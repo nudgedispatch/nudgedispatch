@@ -1,11 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { billingAccess } from "../app/access.js";
+import { isListedPlatformAdmin, platformAdminEmails } from "../app/platform-admin.js";
 import { kindForPlan, normPlan, smsAllowed, stripeKeyProblem } from "../app/billing.js";
 import { computeQuote, validateRateSheet } from "../app/quote-engine.js";
 import { sendBlandSms, smsMode, textingProblem, usCanadaE164 } from "../app/sms.js";
 import { verifyStripeSignature } from "../app/stripe_webhook.js";
 import { trialState } from "../app/trial.js";
+
+test("platform admin emails fail closed unless listed", () => {
+  assert.deepEqual(platformAdminEmails(undefined), []);
+  assert.deepEqual(platformAdminEmails({}), []);
+  assert.deepEqual(platformAdminEmails({ PLATFORM_ADMIN_EMAILS: "  , ," }), []);
+  assert.equal(isListedPlatformAdmin({}, "owner@example.test"), false);
+  assert.equal(isListedPlatformAdmin({ PLATFORM_ADMIN_EMAILS: "" }, "owner@example.test"), false);
+  const env = { PLATFORM_ADMIN_EMAILS: " Owner@Example.test, dispatcher@example.test " };
+  assert.deepEqual(platformAdminEmails(env), ["owner@example.test", "dispatcher@example.test"]);
+  assert.equal(isListedPlatformAdmin(env, "owner@example.test"), true);
+  assert.equal(isListedPlatformAdmin(env, "other@example.test"), false);
+});
 
 test("hourly quote uses the vehicle rate and the hour minimum", () => {
   const parsed = validateRateSheet({

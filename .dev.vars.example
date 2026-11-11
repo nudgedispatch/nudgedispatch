@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local wrangler. Do not commit .dev.vars or put a real address here.
+# Comma-separated. Unset or empty means nobody is a platform admin.
+PLATFORM_ADMIN_EMAILS=
+SMS_MODE=off

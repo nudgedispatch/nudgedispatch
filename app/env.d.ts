@@ -15,6 +15,8 @@ export interface NudgeEnv {
   DB: D1Database;
   /** Bearer token for the non-UI admin API. Empty means that API stays hidden. */
   ADMIN_TOKEN?: string;
+  /** Comma-separated platform admin emails. Unset or empty means nobody is a platform admin. */
+  PLATFORM_ADMIN_EMAILS?: string;
   /** Bland SMS. Unused while SMS_MODE is off. */
   BLAND_API_KEY?: string;
   BLAND_FROM_NUMBER?: string;

@@ -16,10 +16,13 @@ Requirements: Node 22.
 
 ```bash
 npm ci
+cp .dev.vars.example .dev.vars
 npx wrangler d1 migrations apply nudge-app-local --local
 node scripts/seed-local.js
 npm run dev
 ```
+
+`.dev.vars` is gitignored. Leave `PLATFORM_ADMIN_EMAILS` empty unless you are testing a local platform admin.
 
 Open http://127.0.0.1:8787 . The seed script prints two sample logins. They exist only in the local D1 database under `.wrangler/`.
 
@@ -43,7 +46,6 @@ The operator app reads and writes Cloudflare D1 through the `DB` binding.
 | | |
 |---|---|
 | Production database name | `nudge-app-db` |
-| Production database id | `6b1f0046-6147-4987-a0e0-5889dc16a4e9` |
 | Local name in this repo | `nudge-app-local` |
 
 Tables: `companies`, `users`, `clients`, `rides`, `sessions`, `memberships`, `invites`, `invoice_settings`, `invoices`, `rate_sheets`, `ride_requests`, `booking_pages`, `booking_limits`, `driver_locations`, `location_links`, `sms_messages`, `stripe_events`, `admin_audit`, `login_attempts`, `static_assets`.
@@ -58,6 +60,7 @@ Set these on the Worker host. Do not commit values.
 |---|---|---|
 | `DB` | D1 binding | All operator data |
 | `ADMIN_TOKEN` | secret | Bearer token for the non-UI admin API. Empty hides that API |
+| `PLATFORM_ADMIN_EMAILS` | secret | Comma-separated emails allowed to be platform admins. Unset or empty means nobody is a platform admin, including accounts already flagged in D1. Set this on the `nudge-app` Worker before the next deploy |
 | `BLAND_API_KEY` | secret | Bland SMS. Unused while `SMS_MODE` is `off` |
 | `BLAND_FROM_NUMBER` | plain text | Bland sending number |
 | `SMS_MODE` | plain text | `off` (default here), `test`, or `live` |

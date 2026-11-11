@@ -10,6 +10,7 @@ export default [
       "app/sms.js",
       "app/billing.js",
       "app/stripe_webhook.js",
+      "app/platform-admin.js",
       "test/**/*.js",
       "scripts/**/*.js",
     ],

@@ -781,8 +781,8 @@ function clearCookie(request) {
   return sessionCookie("", request, 0);
 }
 __name(clearCookie, "clearCookie");
-function profileFromRow(userId, row) {
-  if (row.platform_admin === 1) {
+function profileFromRow(userId, row, env) {
+  if (row.platform_admin === 1 && isListedPlatformAdmin(env, row.email)) {
     return {
       userId,
       email: row.email,
@@ -817,7 +817,7 @@ async function accountProfile(env, userId) {
      WHERE u.id = ?`
   ).bind(userId).first();
   if (!row) return null;
-  return profileFromRow(userId, row);
+  return profileFromRow(userId, row, env);
 }
 __name(accountProfile, "accountProfile");
 async function currentUser(request, env) {
@@ -839,7 +839,7 @@ async function currentUser(request, env) {
     await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(row.session_id).run();
     return null;
   }
-  const profile = profileFromRow(row.user_id, row);
+  const profile = profileFromRow(row.user_id, row, env);
   if (!profile || profile.suspended) return null;
   return {
     sessionId: row.session_id,
@@ -1098,7 +1098,6 @@ function shouldWriteLocation(prev, next, now) {
 __name(shouldWriteLocation, "shouldWriteLocation");
 
 // src/promote-admin.ts
-var PLATFORM_ADMIN_EMAIL = "sneaky96b@gmail.com";
 var PLACEHOLDER_COMPANY_NAME = "Iron Gate Executive Transport LLC";
 async function promotePlatformAdmin(env, email) {
   const empty = {
@@ -1997,7 +1996,7 @@ async function adminPromote(request, env) {
   const body = await readJson(request);
   if (isResponse(body)) return body;
   const email = normEmail(body.email);
-  if (email !== PLATFORM_ADMIN_EMAIL) return fail(400, "That email cannot be promoted.");
+  if (!isListedPlatformAdmin(env, email)) return fail(400, "That email cannot be promoted.");
   const report = await promotePlatformAdmin(env, email);
   if (!report.found || !report.passwordUnchanged || report.sessionsAfter !== report.sessionsBefore) {
     return fail(404, "No account with that email.");
@@ -2216,7 +2215,7 @@ async function platformInvite(request, env) {
   if (!companyName) return fail(400, "Enter the company name.");
   if (!accountKind || !billingPlan) return fail(400, "Plan must be solo, small, or fleet.");
   if (smsAddon && !smsAllowed(billingPlan)) return fail(400, "The texting add-on is for Small fleet and Fleet plans only.");
-  if (email === PLATFORM_ADMIN_EMAIL) return fail(409, "That email already has an account.");
+  if (isListedPlatformAdmin(env, email)) return fail(409, "That email already has an account.");
   const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
   if (existing) return fail(409, "That email already has an account.");
   const invite = await createInvite(env, email, "invite", companyName, null, { accountKind, billingPlan, smsAddon });
@@ -3518,6 +3517,7 @@ import { billingAccess, billingBanner, lockedView, lockedMessage } from "./acces
 import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, StripeError, pricesByLookup, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
+import { isListedPlatformAdmin } from "./platform-admin.js";
 var CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 var FILES = {
   "/": { body: indexHtml, type: "text/html; charset=utf-8", cache: "no-cache" },
