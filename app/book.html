@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Book a ride">
+<meta name="robots" content="noindex, nofollow">
+<meta name="description" content="Request a ride.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'">
+<title>Book a ride</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="bookpage">
+<header class="top">
+  <img id="coLogo" src="/icons/icon-192.png" alt="" class="logo">
+  <div class="brand">
+    <span id="coName" class="coname">Booking page</span>
+    <small>Request a ride</small>
+  </div>
+</header>
+<main id="bk">
+  <p id="load" class="muted">Loading the booking page…</p>
+  <p id="unavailable" class="err hidden" role="alert">This booking page is not available.</p>
+  <div id="closed" class="hidden">
+    <div class="card closed-card">
+      <div class="title">Online requests are paused</div>
+      <div class="sub" id="closedTxt"></div>
+      <div class="contact" id="closedContact"></div>
+    </div>
+  </div>
+  <h1 id="heading" class="hidden">Book a ride</h1>
+  <form id="bf" class="hidden" novalidate>
+    <label>Your name<input name="name" autocomplete="name" required></label>
+    <label>Mobile phone<input name="phone" type="tel" autocomplete="tel" inputmode="tel" required></label>
+    <label>Email (optional)<input name="email" type="email" autocomplete="email" inputmode="email"></label>
+    <div class="two"><label>Date<input name="date" type="date" required></label><label>Pickup time<select name="time" required><option value="">Select time</option></select></label></div>
+    <label>Trip type<select name="tripType"><option value="one-way">One way</option><option value="round-trip">Round trip</option><option value="hourly">Hourly</option></select></label>
+    <label id="hoursWrap" class="hidden">How many hours?<select name="hours"><option value="">Select hours</option></select></label>
+    <label id="vehicleWrap" class="hidden">Vehicle<select name="vehicle"></select></label>
+    <label>Pickup address<input name="pickup" autocomplete="street-address" required></label>
+    <label><span id="dropLabel">Drop-off address</span><input name="dropoff" autocomplete="off" required></label>
+    <div id="places" class="chips hidden" aria-label="Flat-rate places"></div>
+    <label>Passengers<input name="passengers" type="number" min="1" max="14" inputmode="numeric" value="1"></label>
+    <div class="card quote hidden" id="quote" aria-live="polite">
+      <div class="sub" id="qKind">Instant estimate</div>
+      <div class="qprice" id="qPrice">&ndash;</div>
+      <div class="sub" id="qLabel">Enter pickup and drop-off to see an estimate.</div>
+      <table class="qlines hidden" id="qLines"></table>
+      <div class="sub" id="qNotes"></div>
+      <div class="fine qconfirm" id="qConfirm"></div>
+    </div>
+    <label>Flight number (optional)<input name="flight" placeholder="e.g. DAL1234" autocapitalize="characters"></label>
+    <label>Notes (optional)<textarea name="notes" placeholder="Child seat, gate code, anything the driver should know"></textarea></label>
+    <div class="hp" aria-hidden="true">
+      <label>Company website<input name="company_website" tabindex="-1" autocomplete="off"></label>
+    </div>
+    <p id="err" class="err hidden" role="alert"></p>
+    <button class="btn" type="submit" id="go">Request this ride</button>
+    <p class="muted fine" id="fineprint">Your request goes to the operator for approval. Nothing is emailed or texted.</p>
+  </form>
+  <div id="done" class="hidden">
+    <div class="card okcard">
+      <div class="title">Request sent</div>
+      <div class="sub" id="doneTxt"></div>
+    </div>
+    <button class="btn" type="button" id="again">Book another ride</button>
+  </div>
+</main>
+<script src="/book.js" defer></script>
+</body>
+</html>

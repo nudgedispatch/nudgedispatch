@@ -1,0 +1,1502 @@
+"use strict";
+const view = document.querySelector("#view");
+const tabs = document.querySelector("#tabs");
+const state = { me: null, inviteToken: "" };
+let renderGen = 0;
+
+const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const money = (cents) => "$" + (Number(cents || 0) / 100).toFixed(2);
+const label = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
+function longIssued(iso) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
+  if (!match) return iso || "";
+  const dt = new Date(Date.UTC(+match[1], +match[2] - 1, +match[3]));
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][dt.getUTCDay()];
+  const mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][+match[2] - 1];
+  return `${dow}, ${mon} ${+match[3]}, ${match[1]}`;
+}
+function time12(value) {
+  const match = /^(\d{2}):(\d{2})$/.exec(value || "");
+  if (!match) return value || "";
+  let hour = +match[1];
+  const suffix = hour >= 12 ? "PM" : "AM";
+  hour = hour % 12 || 12;
+  return `${hour}:${match[2]} ${suffix}`;
+}
+
+const locWatch = { id: null, timer: null, on: false, rideId: "" };
+
+function locStopWatch() {
+  if (locWatch.id != null && navigator.geolocation) navigator.geolocation.clearWatch(locWatch.id);
+  locWatch.id = null;
+  if (locWatch.timer) clearInterval(locWatch.timer);
+  locWatch.timer = null;
+}
+
+function locSendFix(pos) {
+  if (!locWatch.rideId) return Promise.resolve();
+  return api("/api/location", {
+    method: "POST",
+    body: {
+      rideId: locWatch.rideId,
+      lat: pos.coords.latitude,
+      lng: pos.coords.longitude,
+      acc: typeof pos.coords.accuracy === "number" ? pos.coords.accuracy : null,
+      ts: pos.timestamp || Date.now(),
+    },
+  });
+}
+
+function locStartWatch() {
+  locStopWatch();
+  if (!navigator.geolocation || window.isSecureContext === false) return;
+  const opt = { enableHighAccuracy: false, maximumAge: 30000, timeout: 30000 };
+  locWatch.id = navigator.geolocation.watchPosition((pos) => { locSendFix(pos); }, () => {}, opt);
+  locWatch.timer = setInterval(() => {
+    if (!locWatch.on || document.visibilityState !== "visible" || !navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition((pos) => { locSendFix(pos); }, () => {}, opt);
+  }, 45000);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!locWatch.on) return;
+  if (document.visibilityState !== "visible") locStopWatch();
+  else locStartWatch();
+});
+
+function whereToken() {
+  const match = /^#\/where\/([A-Za-z0-9_-]{20,})$/.exec(location.hash || "");
+  return match ? match[1] : "";
+}
+
+function routeName() {
+  const hash = location.hash || "#/rides";
+  const parts = hash.replace(/^#/, "").split("/").filter(Boolean);
+  return { parts, name: parts[0] || "rides", id: parts[1] || "" };
+}
+
+async function api(path, options = {}) {
+  const headers = { "X-Nudge-Client": "1" };
+  if (options.body) headers["Content-Type"] = "application/json";
+  if (options.auth !== false && state.me && options.method && options.method !== "GET") headers["X-CSRF-Token"] = state.me.csrf;
+  let response;
+  try {
+    response = await fetch(path, {
+      method: options.method || "GET",
+      headers,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      credentials: "same-origin",
+    });
+  } catch {
+    return { status: 0, data: { ok: false, error: "No connection. Check your signal and try again." } };
+  }
+  const data = await response.json().catch(() => ({ ok: false, error: "Unexpected response (" + response.status + ")." }));
+  if (!response.ok && data && typeof data === "object" && data.ok !== false) { data.ok = false; data.error = data.error || "Request failed (" + response.status + ")."; }
+  if (response.status === 403 && data && data.billingLocked && state.me && !state.me.platformAdmin) {
+    state.me.access = { ...(state.me.access || {}), state: "locked", locked: true, banner: null, lockedView: data.lockedView || null };
+    setTimeout(() => renderLocked(), 0);
+  }
+  if (response.status === 401 && path !== "/api/login" && path !== "/api/invites/accept") {
+    const hadSession = !!state.me;
+    state.me = null;
+    const screen = (location.hash || "").replace(/^#\//, "").split("/")[0];
+    if (hadSession || (screen && screen !== "login" && screen !== "start")) location.hash = "#/login";
+  }
+  return { status: response.status, data };
+}
+
+function setTag() {
+  const tag = document.querySelector(".tag");
+  if (tag) tag.textContent = state.me && state.me.platformAdmin ? "Platform" : "Private operator";
+}
+
+async function signOut() {
+  await api("/api/logout", { method: "POST", body: {} });
+  state.me = null;
+  location.hash = "#/login";
+}
+
+// ---- Billing access (draft Nov 10, 2026): grace banner, ending banner, locked page ----
+function billingLocked() {
+  return !!(state.me && !state.me.platformAdmin && state.me.access && state.me.access.locked);
+}
+function canManageBilling() {
+  return !!(state.me && state.me.role === "owner" && state.me.access && state.me.access.canManageBilling);
+}
+function portalButtonHtml(ghost) {
+  return `<button class="btn ${ghost ? "ghost " : ""}full portal-btn" type="button" data-portal>Update card / billing</button><p class="err portal-msg"></p>`;
+}
+async function openPortal(button) {
+  const msg = button.parentElement && button.parentElement.querySelector(".portal-msg");
+  button.disabled = true;
+  if (msg) { msg.style.color = ""; msg.textContent = "Opening the secure billing page…"; }
+  try {
+    const r = await api("/api/billing/portal", { method: "POST", body: {} });
+    if (r.data.ok && r.data.url) { location.href = r.data.url; return; }
+    if (msg) msg.textContent = r.data.error || "Could not open the billing page.";
+  } catch { if (msg) msg.textContent = "Could not open the billing page. Check your connection."; }
+  button.disabled = false;
+}
+document.addEventListener("click", (event) => {
+  const button = event.target.closest && event.target.closest("[data-portal]");
+  if (button) { event.preventDefault(); openPortal(button); }
+});
+function billingBannerHtml() {
+  const b = state.me && state.me.access && state.me.access.banner;
+  if (!b) return "";
+  const mail = `<a href="mailto:${esc(b.contactEmail)}">${esc(b.contactEmail)}</a>`;
+  return `<section class="card billing-banner billing-${esc(b.state)}" id="billing-banner" data-state="${esc(b.state)}" role="alert">
+      <p class="trial-line"><strong>${esc(b.line)}</strong></p>
+      <p class="sub">${esc(b.detail).replace(esc(b.contactEmail), mail)}</p>
+      ${b.state === "grace" && canManageBilling() ? portalButtonHtml(false) : ""}
+    </section>`;
+}
+function renderLocked() {
+  if (!billingLocked()) return;
+  setTabs(false);
+  const v = (state.me.access && state.me.access.lockedView) || { title: "This account is paused", why: "", how: "To reactivate, email nudgedispatch@gmail.com.", kept: "Your data is kept. Nothing has been deleted.", contactEmail: "nudgedispatch@gmail.com" };
+  const mail = `<a href="mailto:${esc(v.contactEmail)}">${esc(v.contactEmail)}</a>`;
+  const owner = state.me.role === "owner";
+  shell(`<section class="card locked-page" id="locked-page">
+      <h1>${esc(v.title)}</h1>
+      ${v.why ? `<p>${esc(v.why)}</p>` : ""}
+      <p>${esc(v.how).replace(esc(v.contactEmail), mail)}</p>
+      <p class="sub">${esc(v.kept)}</p>
+      ${owner && canManageBilling() ? portalButtonHtml(false) : ""}
+      ${owner ? `<p class="sub">You can still download your records:</p><div class="export-actions"><a class="btn ghost" href="/api/export/rides.csv" download>Rides (CSV)</a><a class="btn ghost" href="/api/export/clients.csv" download>Clients (CSV)</a></div>` : ""}
+      <button class="btn ghost full" type="button" id="out">Sign out</button>
+    </section>`);
+  document.querySelector("#out").onclick = () => signOut();
+}
+
+function when(ms) {
+  if (!ms) return "None yet";
+  return new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York", dateStyle: "medium", timeStyle: "short" });
+}
+
+function setTabs(on) {
+  const driver = state.me && state.me.role === "driver";
+  const admin = state.me && state.me.platformAdmin;
+  tabs.classList.toggle("hidden", !on || !!admin);
+  for (const button of tabs.querySelectorAll("button")) {
+    const name = routeName().name;
+    const go = button.dataset.go;
+    button.classList.toggle("hidden", !!(driver && go !== "#/rides"));
+    button.classList.toggle("on", go === "#/" + (name === "invoices" ? "rides" : name));
+  }
+}
+
+function shell(html) {
+  view.innerHTML = html;
+}
+
+function formError(message) {
+  let el = document.querySelector("#err");
+  if (!el) {
+    el = document.createElement("p");
+    el.className = "err";
+    el.id = "err";
+    const form = document.querySelector("#f") || document.querySelector("#view");
+    const button = form && form.querySelector("button[type=submit]");
+    if (button) button.insertAdjacentElement("beforebegin", el);
+    else if (form) form.appendChild(el);
+    else return;
+  }
+  el.style.color = "";
+  el.textContent = message || "";
+}
+
+const INVITE_TOKEN_KEY = "nudge_invite_token";
+
+function rememberInviteToken(token) {
+  state.inviteToken = token || "";
+  try {
+    if (token) sessionStorage.setItem(INVITE_TOKEN_KEY, token);
+    else sessionStorage.removeItem(INVITE_TOKEN_KEY);
+  } catch {}
+}
+
+function loadInviteToken() {
+  if (state.inviteToken) return state.inviteToken;
+  try { state.inviteToken = sessionStorage.getItem(INVITE_TOKEN_KEY) || ""; }
+  catch { state.inviteToken = state.inviteToken || ""; }
+  return state.inviteToken;
+}
+
+function clearInviteToken() {
+  state.inviteToken = "";
+  try { sessionStorage.removeItem(INVITE_TOKEN_KEY); } catch {}
+}
+
+async function boot() {
+  const start = /^#\/start\/([A-Za-z0-9_-]+)$/.exec(location.hash);
+  if (start) {
+    rememberInviteToken(start[1]);
+    history.replaceState(null, "", location.pathname + location.search + "#/start");
+  } else if (location.hash === "#/start") {
+    loadInviteToken();
+  }
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+  const me = await api("/api/me");
+  if (me.data.ok) {
+    state.me = me.data;
+    setTag();
+    if (location.hash === "" || location.hash === "#/login" || location.hash === "#/start") {
+      location.hash = me.data.platformAdmin ? "#/admin" : "#/rides";
+    }
+    await route();
+    return;
+  }
+  if (whereToken()) return route();
+  if (location.hash === "#/start") return renderStart();
+  location.hash = "#/login";
+  renderLogin();
+}
+
+function renderLogin() {
+  setTabs(false);
+  shell(`<section class="card login">
+    <img src="/brand/mark.svg" alt="" class="login-mark">
+    <h1>Sign in</h1>
+    <p class="note">Private to your company. There is no public signup.</p>
+    <p class="muted">The same sign-in is used for the platform admin console. There is no separate admin login.</p>
+    <form id="f">
+      <label>Email<input id="email" type="email" autocomplete="username" required></label>
+      <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
+      <p class="err" id="err"></p>
+      <button class="btn full" type="submit">Sign in</button>
+    </form>
+    <p class="muted">A setup or reset link opens the set-password screen. Nothing is emailed from this app.</p>
+  </section>`);
+  document.querySelector("#f").onsubmit = async (event) => {
+    event.preventDefault();
+    const result = await api("/api/login", { method: "POST", auth: false, body: { email: email.value, password: password.value } });
+    if (!result.data.ok) return formError(result.data.error || "Could not sign in.");
+    state.me = result.data;
+    setTag();
+    location.hash = result.data.platformAdmin ? "#/admin" : "#/rides";
+  };
+  const email = document.querySelector("#email");
+  const password = document.querySelector("#password");
+}
+
+function startAcceptError(data) {
+  const error = data && data.error || "";
+  if (/invalid or already used/i.test(error)) {
+    return "This setup link has expired or was already used. Ask your Nudge Dispatch contact for a new link.";
+  }
+  return error || "Could not save the password.";
+}
+
+function updateStartHint() {
+  const password = document.querySelector("#password");
+  const again = document.querySelector("#again");
+  const hint = document.querySelector("#pw-hint");
+  if (!password || !again || !hint) return;
+  const a = password.value;
+  const b = again.value;
+  hint.style.color = "";
+  hint.textContent = "";
+  if (!a && !b) return;
+  if (a.length < 12) {
+    hint.style.color = "var(--red)";
+    hint.textContent = "Use at least 12 characters.";
+    return;
+  }
+  if (a.length > 200) {
+    hint.style.color = "var(--red)";
+    hint.textContent = "Use at most 200 characters.";
+    return;
+  }
+  if (b && a !== b) {
+    hint.style.color = "var(--red)";
+    hint.textContent = "Those passwords do not match.";
+    return;
+  }
+  if (b && a === b) {
+    hint.style.color = "var(--green)";
+    hint.textContent = "Passwords match.";
+  }
+}
+
+function renderStart() {
+  setTabs(false);
+  loadInviteToken();
+  shell(`<section class="card login">
+    <img src="/brand/mark.svg" alt="" class="login-mark">
+    <h1>Set your password</h1>
+    <p class="note">This one-time link is for you only. It is not a public signup, and no email is sent.</p>
+    <form id="f" novalidate>
+      <label>New password<input id="password" type="password" autocomplete="new-password" required>
+        <span class="muted">At least 12 characters. Can't be your email.</span>
+      </label>
+      <label>Repeat password<input id="again" type="password" autocomplete="new-password" required></label>
+      <p class="muted" id="pw-hint"></p>
+      <p class="err" id="err"></p>
+      <button class="btn full" type="submit">Save password and open my rides</button>
+    </form>
+  </section>`);
+  const form = document.querySelector("#f");
+  const passwordInput = document.querySelector("#password");
+  const againInput = document.querySelector("#again");
+  const button = form.querySelector("button[type=submit]");
+  passwordInput.addEventListener("input", updateStartHint);
+  againInput.addEventListener("input", updateStartHint);
+  if (!state.inviteToken) formError("Open the one-time setup link you were given.");
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const password = passwordInput.value;
+    const again = againInput.value;
+    updateStartHint();
+    if (!password) return formError("Enter a password.");
+    if (password.length < 12 || password.length > 200) return formError("Use a password between 12 and 200 characters.");
+    if (password !== again) return formError("Those passwords do not match.");
+    if (!state.inviteToken) return formError("Open the one-time setup link you were given.");
+    button.disabled = true;
+    try {
+      const acceptBody = { token: state.inviteToken, password };
+      const result = await api("/api/invites/accept", { method: "POST", auth: false, body: acceptBody });
+      if (!result.data.ok) return formError(startAcceptError(result.data));
+      clearInviteToken();
+      state.me = result.data;
+      location.hash = "#/rides";
+    } catch {
+      formError("Could not save the password. Check your connection and try again.");
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+
+// ---- Free trial (draft Nov 10, 2026) ----
+async function loadTrial() {
+  state.trial = null;
+  state.trialBanner = null;
+  if (!state.me || state.me.role !== "owner" || state.me.platformAdmin) return null;
+  const result = await api("/api/trial");
+  if (result.data.ok) {
+    state.trial = result.data.trial;
+    state.trialBanner = result.data.banner;
+  }
+  return state.trial;
+}
+function trialClosed() {
+  return !!(state.trial && state.trial.open === false);
+}
+function trialBannerHtml() {
+  const b = state.trialBanner;
+  if (!b) return "";
+  const contact = b.contact ? `<p class="sub">${esc(b.contact).replace(esc(b.contactEmail), `<a href="mailto:${esc(b.contactEmail)}">${esc(b.contactEmail)}</a>`)}</p>` : "";
+  if (b.state === "ended") {
+    return `<section class="card trial trial-ended" id="trial-card" data-state="ended">
+      <h2>${esc(b.title)}</h2>
+      <p class="trial-line">${esc(b.line)}</p>
+      <p class="sub">${esc(b.detail)}</p>
+      ${contact}
+      <p class="sub"><a href="#/settings">Export your rides and clients</a> any time from More.</p>
+    </section>`;
+  }
+  const t = state.trial;
+  const pct = t && t.rideLimit ? Math.min(100, Math.round((t.ridesUsed / t.rideLimit) * 100)) : 0;
+  return `<section class="card trial trial-${esc(b.state)}" id="trial-card" data-state="${esc(b.state)}">
+      <p class="trial-line">${esc(b.line)}</p>
+      <div class="trial-bar" aria-hidden="true"><span class="trial-fill w${Math.round(pct / 5) * 5}"></span></div>
+      <p class="sub">${esc(b.detail)}</p>
+      ${contact}
+    </section>`;
+}
+function trialPausedHtml() {
+  return `<p class="sub trial-paused">Approving new requests is paused because the free trial has ended. You can still decline.</p>`;
+}
+
+function rideCardHtml(ride, pending) {
+  const when = `${esc(ride.date)} · ${esc(time12(ride.time))}`;
+  const fare = ride.status === "requested" || !ride.fare || ride.fare === "$0.00" ? "" : " · " + esc(ride.fare);
+  const phone = ride.clientPhone ? `<div class="sub">${esc(ride.clientPhone)}</div>` : "";
+  const notes = pending && ride.notes ? `<div class="sub">${esc(ride.notes)}</div>` : "";
+  const trip = tripLine(ride) ? `<div class="sub">${esc(tripLine(ride))}</div>` : "";
+  const owner = !(state.me && state.me.role === "driver");
+  const quote = pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">No estimate was shown to the client.</div>`) : "";
+  const actions = pending && owner ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, `data-fare="${esc(ride.id)}"`, `data-approve="${esc(ride.id)}"`)}<div class="pend-actions"><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : "";
+  return `<div class="list-btn${pending ? " pending-request card" : ""}" data-id="${esc(ride.id)}">
+      <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badge ${esc(ride.status)}">${esc(ride.schedule && ride.schedule.now && ride.status !== "scheduled" ? ride.schedule.now : label(ride.status))}</span></div>
+      <div class="sub when">${when}${fare}</div>
+      <div class="sub">${esc(ride.pickup)} → ${esc(ride.dropoff)}</div>
+      ${trip}${phone}${notes}${quote}${actions}
+    </div>`;
+}
+
+async function renderRides(gen) {
+  setTabs(true);
+  const driverView = state.me && state.me.role === "driver";
+  shell(`<h1>Rides</h1><div id="trial"></div><p class="note">${driverView ? "You are the driver. Tap On my way, Picked up, then Dropped off. Nothing is texted." : "Requested rides wait here until you approve them. Nothing is texted."}</p><div id="list" class="muted">Loading…</div>`);
+  const [result] = await Promise.all([api("/api/rides"), loadTrial()]);
+  if (gen !== renderGen) return;
+  const trialBox = document.querySelector("#trial");
+  if (trialBox) trialBox.innerHTML = billingBannerHtml() + trialBannerHtml();
+  const list = document.querySelector("#list");
+  if (!result.data.ok) { list.textContent = result.data.error || "Could not load rides."; return; }
+  const rides = result.data.rides || [];
+  if (!rides.length) { list.innerHTML = `<p>No rides yet. Use + New, or share your booking page from More.</p>`; return; }
+  const pending = rides.filter((ride) => ride.status === "requested");
+  const rest = rides.filter((ride) => ride.status !== "requested");
+  const parts = [];
+  if (pending.length && !driverView) {
+    parts.push(`<h2>Needs your approval</h2>` + pending.map((ride) => rideCardHtml(ride, true)).join(""));
+  }
+  if (rest.length) {
+    if (pending.length && !driverView) parts.push("<h2>Rides</h2>");
+    parts.push(rest.map((ride) => rideCardHtml(ride, false)).join(""));
+  }
+  list.innerHTML = parts.join("") || `<p>No rides yet. Use + New, or share your booking page from More.</p>`;
+  wireApproveBlock(list);
+  list.onclick = async (event) => {
+    const approve = event.target.closest("[data-approve]");
+    const decline = event.target.closest("[data-decline]");
+    if (event.target.closest("[data-fare]") || event.target.closest(".approve-price label") || event.target.closest(".fare-hint")) return;
+    if (approve || decline) {
+      event.preventDefault();
+      const id = (approve || decline).dataset.approve || (approve || decline).dataset.decline;
+      const path = approve ? "/api/rides/" + id + "/approve" : "/api/rides/" + id + "/decline";
+      const fareInput = approve ? list.querySelector(`[data-fare="${CSS.escape(id)}"]`) : null;
+      if (approve && (!fareInput || !fareOk(fareInput.value))) { formError("Enter the final price to approve."); return; }
+      const next = await api(path, { method: "POST", body: approve ? { fare: fareInput.value.trim() } : {} });
+      if (gen !== renderGen) return;
+      if (!next.data.ok) { formError(next.data.error || "Could not update the request."); return; }
+      route();
+      return;
+    }
+    const button = event.target.closest("[data-id]");
+    if (button) location.hash = "#/rides/" + button.dataset.id;
+  };
+}
+
+async function renderRide(id, gen) {
+  setTabs(true);
+  shell(`<p class="muted"><a href="#/rides">Rides</a></p><div id="box" class="muted">Loading…</div>`);
+  const driverView = state.me && state.me.role === "driver";
+  const fleetOwner = state.me && state.me.accountKind === "fleet" && state.me.role === "owner";
+  const requests = [api("/api/rides/" + id), api("/api/location?rideId=" + encodeURIComponent(id))];
+  requests.push(fleetOwner ? api("/api/drivers") : Promise.resolve(null));
+  requests.push(driverView ? Promise.resolve(null) : loadTrial());
+  requests.push(api("/api/sms/status").catch(() => null));
+  const [result, loc, drivers, , smsInfo] = await Promise.all(requests);
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#box");
+  if (!result.data.ok) { box.textContent = result.data.error || "Ride not found."; return; }
+  const ride = result.data.ride;
+  const schedule = ride.schedule || {};
+  const invoice = result.data.invoice;
+  const rows = [
+    ["Planned pickup", ride.date + " at " + time12(ride.time) + " ET"],
+    ["Planned drop-off", "Not stored"],
+    ["On my way", schedule.enRouteLabel ? schedule.enRouteLabel + " ET" : "Not recorded"],
+    ["Picked up", schedule.pickedUpLabel ? schedule.pickedUpLabel + " ET" : "Not recorded"],
+    ["Dropped off", schedule.droppedOffLabel ? schedule.droppedOffLabel + " ET" : "Not recorded"],
+    ["On my way to pickup", schedule.toPickupMinutes == null ? "Not recorded" : schedule.toPickupMinutes + " min"],
+    ["Waiting", "Not recorded"],
+    ["Trip", schedule.tripMinutes == null ? "Not recorded" : schedule.tripMinutes + " min"],
+  ];
+  const sharing = loc.data.ok && loc.data.location && loc.data.location.sharing;
+  setTimeout(() => {
+    const omw = document.querySelector("#sms-omw");
+    if (!omw) return;
+    omw.onclick = async () => {
+      const msg = document.querySelector("#sms-msg");
+      omw.disabled = true;
+      const pre = await api("/api/rides/" + id + "/text", { method: "POST", body: { kind: "on_my_way", preview: true } });
+      if (!pre.data.ok) { msg.textContent = pre.data.error || "Could not prepare the text."; omw.disabled = false; return; }
+      if (!confirm("Send this text to the number ending " + pre.data.toLast4 + "?\n\n" + pre.data.preview)) { omw.disabled = false; return; }
+      const r = await api("/api/rides/" + id + "/text", { method: "POST", body: { kind: "on_my_way" } });
+      msg.textContent = r.data.ok ? "Text sent to the number ending " + r.data.toLast4 + "." : (r.data.error || "The text could not be sent.");
+      if (!r.data.ok) omw.disabled = false;
+    };
+  }, 0);
+  const links = loc.data.ok && Array.isArray(loc.data.links) ? loc.data.links.filter((link) => !link.revokedAt) : [];
+  box.innerHTML = `<article class="card">
+      <div class="row"><h2>${esc(ride.clientName)}</h2><span class="badge ${esc(ride.status)}">${esc(schedule.now || label(ride.status))}</span></div>
+      <p>${esc(ride.pickup)}<br>→ ${esc(ride.dropoff)}</p>
+      ${tripLine(ride) ? `<p class="sub">${esc(tripLine(ride))}</p>` : ""}
+      ${ride.quote && !driverView ? quoteBoxHtml(ride.quote) : ""}
+      <p class="sub">${esc(ride.passengers)} passenger${ride.passengers === 1 ? "" : "s"}${ride.flight ? " · Flight " + esc(ride.flight) : ""}${ride.fare && ride.fare !== "$0.00" ? " · " + esc(ride.fare) : ""}${ride.clientPhone ? " · " + esc(ride.clientPhone) : ""}</p>
+      <table class="times">${rows.map(([name, value]) => `<tr><th>${esc(name)}</th><td>${esc(value)}</td></tr>`).join("")}</table>
+      <p class="sub">Arrival is not a step. Waiting time is not clocked. Times are Eastern and come only from taps.</p>
+      ${ride.notes ? `<p>${esc(ride.notes)}</p>` : ""}
+    </article>
+    <div class="stack noprint">
+      ${ride.status === "requested" && !driverView ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, 'id="final-fare"', 'id="approve"')}<div class="pend-actions"><button class="btn ghost" id="decline" type="button">Decline</button></div>` : ""}
+      ${schedule.nextLabel ? `<button class="btn stage" id="step" type="button">${esc(schedule.nextLabel)}</button>` : ""}
+      ${smsInfo && smsInfo.data && smsInfo.data.ok && smsInfo.data.addon && ride.status === "scheduled" ? `<div class="card sms-box"><button class="btn ghost" id="sms-omw" type="button" ${smsInfo.data.ready ? "" : "disabled"}>Text client: on my way</button><p class="sub" id="sms-msg">${smsInfo.data.ready ? "You'll see the text before it is sent." : esc(smsInfo.data.problem)}</p></div>` : ""}
+      ${schedule.nav ? `<a class="btn ghost" id="maps" href="${esc(schedule.nav.url)}" target="_blank" rel="noopener">${esc(schedule.nav.label)}</a>` : ""}
+      ${schedule.undoStep != null && ride.status !== "cancelled" && ride.status !== "requested" && ride.status !== "declined" ? `<button class="btn ghost" id="undo" type="button">Undo last step</button>` : ""}
+      ${ride.status === "scheduled" && !driverView ? `<button class="btn ghost" id="cancel" type="button">Cancel ride</button>` : ""}
+      ${ride.status === "completed" && !driverView ? `<button class="btn" id="invoice" type="button">${invoice ? "Open invoice" : "Create invoice"}</button>` : ""}
+    </div>
+    ${fleetOwner && ride.status !== "requested" && ride.status !== "declined" ? `<form id="assign" class="card noprint"><label>Assigned driver<select id="driver"><option value="">Unassigned</option>${((drivers && drivers.data && drivers.data.drivers) || []).map((member) => `<option value="${esc(member.id)}">${esc(member.email)} · ${esc(member.role)}</option>`).join("")}</select></label><p class="err" id="assignerr"></p></form>` : ""}
+    <section class="card noprint${ride.status === "requested" || ride.status === "declined" ? " hidden" : ""}">
+      <h2>Your location</h2>
+      <p class="note">Sharing stays on only while this ride screen is open and the phone is unlocked. Updates pause when you leave this page or lock the phone. Nudge does not track in the background, and it does not text the location link to anyone.</p>
+      <div class="loc-actions">
+        <button class="btn" id="share" type="button">${sharing ? "Stop sharing" : "Start sharing"}</button>
+        <button class="btn ghost" id="makelink" type="button">Create a private view link</button>
+      </div>
+      <p class="sub" id="locstate">${sharing ? "Sharing is on for this ride only. A view link is not sent anywhere." : "Sharing is off until you tap Start sharing."}</p>
+      <div id="links">${links.map((link) => `<p class="sub">Link ${esc(link.id.slice(0, 8))} · <button type="button" class="btn ghost" data-revoke="${esc(link.id)}">Revoke</button></p>`).join("")}</div>
+      <p class="err" id="locerr"></p>
+    </section>
+    <form id="pay" class="card noprint${driverView || ride.status === "requested" || ride.status === "declined" ? " hidden" : ""}">
+      <label>Payment status
+        <select id="payment">
+          <option value="unpaid">Unpaid</option>
+          <option value="invoiced">Invoiced</option>
+          <option value="paid">Paid</option>
+        </select>
+      </label>
+      <button class="btn full" type="submit">Save payment status</button>
+      <p class="err" id="err"></p>
+    </form>`;
+  wireApproveBlock(box);
+  document.querySelector("#payment").value = ride.payment || "unpaid";
+  const assign = document.querySelector("#driver");
+  if (assign) {
+    assign.value = ride.driverUserId || "";
+    assign.onchange = async () => {
+      const next = await api("/api/rides/" + id, { method: "PATCH", body: { driverUserId: assign.value || null } });
+      const err = document.querySelector("#assignerr");
+      if (!next.data.ok) { if (err) err.textContent = next.data.error || "Could not assign the driver."; return; }
+      route();
+    };
+  }
+  if (sharing) { locWatch.rideId = id; locWatch.on = true; locStartWatch(); }
+  const step = document.querySelector("#step");
+  if (step) step.onclick = async () => {
+    const goingTo = schedule.nextStep;
+    const next = await api("/api/rides/" + id + "/progress", { method: "POST", body: { step: goingTo, from: schedule.progress || "" } });
+    if (gen !== renderGen) return;
+    if (!next.data.ok) return formError(next.data.error);
+    const nav = next.data.ride && next.data.ride.schedule && next.data.ride.schedule.nav;
+    if (nav && (goingTo === "En route" || goingTo === "Picked up")) window.open(nav.url, "_blank", "noopener");
+    route();
+  };
+  const undo = document.querySelector("#undo");
+  if (undo) undo.onclick = async () => {
+    const next = await api("/api/rides/" + id + "/progress", { method: "POST", body: { step: schedule.undoStep, from: schedule.progress || "", undo: true } });
+    if (gen !== renderGen) return;
+    if (!next.data.ok) return formError(next.data.error);
+    route();
+  };
+  const cancel = document.querySelector("#cancel");
+  if (cancel) cancel.onclick = async () => {
+    const next = await api("/api/rides/" + id + "/cancel", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    if (!next.data.ok) return formError(next.data.error);
+    route();
+  };
+  const invoiceBtn = document.querySelector("#invoice");
+  if (invoiceBtn) invoiceBtn.onclick = async () => {
+    if (invoice) { location.hash = "#/invoices/" + invoice.id; return; }
+    const next = await api("/api/rides/" + id + "/invoice", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    if (!next.data.ok) return formError(next.data.error);
+    location.hash = "#/invoices/" + next.data.invoice.id;
+  };
+  const approveBtn = document.querySelector("#approve");
+  if (approveBtn) approveBtn.onclick = async () => {
+    const fareEl = document.querySelector("#final-fare");
+    if (!fareEl || !fareOk(fareEl.value)) return formError("Enter the final price to approve.");
+    const next = await api("/api/rides/" + id + "/approve", { method: "POST", body: { fare: fareEl.value.trim() } });
+    if (gen !== renderGen) return;
+    if (!next.data.ok) return formError(next.data.error);
+    route();
+  };
+  const declineBtn = document.querySelector("#decline");
+  if (declineBtn) declineBtn.onclick = async () => {
+    const next = await api("/api/rides/" + id + "/decline", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    if (!next.data.ok) return formError(next.data.error);
+    location.hash = "#/rides";
+  };
+  const shareBtn = document.querySelector("#share");
+  if (shareBtn) shareBtn.onclick = async () => {
+    const next = await api("/api/location/sharing", { method: "POST", body: { on: !sharing, rideId: id } });
+    const err = document.querySelector("#locerr");
+    if (!next.data.ok) { if (err) err.textContent = next.data.error || "Could not change sharing."; return; }
+    if (!sharing) { locWatch.rideId = id; locWatch.on = true; locStartWatch(); }
+    else { locWatch.on = false; locStopWatch(); }
+    route();
+  };
+  document.querySelector("#makelink").onclick = async () => {
+    const next = await api("/api/location/links", { method: "POST", body: { rideId: id } });
+    const err = document.querySelector("#locerr");
+    if (!next.data.ok) { if (err) err.textContent = next.data.error || "Could not create a link."; return; }
+    const path = next.data.link.path;
+    const boxLink = document.querySelector("#links");
+    if (boxLink) boxLink.insertAdjacentHTML("afterbegin", `<p>Private link, shown once. It is not sent. <input readonly value="${esc(location.origin + path)}"></p>`);
+  };
+  box.querySelectorAll("[data-revoke]").forEach((button) => {
+    button.onclick = async () => {
+      const next = await api("/api/location/links/" + button.dataset.revoke + "/revoke", { method: "POST", body: {} });
+      if (!next.data.ok) return formError(next.data.error);
+      route();
+    };
+  });
+  document.querySelector("#pay").onsubmit = async (event) => {
+    event.preventDefault();
+    const payment = document.querySelector("#payment");
+    if (!payment || gen !== renderGen) return;
+    const next = await api("/api/rides/" + id, { method: "PATCH", body: { payment: payment.value } });
+    if (gen !== renderGen) return;
+    if (!next.data.ok) return formError(next.data.error);
+    route();
+  };
+}
+
+async function renderWhere(token, gen) {
+  setTabs(false);
+  shell(`<h1>Driver location</h1><p class="note">Latest point only, and only while sharing is on. This page does not track a locked phone.</p><div id="box" class="muted">Loading…</div>`);
+  const result = await api("/api/location/view/" + encodeURIComponent(token));
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#box");
+  if (!result.data.ok) { box.textContent = "This link is off, expired, or revoked."; return; }
+  const point = result.data.location;
+  if (!point || !point.sharing || !point.fresh) { box.textContent = "Not sharing a current location."; return; }
+  const q = point.lat + "," + point.lng;
+  box.innerHTML = `<article class="card"><p>${esc(String(point.lat))}, ${esc(String(point.lng))}</p><p class="sub">Fix ${esc(new Date(point.fixAt).toLocaleString())}${point.stale ? " · stale" : ""}</p><a class="btn" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}" target="_blank" rel="noopener">Open the point in Maps</a></article>`;
+}
+
+async function renderClients(gen) {
+  setTabs(true);
+  shell(`<div class="row"><h1>Clients</h1><a class="btn" href="#/clients/new">Add</a></div><div id="list" class="muted">Loading…</div>`);
+  const result = await api("/api/clients");
+  if (gen !== renderGen) return;
+  const list = document.querySelector("#list");
+  if (!result.data.ok) { list.textContent = result.data.error || "Could not load clients."; return; }
+  if (!result.data.clients.length) { list.innerHTML = "<p>No clients yet.</p>"; return; }
+  list.innerHTML = result.data.clients.map((client) => `<button class="list-btn" data-id="${esc(client.id)}">
+      <div class="title">${esc(client.name)}</div>
+      <div class="sub">${esc(client.phone || client.email || "No phone yet")}</div>
+    </button>`).join("");
+  list.onclick = (event) => {
+    const button = event.target.closest("[data-id]");
+    if (button) location.hash = "#/clients/" + button.dataset.id;
+  };
+}
+
+function clientForm(client) {
+  return `<form id="f" class="fields">
+    <label class="full">Name<input id="name" required value="${esc(client?.name || "")}"></label>
+    <label>Phone<input id="phone" type="tel" inputmode="tel" value="${esc(client?.phone || "")}"></label>
+    <label>Email<input id="email" type="email" inputmode="email" value="${esc(client?.email || "")}"></label>
+    <label class="full">Notes<textarea id="notes">${esc(client?.notes || "")}</textarea></label>
+    <p class="err full" id="err"></p>
+    <button class="btn full" type="submit">${client ? "Save client" : "Add client"}</button>
+  </form>`;
+}
+
+async function renderClientForm(id, gen) {
+  setTabs(true);
+  let client = null;
+  if (id) {
+    const result = await api("/api/clients/" + id);
+    if (gen !== renderGen) return;
+    if (!result.data.ok) { shell(`<p>${esc(result.data.error || "Client not found.")}</p>`); return; }
+    client = result.data.client;
+  }
+  shell(`<p class="muted"><a href="#/clients">Clients</a></p><h1>${client ? "Client" : "New client"}</h1>${clientForm(client)}`);
+  document.querySelector("#f").onsubmit = async (event) => {
+    event.preventDefault();
+    const body = {
+      name: document.querySelector("#name").value,
+      phone: document.querySelector("#phone").value,
+      email: document.querySelector("#email").value,
+      notes: document.querySelector("#notes").value,
+    };
+    const result = id
+      ? await api("/api/clients/" + id, { method: "PATCH", body })
+      : await api("/api/clients", { method: "POST", body });
+    if (!result.data.ok) return formError(result.data.error);
+    location.hash = "#/clients";
+  };
+}
+
+async function renderNewRide(gen) {
+  setTabs(true);
+  const [clients] = await Promise.all([api("/api/clients"), loadTrial()]);
+  if (gen !== renderGen) return;
+  if (trialClosed()) {
+    shell(`<h1>New ride</h1>${trialBannerHtml()}<p class="sub">Rides already on the schedule can still be completed from Rides.</p><a class="btn ghost full linkbtn-block" href="#/rides">Back to Rides</a>`);
+    return;
+  }
+  if (!clients.data.ok) { shell(`<p>${esc(clients.data.error || "Could not load clients.")}</p>`); return; }
+  if (!clients.data.clients.length) {
+    shell(`<h1>New ride</h1><p>Add a client first.</p><a class="btn" href="#/clients/new">Add a client</a>`);
+    return;
+  }
+  const options = clients.data.clients.map((client) => `<option value="${esc(client.id)}">${esc(client.name)}</option>`).join("");
+  shell(`<h1>New ride</h1>
+    <p class="note">You type the ride. It is not booked from a public page.</p>
+    <form id="f" class="fields">
+      <label class="full">Client<select id="client">${options}</select></label>
+      <label>Date<input id="date" type="date" required></label>
+      <label>Time<input id="time" type="time" required></label>
+      <label class="full">Pickup<input id="pickup" required autocomplete="street-address"></label>
+      <label class="full">Drop-off<input id="dropoff" required></label>
+      <label>Passengers<input id="passengers" type="number" min="1" max="14" value="1" inputmode="numeric"></label>
+      <label>Fare (USD)<input id="fare" inputmode="decimal" placeholder="125.00" required></label>
+      <label class="full">Flight (optional)<input id="flight" maxlength="12" autocapitalize="characters"></label>
+      <label class="full">Notes<textarea id="notes"></textarea></label>
+      <p class="err full" id="err"></p>
+      <button class="btn full" type="submit">Save ride</button>
+    </form>`);
+  document.querySelector("#f").onsubmit = async (event) => {
+    event.preventDefault();
+    const result = await api("/api/rides", {
+      method: "POST",
+      body: {
+        clientId: document.querySelector("#client").value,
+        date: document.querySelector("#date").value,
+        time: document.querySelector("#time").value,
+        pickup: document.querySelector("#pickup").value,
+        dropoff: document.querySelector("#dropoff").value,
+        passengers: Number(document.querySelector("#passengers").value || 1),
+        fare: document.querySelector("#fare").value,
+        flight: document.querySelector("#flight").value,
+        notes: document.querySelector("#notes").value,
+      },
+    });
+    if (!result.data.ok) return formError(result.data.error);
+    location.hash = "#/rides/" + result.data.ride.id;
+  };
+}
+
+async function renderInvoice(id, gen) {
+  setTabs(false);
+  shell(`<div id="box" class="muted">Loading…</div>`);
+  const result = await api("/api/invoices/" + id);
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#box");
+  if (!result.data.ok) { box.textContent = result.data.error || "Invoice not found."; return; }
+  const invoice = result.data.invoice;
+  const business = invoice.business;
+  const trip = invoice.trip;
+  const logo = business.logoDataUrl ? `<img class="logo" alt="" src="${esc(business.logoDataUrl)}">` : "";
+  box.innerHTML = `<p class="noprint"><a href="#/rides/${esc(invoice.rideId)}">Back to ride</a></p>
+    <div class="actions noprint">
+      <button class="btn" id="print" type="button">Print</button>
+      <button class="btn ghost" id="txt" type="button">Download text</button>
+      <button class="btn ghost" id="html" type="button">Download page</button>
+    </div>
+    <article class="sheet" id="sheet">
+      <div class="who">${logo}<div><h2>INVOICE</h2><strong>${esc(business.name)}</strong><div>${esc([business.address, business.phone, business.email, business.website].filter(Boolean).join(" · "))}</div></div></div>
+      <p><strong>${esc(invoice.number)}</strong><br>Issued ${esc(longIssued(invoice.issuedOn))}<br>Due on receipt</p>
+      <p class="total">${esc(invoice.fare)}</p>
+      <p><strong>Bill to</strong><br>${esc(invoice.billTo.name)}<br>${esc(invoice.billTo.phone)} ${esc(invoice.billTo.email)}</p>
+      <table>
+        <tr><td>When</td><td>${esc(longIssued(trip.date))} ${esc(time12(trip.time))}</td></tr>
+        <tr><td>Pickup</td><td>${esc(trip.pickup)}</td></tr>
+        <tr><td>Drop-off</td><td>${esc(trip.dropoff)}</td></tr>
+        <tr><td>Passengers</td><td>${esc(trip.passengers)}</td></tr>
+        ${trip.flight ? `<tr><td>Flight</td><td>${esc(trip.flight)}</td></tr>` : ""}
+      </table>
+      <p><strong>How to pay</strong><br>${esc(business.paymentInstructions || "Pay the operator directly.")}</p>
+      <p>${esc(business.terms)} ${esc(business.gratuityNote)}</p>
+      <p>Nothing was sent automatically.</p>
+    </article>`;
+  document.querySelector("#print").onclick = () => window.print();
+  document.querySelector("#txt").onclick = () => download(`invoice-${invoice.number}.txt`, invoice.snapshotText, "text/plain");
+  document.querySelector("#html").onclick = () => download(`invoice-${invoice.number}.html`, `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Invoice ${esc(invoice.number)}</title></head><body><pre>${esc(invoice.snapshotText)}</pre></body></html>`, "text/html");
+}
+
+function download(name, contents, type) {
+  const blob = new Blob([contents], { type: type + ";charset=utf-8" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 30000);
+}
+
+async function renderSettings(gen) {
+  setTabs(true);
+  shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card"><h2>Drivers</h2><form id="add-driver"><label>Driver email<input id="driver-email" type="email" required></label><button class="btn" type="submit">Create a driver setup link</button><p class="err" id="driver-err"></p></form><div id="driver-list" class="muted">Loading drivers…</div><p class="note">The link is shown once on this screen and is not emailed. An individual account cannot add drivers.</p></section>` : ""}<div id="box" class="muted">Loading…</div>`);
+  const result = await api("/api/settings");
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#box");
+  if (!result.data.ok) { box.textContent = result.data.error || "Could not load settings."; return; }
+  const s = result.data.settings;
+  const bookingUrl = location.origin + (s.bookingPath || (s.bookingSlug ? "/book/" + s.bookingSlug : ""));
+  if (state.me.role === "owner") api("/api/billing").then((b) => {
+    const card = document.querySelector("#plan-card");
+    if (!card || !b.data.ok) return;
+    const x = b.data.billing;
+    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">Update your card or see past invoices on Stripe's secure billing page (test mode).</p>${portalButtonHtml(true)}` : ""}`;
+    card.hidden = false;
+  }).catch(() => {});
+  box.innerHTML = `<section class="card" id="booking-card">
+      <h2>Your booking page</h2>
+      <p class="sub">Share this link so it sits on a client's phone or a hotel concierge screen. Requests wait in Rides until you approve them. Nothing is emailed or texted.</p>
+      <p><input class="booking-link" id="booking-link" readonly value="${esc(bookingUrl)}"></p>
+      <button class="btn full" id="copy-booking" type="button">Copy link</button>
+      <p class="err" id="booking-copy"></p>
+    </section>
+    <section class="card" id="plan-card" hidden></section>
+    <section class="card" id="export-card">
+      <h2>Export</h2>
+      <p class="sub">Download your rides and clients as spreadsheet files (CSV). This works any time, including after a trial ends.</p>
+      <div class="export-actions"><a class="btn ghost" href="/api/export/rides.csv" download>Rides (CSV)</a><a class="btn ghost" href="/api/export/clients.csv" download>Clients (CSV)</a></div>
+    </section>
+    <section class="card" id="rates-card">
+      <h2>Rates &amp; instant quotes</h2>
+      <p class="sub">Set your vehicles, per-mile and hourly rates, airport flat fares, and fees. Clients see an estimate on your booking page; you confirm the final price when you approve.</p>
+      <a class="btn ghost full" href="#/settings/rates" style="display:block;text-align:center;text-decoration:none">Edit rate sheet</a>
+    </section>
+    <form id="f" class="fields">
+      <label class="full">Business name<input id="businessName" value="${esc(s.businessName)}"></label>
+      <label class="full">Address<input id="address" value="${esc(s.address)}"></label>
+      <label>Phone<input id="phone" type="tel" value="${esc(s.phone)}"></label>
+      <label>Email<input id="email" type="email" value="${esc(s.email)}"></label>
+      <label class="full">Website<input id="website" value="${esc(s.website)}"></label>
+      <label>Invoice prefix<input id="prefix" maxlength="8" value="${esc(s.prefix)}"></label>
+      <label>Next invoice number<input id="nextNumber" inputmode="numeric" value="${esc(s.nextNumber)}"></label>
+      <label class="full">How clients pay you<textarea id="pay">${esc(s.paymentInstructions)}</textarea></label>
+      <label class="full">Terms<textarea id="terms">${esc(s.terms)}</textarea></label>
+      <label class="full">Gratuity line<input id="gratuity" value="${esc(s.gratuityNote)}"></label>
+      <label class="full">Logo (optional PNG, JPG, or WebP)<input id="logo" type="file" accept="image/png,image/jpeg,image/webp"></label>
+      ${s.logoDataUrl ? `<p class="full"><img alt="Current logo" src="${esc(s.logoDataUrl)}" style="width:72px;height:72px;object-fit:contain;background:#fff;border-radius:8px"></p>` : ""}
+      <p class="err full" id="err"></p>
+      <button class="btn full" type="submit">Save business details</button>
+    </form>
+    <p class="note">Invoices stay on this phone until you copy, print, or download them. The app never sends them.</p>
+    <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
+    <button class="btn ghost full" id="out" type="button">Sign out</button>`;
+  document.querySelector("#f").onsubmit = async (event) => {
+    event.preventDefault();
+    const body = {
+      businessName: document.querySelector("#businessName").value,
+      address: document.querySelector("#address").value,
+      phone: document.querySelector("#phone").value,
+      email: document.querySelector("#email").value,
+      website: document.querySelector("#website").value,
+      prefix: document.querySelector("#prefix").value,
+      nextNumber: Number(document.querySelector("#nextNumber").value),
+      paymentInstructions: document.querySelector("#pay").value,
+      terms: document.querySelector("#terms").value,
+      gratuityNote: document.querySelector("#gratuity").value,
+    };
+    const file = document.querySelector("#logo").files[0];
+    if (file) {
+      if (file.size > 120000) return formError("Use a logo under about 120 KB.");
+      body.logoDataUrl = await blobToDataUrl(file);
+    }
+    const saved = await api("/api/settings", { method: "PUT", body });
+    if (!saved.data.ok) return formError(saved.data.error);
+    formError("Saved.");
+    document.querySelector("#err").style.color = "var(--green)";
+  };
+  document.querySelector("#out").onclick = () => signOut();
+  const copyBooking = document.querySelector("#copy-booking");
+  if (copyBooking) copyBooking.onclick = async () => {
+    const input = document.querySelector("#booking-link");
+    const note = document.querySelector("#booking-copy");
+    const url = input && input.value;
+    if (!url) return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(url);
+      else { input.focus(); input.select(); document.execCommand("copy"); }
+      if (note) { note.style.color = "var(--green)"; note.textContent = "Link copied."; }
+    } catch {
+      if (input) { input.focus(); input.select(); }
+      if (note) { note.style.color = ""; note.textContent = "Copy the link from the box above."; }
+    }
+  };
+  if (state.me.accountKind === "fleet") {
+    const listed = await api("/api/drivers");
+    const list = document.querySelector("#driver-list");
+    if (list) {
+      list.innerHTML = listed.data.ok ? listed.data.drivers.map((member) => `<p class="sub">${esc(member.email)} · ${esc(member.role)}</p>`).join("") : (listed.data.error || "Could not load drivers.");
+    }
+    const add = document.querySelector("#add-driver");
+    if (add) add.onsubmit = async (event) => {
+      event.preventDefault();
+      const next = await api("/api/drivers", { method: "POST", body: { email: document.querySelector("#driver-email").value } });
+      const err = document.querySelector("#driver-err");
+      if (!next.data.ok) { if (err) err.textContent = next.data.error || "Could not create the driver link."; return; }
+      if (err) {
+        err.style.color = "var(--green)";
+        err.textContent = "Give this one-time link to the driver. It is not emailed.";
+      }
+      if (list) list.insertAdjacentHTML("afterbegin", `<p><input readonly value="${esc(location.origin + "/#/start/" + next.data.inviteToken)}"></p>`);
+    };
+  }
+}
+
+function blobToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("logo"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function adminTrialText(t) {
+  if (!t) return "";
+  if (t.state === "active") return "Paying customer · no trial limits";
+  if (t.state === "ended") {
+    const why = t.endedReason === "rides" ? t.ridesUsed + " rides completed" : t.endedReason === "days" ? "30 days passed" : "ended by you";
+    return "Free trial ended (" + why + ") · " + t.ridesUsed + " of " + t.rideLimit + " rides used";
+  }
+  return "Free trial · " + t.ridesUsed + " of " + t.rideLimit + " rides used, " + (t.daysLeft <= 1 ? "last day" : t.daysLeft + " days left") + " (ends " + t.endsOn + ")";
+}
+function adminTrialHtml(c) {
+  if (!c) return "";
+  const t = c.trial;
+  const paying = t.plan === "active";
+  return `<div class="trial-admin" data-state="${esc(t.state)}">
+      <h3>Trial status</h3>
+      <p class="trial-line">${esc(adminTrialText(t))}</p>
+      <p class="sub">Booking page: ${t.open ? "open" : "paused (shows a call or email message)"}${c.waitingRequests ? " · " + esc(c.waitingRequests) + " waiting request" + (c.waitingRequests === 1 ? "" : "s") : ""}</p>
+      ${paying
+        ? `<button class="btn ghost full" type="button" data-act="trial-back">Move back to free trial</button>
+           <p class="sub">Uses the current trial limits (${esc(t.rideLimit)} rides, ${esc(t.days)} days from the start). If they are already used up, the trial shows as ended; add rides or days below.</p>`
+        : `<button class="btn approve full" type="button" data-act="trial-active">Mark as paying customer</button>
+           <p class="sub">Lifts all trial limits right away and reopens the booking page. Rides, clients, and invoices all stay.</p>`}
+      <div class="trial-extend">
+        <label>Add rides<input name="addRides" inputmode="numeric" placeholder="0"></label>
+        <label>Add days<input name="addDays" inputmode="numeric" placeholder="0"></label>
+      </div>
+      <button class="btn ghost full" type="button" data-act="trial-extend">${paying ? "Save trial limits" : "Extend free trial"}</button>
+      ${!paying && t.state !== "ended" ? `<button class="btn danger full" type="button" data-act="trial-end">End free trial now</button>` : ""}
+      <p class="err trial-msg"></p>
+    </div>`;
+}
+
+const BILLING_STATUS_LABEL = { active: "paying (active)", past_due: "payment failed (past due)", canceled: "subscription canceled", incomplete: "first invoice not paid yet" };
+function etDay(ms) { return new Date(ms).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric" }); }
+function accessLine(a) {
+  if (!a || a.state === "none" || a.state === "ok") return "";
+  const text = a.state === "grace" ? `Access: grace period${a.until ? " until " + etDay(a.until) : ""} (owner sees a payment-failed banner)`
+    : a.state === "ending" ? `Access: full until ${etDay(a.until)} (canceled; owner sees an end-date banner)`
+    : `Access: LOCKED${a.until ? " since " + etDay(a.until) : ""} (${a.reason === "payment" ? "payment failed, 7-day grace over" : "canceled, paid period over"}). Data kept.`;
+  return `<p class="sub billing-access" data-access="${esc(a.state)}"><strong>${esc(text)}</strong></p>`;
+}
+function adminBillingHtml(b) {
+  if (!b) return "";
+  return `<div class="billing-admin">
+      <h3>Plan and texting</h3>
+      ${b.subscribed ? `<p class="sub billing-status" data-status="${esc(b.billingStatus || "none")}"><strong>Billing: ${esc(BILLING_STATUS_LABEL[b.billingStatus] || "waiting for Stripe")}</strong>${b.paidThrough ? " · paid through " + esc(new Date(b.paidThrough).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric" })) : ""}${b.lastPaidAt ? " · last paid " + esc(when(b.lastPaidAt)) : ""}</p>${accessLine(b.access)}` : ""}
+      <p class="sub">${esc(b.planLabel)} · about ${esc(b.monthlyEstimate)}/mo${b.extraDrivers ? " incl. " + esc(b.extraDrivers) + " extra driver" + (b.extraDrivers === 1 ? "" : "s") : ""} · ${b.subscribed ? "Stripe test subscription " + esc(b.subscriptionId) : "no Stripe subscription yet"}</p>
+      <label class="check"><input type="checkbox" data-sms-toggle ${b.smsAddon ? "checked" : ""} ${b.smsCanEnable || b.smsAddon ? "" : "disabled"}> Texting add-on</label>
+      ${!b.smsAddon && b.smsEnableNote ? `<p class="sub sms-enable-note"><strong>${esc(b.smsEnableNote)}</strong></p>` : ""}
+      <p class="sub">${b.smsAllowed ? esc(b.smsPriceText) + "." : "Texting is for Small fleet and Fleet plans."} ${b.textingReady ? "Texting is connected." : "Texting is not sending yet (provider setup pending)."} Texts sent this month: ${esc(b.textsThisMonth || 0)} of 500 included.</p>
+      ${b.subscribed ? "" : `<label class="check"><input type="checkbox" name="beta"> Beta tester (BETA50: 50% off the plan setup fee)</label>
+      <button class="btn ghost full" type="button" data-act="billing-start">Start test subscription (Stripe test mode)</button>`}
+      <p class="err billing-msg"></p>
+    </div>`;
+}
+
+// Visible admin messages: never fail silently (Nov 10, 2026).
+function setMsg(p, text, ok) {
+  if (!p) return;
+  p.style.color = ok ? "var(--green)" : "";
+  p.textContent = text;
+  if (p.scrollIntoView) p.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+function adminMsg(box, text, ok) {
+  if (!box) return;
+  let p = box.querySelector(":scope > .admin-msg");
+  if (!p) { p = document.createElement("p"); p.className = "err admin-msg"; p.setAttribute("role", "alert"); box.appendChild(p); }
+  setMsg(p, text, ok);
+}
+async function busy(button, work) {
+  if (!button || button.dataset.busy) return;
+  button.dataset.busy = "1";
+  button.disabled = true;
+  try { await work(); }
+  finally { delete button.dataset.busy; button.disabled = false; }
+}
+const SOMETHING_WRONG = (e) => "Something went wrong (" + ((e && e.message) || "unknown error") + "). Nothing was changed.";
+
+async function renderAdmin(gen) {
+  setTabs(false);
+  setTag();
+  shell(`<h1>Accounts</h1>
+    <button class="btn ghost full" id="out" type="button">Sign out</button>
+    <p class="note">Company accounts only. Passenger names, rides, and invoices stay in each company.</p>
+    <form id="invite" class="card">
+      <h2>New owner</h2>
+      <label>Email<input id="inv-email" type="email" autocomplete="off" required></label>
+      <label>Company<input id="inv-company" required></label>
+      <label>Plan<select id="inv-plan"><option value="solo">Solo</option><option value="small">Small fleet (2-5 drivers)</option><option value="fleet">Fleet (6-15 drivers)</option></select></label>
+      <p class="sub" id="inv-sms-note">Texting (Small fleet and Fleet) can be added from the company card once the customer is paying.</p>
+      <p class="err" id="inv-err"></p>
+      <button class="btn full" type="submit">Create setup link</button>
+      <div id="inv-once"></div>
+    </form>
+    <section class="card" id="billing-status"><h2>Billing (Stripe test mode)</h2><p class="sub" id="billing-line">Checking…</p>
+      <button class="btn ghost full" type="button" id="sms-meter">Set up texting meter (one time)</button><p class="err" id="billing-msg"></p></section>
+    <div id="accounts" class="muted">Loading…</div>
+    <h2>Audit</h2>
+    <div id="audit" class="muted">Loading…</div>`);
+  document.querySelector("#out").onclick = () => signOut();
+  api("/api/platform/billing").then((b) => {
+    const line = document.querySelector("#billing-line");
+    if (!line) return;
+    line.textContent = b.data.ok ? (b.data.stripeConnected ? "Connected to Stripe in test mode. No real charges." : b.data.problem) : "Could not check billing.";
+  }).catch(() => {});
+  document.querySelector("#sms-meter").onclick = (event) => busy(event.currentTarget, async () => {
+    const msg = document.querySelector("#billing-msg");
+    try {
+      const r = await api("/api/platform/billing/sms-meter", { method: "POST", body: {} });
+      setMsg(msg, r.data.ok ? (r.data.created ? "Texting meter and extra-text price created in Stripe test mode." : "Texting meter is already set up.") : (r.data.error || "Could not set up the meter."), r.data.ok);
+    } catch (e) { setMsg(msg, SOMETHING_WRONG(e), false); }
+  });
+  const listed = await api("/api/platform/accounts");
+  const audit = await api("/api/platform/audit");
+  const trials = await api("/api/platform/trials");
+  const trialById = {};
+  if (trials.data.ok) for (const c of trials.data.companies) trialById[c.id] = c;
+  if (gen !== renderGen) return;
+  const accounts = document.querySelector("#accounts");
+  const auditBox = document.querySelector("#audit");
+  if (!listed.data.ok) {
+    accounts.textContent = listed.data.error || "Could not load accounts.";
+    return;
+  }
+  accounts.innerHTML = listed.data.accounts.length ? listed.data.accounts.map((account) => `<article class="card" data-company="${esc(account.id)}" data-owner="${esc(account.ownerEmail || "")}" data-plan="${esc(account.billing ? account.billing.plan : account.plan)}">
+      <div class="row"><span class="title">${esc(account.name)}</span><span class="badge ${account.status === "suspended" ? "cancelled" : "completed"}">${esc(account.status)}</span></div>
+      <p class="sub">${esc(account.billing ? account.billing.planLabel : (account.plan === "fleet" ? "Fleet" : "Solo"))} · ${esc(account.driverCount)} drivers</p>
+      <p class="sub">Owner ${esc(account.ownerEmail || "none")}</p>
+      <p class="sub">Created ${esc(when(account.createdAt))}</p>
+      <p class="sub">Last sign-in ${esc(when(account.lastSignInAt))}</p>
+      <div class="admin-actions">
+        <button class="btn ghost" type="button" data-act="edit">Edit name and plan</button>
+        <button class="btn ${account.status === "suspended" ? "" : "danger"}" type="button" data-act="${account.status === "suspended" ? "reactivate" : "suspend"}">${account.status === "suspended" ? "Reactivate" : "Suspend"}</button>
+        <button class="btn ghost" type="button" data-act="reset">Password reset link</button>
+      </div>
+      <div class="once" aria-live="polite"></div>
+      ${adminTrialHtml(trialById[account.id])}
+      ${adminBillingHtml(account.billing)}
+    </article>`).join("") : `<p>No customer accounts yet.</p>`;
+  if (trials.data.ok) accounts.insertAdjacentHTML("afterbegin", `<p class="sub" id="beta-spots">Beta spots: ${esc(trials.data.betaSpots.onTrial)} of ${esc(trials.data.betaSpots.limit)} on a free trial now.</p>`);
+  auditBox.innerHTML = audit.data.ok && audit.data.audit.length ? audit.data.audit.map((row) => {
+    let detail = "";
+    try { detail = Object.entries(JSON.parse(row.detail || "{}")).map(([key, value]) => `${key} ${value}`).join(" · "); } catch { detail = ""; }
+    return `<p class="sub">${esc(when(row.createdAt))} · ${esc(row.action)} · ${esc(detail)}</p>`;
+  }).join("") : `<p class="sub">No admin actions yet.</p>`;
+  document.querySelector("#invite").onsubmit = (event) => {
+    event.preventDefault();
+    const err = document.querySelector("#inv-err");
+    return busy(event.target.querySelector("[type=submit]"), async () => { try {
+    const result = await api("/api/platform/invites", {
+      method: "POST",
+      body: {
+        email: document.querySelector("#inv-email").value,
+        companyName: document.querySelector("#inv-company").value,
+        plan: document.querySelector("#inv-plan").value,
+      },
+    });
+    if (!result.data.ok) { setMsg(err, result.data.error || "Could not create the link.", false); return; }
+    setMsg(err, "Copy this one-time link now. It is not emailed or saved.", true);
+    const link = location.origin + "/#/start/" + result.data.inviteToken;
+    document.querySelector("#inv-once").innerHTML = `<label>Setup link<input readonly value="${esc(link)}"></label>`;
+    } catch (e) { setMsg(err, SOMETHING_WRONG(e), false); } });
+  };
+  accounts.onchange = async (event) => {
+    const box = event.target.closest("[data-sms-toggle]");
+    if (!box) return;
+    const card = box.closest("[data-company]");
+    const msg = card.querySelector(".billing-msg");
+    box.disabled = true;
+    let result;
+    try { result = await api("/api/platform/companies/" + card.dataset.company + "/sms", { method: "POST", body: { enabled: box.checked } }); }
+    catch (e) { result = { data: { ok: false, error: SOMETHING_WRONG(e) } }; }
+    box.disabled = false;
+    if (!result.data.ok) { box.checked = !box.checked; setMsg(msg, result.data.error || "Could not change texting.", false); return; }
+    msg.style.color = "var(--green)";
+    msg.textContent = (box.checked ? "Texting add-on on. " : "Texting add-on off. ") + (result.data.note || "") + " Monthly estimate " + result.data.billing.monthlyEstimate + ".";
+  };
+  accounts.onclick = (event) => {
+    const button = event.target.closest("[data-act]");
+    if (!button) return;
+    const card = button.closest("[data-company]");
+    if (!card) return;
+    return busy(button, async () => {
+      try { await adminCardAction(button, card); }
+      catch (e) { adminMsg(card.querySelector(".once"), SOMETHING_WRONG(e), false); }
+    });
+  };
+  const adminCardAction = async (button, card) => {
+    const id = card.dataset.company;
+    const once = card.querySelector(".once");
+    if (button.dataset.act === "billing-start") {
+      const box = card.querySelector(".billing-admin");
+      const msg = box.querySelector(".billing-msg");
+      const beta = box.querySelector("[name=beta]").checked;
+      const result = await api("/api/platform/companies/" + id + "/subscription", { method: "POST", body: { beta } });
+      if (!result.data.ok) { setMsg(msg, result.data.error || "Could not start the test subscription.", false); return; }
+      msg.style.color = "var(--green)";
+      msg.innerHTML = "Test subscription " + esc(result.data.subscriptionId) + " (" + esc(result.data.status) + ")." + (result.data.invoiceUrl ? ` First invoice (test): <a href="${esc(result.data.invoiceUrl)}" target="_blank" rel="noopener">open</a>` : "");
+      return;
+    }
+    if (button.dataset.act.startsWith("trial-")) {
+      const act = button.dataset.act;
+      const box = card.querySelector(".trial-admin");
+      const msg = box.querySelector(".trial-msg");
+      let body = null;
+      if (act === "trial-active") body = { status: "active" };
+      else if (act === "trial-back") body = { status: "trial" };
+      else if (act === "trial-end") body = { status: "ended" };
+      else if (act === "trial-extend") {
+        const addRides = box.querySelector("[name=addRides]").value.trim();
+        const addDays = box.querySelector("[name=addDays]").value.trim();
+        body = { addRides: addRides ? Number(addRides) : 0, addDays: addDays ? Number(addDays) : 0 };
+      }
+      const result = await api("/api/platform/companies/" + id + "/trial", { method: "POST", body });
+      if (!result.data.ok) { setMsg(msg, result.data.error || "Could not update the trial.", false); return; }
+      route();
+      return;
+    }
+    if (button.dataset.act === "edit") {
+      const name = card.querySelector(".title").textContent;
+      const plan = card.dataset.plan === "fleet" ? "fleet" : card.dataset.plan === "small" ? "small" : "solo";
+      once.innerHTML = `<form class="edit">
+        <label>Name<input name="name" value="${esc(name)}" required></label>
+        <label>Plan<select name="plan"><option value="solo" ${plan === "solo" ? "selected" : ""}>Solo</option><option value="small" ${plan === "small" ? "selected" : ""}>Small fleet</option><option value="fleet" ${plan === "fleet" ? "selected" : ""}>Fleet</option></select></label>
+        <button class="btn full" type="submit">Save</button>
+      </form>`;
+      const editForm = once.querySelector("form");
+      editForm.onsubmit = (submit) => {
+        submit.preventDefault();
+        return busy(editForm.querySelector("[type=submit]"), async () => { try {
+          const saved = await api("/api/platform/companies/" + id, {
+            method: "PATCH",
+            body: { name: editForm.elements.name.value, plan: editForm.elements.plan.value },
+          });
+          if (!saved.data.ok) { adminMsg(once, saved.data.error || "Could not save.", false); return; }
+          route();
+        } catch (e) { adminMsg(once, SOMETHING_WRONG(e), false); } });
+      };
+      editForm.elements.name.focus({ preventScroll: true });
+      once.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      return;
+    }
+    if (button.dataset.act === "reset") {
+      const owner = card.dataset.owner || "";
+      once.innerHTML = `<form class="reset">
+        <label>User email<input name="email" type="email" value="${esc(owner)}" required></label>
+        <button class="btn full" type="submit">Create reset link</button>
+      </form>`;
+      const resetForm = once.querySelector("form");
+      resetForm.onsubmit = (submit) => {
+        submit.preventDefault();
+        return busy(resetForm.querySelector("[type=submit]"), async () => { try {
+          const result = await api("/api/platform/resets", { method: "POST", body: { email: resetForm.elements.email.value } });
+          if (!result.data.ok) { adminMsg(once, result.data.error || "Could not create the link.", false); return; }
+          const link = location.origin + "/#/start/" + result.data.inviteToken;
+          once.innerHTML = `<p class="note">Copy this reset link now. It is shown once.</p><label>Reset link<input readonly value="${esc(link)}"></label>`;
+        } catch (e) { adminMsg(once, SOMETHING_WRONG(e), false); } });
+      };
+      if (!owner) adminMsg(once, "This company has no owner yet. Enter the user's email.", false);
+      resetForm.elements.email.focus({ preventScroll: true });
+      once.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      return;
+    }
+    const path = button.dataset.act === "suspend" ? "suspend" : "reactivate";
+    const result = await api("/api/platform/companies/" + id + "/" + path, { method: "POST", body: {} });
+    if (!result.data.ok) { once.innerHTML = ""; adminMsg(once, result.data.error || "Could not update the company.", false); return; }
+    route();
+  };
+}
+
+// ---- Rate sheet editor (More > Rates & instant quotes), draft Nov 10, 2026 ----
+const RS_BLANK_VEHICLE = () => ({ name: "", seats: "", base: "", perMile: "", minimum: "", hourlyRate: "", minHours: "", blockMinutes: "", blockPrice: "" });
+const RS_BLANK_FARE = (n) => ({ place: "", placeKeywords: "", area: "", areaKeywords: "", prices: Array.from({ length: n }, () => ({ oneWay: "", roundTrip: "" })) });
+
+function rsFromServer(enabled, sheet) {
+  const s = sheet || { vehicles: [{ ...RS_BLANK_VEHICLE(), name: "Sedan", seats: "3" }], flatFares: [], fees: [], gratuityPercent: 0, roundTripFactor: 2, roundTo: 1, maxMiles: 100 };
+  const names = s.vehicles.map((v) => v.name);
+  return {
+    enabled: !!enabled,
+    vehicles: s.vehicles.map((v) => ({ ...RS_BLANK_VEHICLE(), ...v })),
+    flatFares: (s.flatFares || []).map((f) => ({ ...f, prices: names.map((name) => ({ oneWay: "", roundTrip: "", ...((f.prices || {})[name] || {}) })) })),
+    fees: (s.fees || []).map((f) => ({ label: f.label, kind: f.kind, appliesTo: f.appliesTo || "all", amount: f.amount })),
+    gratuityPercent: String(s.gratuityPercent ?? 0),
+    roundTripFactor: String(s.roundTripFactor ?? 2),
+    roundTo: String(s.roundTo ?? 1),
+    maxMiles: String(s.maxMiles ?? 100),
+  };
+}
+
+function rsToServer(rs) {
+  return {
+    enabled: rs.enabled,
+    rateSheet: {
+      vehicles: rs.vehicles,
+      flatFares: rs.flatFares.map((f) => ({
+        place: f.place, placeKeywords: f.placeKeywords, area: f.area, areaKeywords: f.areaKeywords,
+        prices: Object.fromEntries(rs.vehicles.map((v, i) => [v.name, f.prices[i] || { oneWay: "", roundTrip: "" }]).filter(([name]) => name)),
+      })),
+      fees: rs.fees,
+      gratuityPercent: rs.gratuityPercent,
+      roundTripFactor: rs.roundTripFactor,
+      roundTo: Number(rs.roundTo),
+      maxMiles: rs.maxMiles,
+    },
+  };
+}
+
+function rsField(path, labelText, value, opts = {}) {
+  const attrs = `data-path="${esc(path)}"${opts.mode ? ` inputmode="${opts.mode}"` : ""}${opts.placeholder ? ` placeholder="${esc(opts.placeholder)}"` : ""}`;
+  return `<label class="${opts.full ? "full" : ""}">${esc(labelText)}<input ${attrs} value="${esc(value)}"></label>`;
+}
+
+function rsEditorHtml(rs, distanceOn) {
+  const vehicleNames = rs.vehicles.map((v, i) => v.name || "Vehicle " + (i + 1));
+  const vehicles = rs.vehicles.map((v, i) => `<div class="rate-vehicle">
+      <div class="row"><h3 class="title">${esc(v.name || "Vehicle " + (i + 1))}</h3>${rs.vehicles.length > 1 ? `<button type="button" class="linkbtn" data-remove-vehicle="${i}">Remove</button>` : ""}</div>
+      <div class="rate-grid">
+        ${rsField(`vehicles.${i}.name`, "Name", v.name, { placeholder: "Sedan, SUV, Sprinter" })}
+        ${rsField(`vehicles.${i}.seats`, "Seats", v.seats, { mode: "numeric", placeholder: "e.g. 3" })}
+        ${rsField(`vehicles.${i}.base`, "Base fare $", v.base, { mode: "decimal" })}
+        ${rsField(`vehicles.${i}.perMile`, "Per mile $", v.perMile, { mode: "decimal" })}
+        ${rsField(`vehicles.${i}.minimum`, "Trip minimum $", v.minimum, { mode: "decimal" })}
+        ${rsField(`vehicles.${i}.hourlyRate`, "Hourly rate $", v.hourlyRate, { mode: "decimal" })}
+        ${rsField(`vehicles.${i}.minHours`, "Minimum hours", v.minHours, { mode: "decimal" })}
+        <label>After the minimum<select data-path="vehicles.${i}.blockMinutes">${[["", "Hourly rate"], ["15", "Per 15 min"], ["30", "Per 30 min"], ["60", "Per 60 min"]].map(([val, text]) => `<option value="${val}"${String(v.blockMinutes || "") === val ? " selected" : ""}>${text}</option>`).join("")}</select></label>
+        ${v.blockMinutes ? rsField(`vehicles.${i}.blockPrice`, `Price per ${v.blockMinutes} min after minimum $`, v.blockPrice, { mode: "decimal", full: true }) : ""}
+      </div>
+    </div>`).join("");
+  const fares = rs.flatFares.map((f, i) => `<div class="rate-fare">
+      <div class="row"><h3 class="title">${esc(f.place || "Flat fare " + (i + 1))}${f.area ? " \u00b7 " + esc(f.area) : ""}</h3><button type="button" class="linkbtn" data-remove-fare="${i}">Remove</button></div>
+      <div class="rate-grid">
+        ${rsField(`flatFares.${i}.place`, "Place", f.place, { placeholder: "ATL Airport" })}
+        ${rsField(`flatFares.${i}.placeKeywords`, "Matches words", f.placeKeywords, { placeholder: "atl, hartsfield" })}
+        ${rsField(`flatFares.${i}.area`, "Only from/to area (optional)", f.area, { placeholder: "Anywhere" })}
+        ${rsField(`flatFares.${i}.areaKeywords`, "Area matches words", f.areaKeywords, { placeholder: "e.g. buckhead" })}
+        ${rs.vehicles.map((v, vi) => `${rsField(`flatFares.${i}.prices.${vi}.oneWay`, vehicleNames[vi] + " one way $", (f.prices[vi] || {}).oneWay || "", { mode: "decimal" })}${rsField(`flatFares.${i}.prices.${vi}.roundTrip`, vehicleNames[vi] + " round trip $", (f.prices[vi] || {}).roundTrip || "", { mode: "decimal", placeholder: "x" + (rs.roundTripFactor || 2) })}`).join("")}
+      </div>
+    </div>`).join("");
+  const fees = rs.fees.map((fee, i) => `<div class="fee-row">
+      ${rsField(`fees.${i}.label`, "Fee name", fee.label, { placeholder: "Airport fee" })}
+      <label>Type<select data-path="fees.${i}.kind"><option value="flat"${fee.kind !== "percent" ? " selected" : ""}>$</option><option value="percent"${fee.kind === "percent" ? " selected" : ""}>% of fare</option></select></label>
+      ${rsField(`fees.${i}.amount`, "Amount", fee.amount, { mode: "decimal" })}
+      <label class="full">Applies to<select data-path="fees.${i}.appliesTo"><option value="all"${fee.appliesTo !== "flat" ? " selected" : ""}>Every trip</option><option value="flat"${fee.appliesTo === "flat" ? " selected" : ""}>Flat-fare trips only (e.g. airport)</option></select></label>
+      <button type="button" class="linkbtn full" data-remove-fee="${i}">Remove fee</button>
+    </div>`).join("");
+  return `<form id="rates" novalidate>
+    <section class="card">
+      <label class="switch"><input type="checkbox" data-path="enabled"${rs.enabled ? " checked" : ""}> Show instant estimates on my booking page</label>
+      <p class="sub">Clients see an estimate with a short breakdown before they send a request. You still set the final price when you approve. Nothing is charged.</p>
+      ${distanceOn ? "" : `<p class="note">Road-distance pricing is off until a maps key is added. Flat fares and hourly rates still give estimates; other trips show \u201cPrice on request\u201d and still come through.</p>`}
+    </section>
+    <section class="card">
+      <h2>Vehicles</h2>
+      <p class="sub">Distance trips: base fare + per mile, at least the trip minimum. Hourly: rate x hours, at least the minimum hours.</p>
+      ${vehicles}
+      ${rs.vehicles.length < 6 ? `<button type="button" class="btn ghost full" id="add-vehicle">Add a vehicle</button>` : ""}
+    </section>
+    <section class="card">
+      <h2>Flat fares</h2>
+      <p class="sub">A set price to or from a place, such as the airport. Works either direction and needs no distance lookup. Add an area to price, for example, Buckhead to ATL differently from Midtown to ATL. Leave a vehicle blank if you don't offer that fare in it.</p>
+      ${fares || `<p class="muted">No flat fares yet.</p>`}
+      <div class="actions">
+        <button type="button" class="btn ghost" id="add-airport">Add ATL airport fare</button>
+        <button type="button" class="btn ghost" id="add-fare">Add another flat fare</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Fees, gratuity, and rounding</h2>
+      ${fees || `<p class="muted">No fees.</p>`}
+      ${rs.fees.length < 5 ? `<button type="button" class="btn ghost full" id="add-fee">Add a fee</button>` : ""}
+      <div class="rate-grid" style="margin-top:12px">
+        ${rsField("gratuityPercent", "Gratuity % (0 = not included)", rs.gratuityPercent, { mode: "decimal" })}
+        ${rsField("roundTripFactor", "Round trip = one way x", rs.roundTripFactor, { mode: "decimal" })}
+        <label>Round fares up to<select data-path="roundTo">${[["1", "$1"], ["5", "$5"], ["10", "$10"]].map(([val, text]) => `<option value="${val}"${String(rs.roundTo) === val ? " selected" : ""}>${text}</option>`).join("")}</select></label>
+        ${rsField("maxMiles", "Longest trip to estimate (mi)", rs.maxMiles, { mode: "numeric" })}
+      </div>
+    </section>
+    <p class="err" id="err"></p>
+    <button class="btn full" type="submit">Save rate sheet</button>
+  </form>
+  <section class="card" style="margin-top:12px">
+    <h2>Try a quote</h2>
+    <p class="sub">Uses your saved rates, even while estimates are hidden from clients.</p>
+    <form id="tryq" novalidate>
+      <label>Trip type<select id="tq-type"><option value="one-way">One way</option><option value="round-trip">Round trip</option><option value="hourly">Hourly</option></select></label>
+      <label>Vehicle<select id="tq-vehicle">${rs.vehicles.filter((v) => v.id).map((v) => `<option value="${esc(v.id)}">${esc(v.name)}</option>`).join("")}</select></label>
+      <label>Pickup<input id="tq-pickup" placeholder="Hotel or address"></label>
+      <label>Drop-off<input id="tq-dropoff" placeholder="ATL Airport"></label>
+      <label>Hours (hourly)<input id="tq-hours" inputmode="decimal" placeholder="3"></label>
+      <button class="btn ghost full" type="submit">Get estimate</button>
+      <div id="tq-out" class="sub"></div>
+    </form>
+  </section>`;
+}
+
+function rsCollect(rs) {
+  document.querySelectorAll("#rates [data-path]").forEach((el) => {
+    const parts = el.dataset.path.split(".");
+    let target = rs;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const key = /^\d+$/.test(parts[i]) ? Number(parts[i]) : parts[i];
+      if (target[key] == null) target[key] = /^\d+$/.test(parts[i + 1]) ? [] : {};
+      target = target[key];
+    }
+    const last = parts[parts.length - 1];
+    target[last] = el.type === "checkbox" ? el.checked : el.value;
+  });
+  return rs;
+}
+
+function quoteBoxHtml(quote) {
+  if (!quote) return "";
+  return `<div class="quote-box">
+      <div class="row"><span class="sub" style="margin:0">Quoted estimate${quote.label ? " \u00b7 " + esc(quote.label) : ""}</span><span class="qtotal">${esc(quote.total)}</span></div>
+      ${quote.lines && quote.lines.length ? `<table class="qlines">${quote.lines.map((line) => `<tr><td>${esc(line.label)}</td><td>${esc(line.amount)}</td></tr>`).join("")}</table>` : ""}
+      ${quote.notes && quote.notes.length ? `<div class="sub">${esc(quote.notes.join(" "))}</div>` : ""}
+    </div>`;
+}
+
+function tripLine(ride) {
+  const bits = [];
+  if (ride.tripTypeLabel) bits.push(ride.tripTypeLabel + (ride.tripType === "hourly" && ride.hours ? " " + ride.hours + " h" : ""));
+  if (ride.vehicleName) bits.push(ride.vehicleName);
+  return bits.join(" \u00b7 ");
+}
+
+function fareSuggestion(ride) {
+  if (ride.quote && ride.quote.totalCents != null) return (ride.quote.totalCents / 100).toFixed(2).replace(/\.00$/, "");
+  return "";
+}
+
+const FARE_RE = /^\$?\d{1,3}(,?\d{3})*(\.\d{1,2})?$|^\$?\d+(\.\d{1,2})?$/;
+function fareOk(value) {
+  return FARE_RE.test(String(value || "").trim());
+}
+
+// Approve needs a typed final price. The estimate is shown as a suggestion only.
+function approveBlockHtml(ride, inputAttr, buttonAttr) {
+  const suggestion = fareSuggestion(ride);
+  return `<div class="approve-price"><label>Final price $<input inputmode="decimal" ${inputAttr} value="" placeholder="${esc(suggestion ? "Estimate " + suggestion : "e.g. 125")}" autocomplete="off"></label><button class="btn approve" type="button" ${buttonAttr} disabled>Approve</button></div>
+    <p class="sub fare-hint">${suggestion ? `Enter the final price to approve. <button type="button" class="linkbtn use-est" data-use="${esc(suggestion)}">Use estimate $${esc(suggestion)}</button>` : "Enter the final price to approve."}</p>`;
+}
+
+function wireApproveBlock(root) {
+  root.querySelectorAll(".approve-price input").forEach((input) => {
+    const block = input.closest(".approve-price");
+    const button = block.querySelector("button.approve");
+    const sync = () => { button.disabled = !fareOk(input.value); };
+    input.addEventListener("input", sync);
+    sync();
+    const use = block.nextElementSibling && block.nextElementSibling.querySelector(".use-est");
+    if (use) use.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); input.value = use.dataset.use; sync(); input.focus(); });
+  });
+}
+
+async function renderRateSheet(gen) {
+  setTabs(true);
+  shell(`<p class="muted"><a href="#/settings">More</a></p><h1>Rates &amp; instant quotes</h1><div id="box" class="muted">Loading\u2026</div>`);
+  const result = await api("/api/rate-sheet");
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#box");
+  if (!result.data.ok) { box.textContent = result.data.error || "Could not load your rates."; return; }
+  const distanceOn = !!result.data.distanceLookup;
+  let rs = rsFromServer(result.data.enabled, result.data.rateSheet);
+  const draw = () => {
+    box.classList.remove("muted");
+    box.innerHTML = rsEditorHtml(rs, distanceOn);
+    const on = (sel, fn) => { const el = document.querySelector(sel); if (el) el.onclick = () => { rsCollect(rs); fn(); draw(); }; };
+    on("#add-vehicle", () => { rs.vehicles.push(RS_BLANK_VEHICLE()); rs.flatFares.forEach((f) => f.prices.push({ oneWay: "", roundTrip: "" })); });
+    on("#add-fare", () => rs.flatFares.push(RS_BLANK_FARE(rs.vehicles.length)));
+    on("#add-airport", () => rs.flatFares.push({ ...RS_BLANK_FARE(rs.vehicles.length), place: "ATL Airport", placeKeywords: "atl, hartsfield, atlanta airport, atl airport, hartsfield-jackson" }));
+    on("#add-fee", () => rs.fees.push({ label: "", kind: "flat", appliesTo: "all", amount: "" }));
+    document.querySelectorAll("[data-remove-vehicle]").forEach((b) => b.onclick = () => { rsCollect(rs); const i = Number(b.dataset.removeVehicle); rs.vehicles.splice(i, 1); rs.flatFares.forEach((f) => f.prices.splice(i, 1)); draw(); });
+    document.querySelectorAll("[data-remove-fare]").forEach((b) => b.onclick = () => { rsCollect(rs); rs.flatFares.splice(Number(b.dataset.removeFare), 1); draw(); });
+    document.querySelectorAll("[data-remove-fee]").forEach((b) => b.onclick = () => { rsCollect(rs); rs.fees.splice(Number(b.dataset.removeFee), 1); draw(); });
+    document.querySelectorAll('#rates select[data-path$=".blockMinutes"]').forEach((sel) => sel.onchange = () => { rsCollect(rs); draw(); });
+    const form = document.querySelector("#rates");
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      rsCollect(rs);
+      const button = form.querySelector("button[type=submit]");
+      button.disabled = true;
+      try {
+        const saved = await api("/api/rate-sheet", { method: "PUT", body: rsToServer(rs) });
+        if (gen !== renderGen) return;
+        if (!saved.data.ok) { formError(saved.data.error || "Could not save your rates."); return; }
+        rs = rsFromServer(saved.data.enabled, saved.data.rateSheet);
+        draw();
+        formError(rs.enabled ? "Saved. Clients now see estimates on your booking page." : "Saved. Estimates stay hidden until you turn them on.");
+        document.querySelector("#err").style.color = "var(--green)";
+      } finally {
+        button.disabled = false;
+      }
+    };
+    document.querySelector("#tryq").onsubmit = async (event) => {
+      event.preventDefault();
+      const out = document.querySelector("#tq-out");
+      out.textContent = "Calculating\u2026";
+      const next = await api("/api/rate-sheet/preview", { method: "POST", body: {
+        tripType: document.querySelector("#tq-type").value,
+        vehicle: document.querySelector("#tq-vehicle").value,
+        pickup: document.querySelector("#tq-pickup").value,
+        dropoff: document.querySelector("#tq-dropoff").value,
+        hours: Number(document.querySelector("#tq-hours").value) || null,
+      } });
+      if (!next.data.ok) { out.textContent = next.data.error || "Could not get an estimate."; return; }
+      const q = next.data.quote;
+      if (!q) { out.textContent = "Choose a vehicle."; return; }
+      if (!q.available) { out.textContent = "Price on request: " + q.message; return; }
+      out.innerHTML = quoteBoxHtml({ total: (q.estimate ? "About " : "") + q.total, label: q.label + (q.miles ? ", " + q.miles + " mi" : ""), lines: q.lines, notes: q.notes });
+    };
+  };
+  draw();
+}
+
+async function route() {
+  locWatch.on = false;
+  locWatch.rideId = "";
+  locStopWatch();
+  const gen = ++renderGen;
+  const { name, id } = routeName();
+  setTag();
+  if (name === "where" && id) return renderWhere(id, gen);
+  if (state.me && state.me.platformAdmin && name !== "admin" && name !== "login" && name !== "start") {
+    location.hash = "#/admin";
+    return;
+  }
+  if (name === "admin") {
+    if (!state.me || !state.me.platformAdmin) {
+      location.hash = state.me ? "#/rides" : "#/login";
+      return;
+    }
+    return renderAdmin(gen);
+  }
+  if (billingLocked() && name !== "login" && name !== "start") return renderLocked();
+  if (state.me && state.me.role === "driver" && name !== "rides" && name !== "login" && name !== "start") {
+    location.hash = "#/rides";
+    return;
+  }
+  if (!state.me && name !== "login" && name !== "start") return renderLogin();
+  if (name === "login") return renderLogin();
+  if (name === "start") return renderStart();
+  if (name === "clients" && id === "new") return renderClientForm("", gen);
+  if (name === "clients" && id) return renderClientForm(id, gen);
+  if (name === "clients") return renderClients(gen);
+  if (name === "new") return renderNewRide(gen);
+  if (name === "rides" && id) return renderRide(id, gen);
+  if (name === "invoices" && id) return renderInvoice(id, gen);
+  if (name === "settings" && id === "rates") return renderRateSheet(gen);
+  if (name === "settings") return renderSettings(gen);
+  return renderRides(gen);
+}
+
+tabs.onclick = (event) => {
+  const button = event.target.closest("[data-go]");
+  if (button) location.hash = button.dataset.go;
+};
+window.addEventListener("hashchange", () => { route(); });
+boot();

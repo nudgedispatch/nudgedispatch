@@ -1,0 +1,366 @@
+"use strict";
+
+(function () {
+  const $ = (s) => document.querySelector(s);
+  const form = $("#bf");
+  const slugMatch = /^\/book\/([^/]+)\/?$/.exec(location.pathname);
+  const slug = slugMatch ? decodeURIComponent(slugMatch[1]) : "";
+
+  function todayIso() {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+  }
+
+  function tomorrowIso() {
+    const parts = todayIso().split("-").map(Number);
+    const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2] + 1));
+    return d.toISOString().slice(0, 10);
+  }
+
+  function timeLabel(h, m) {
+    return ((h % 12) || 12) + ":" + String(m).padStart(2, "0") + " " + (h < 12 ? "AM" : "PM");
+  }
+
+  function fillTimes() {
+    const sel = form.time;
+    for (let minutes = 0; minutes < 1440; minutes += 15) {
+      const h = Math.floor(minutes / 60);
+      const m = minutes % 60;
+      const option = document.createElement("option");
+      option.value = String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+      option.textContent = timeLabel(h, m);
+      sel.appendChild(option);
+    }
+  }
+
+  function setDateDefaults() {
+    form.date.value = tomorrowIso();
+    form.date.min = todayIso();
+  }
+
+  function showErr(message) {
+    const err = $("#err");
+    err.textContent = message || "";
+    err.classList.toggle("hidden", !message);
+  }
+
+  function showUnavailable() {
+    $("#load").classList.add("hidden");
+    form.classList.add("hidden");
+    $("#heading").classList.add("hidden");
+    $("#done").classList.add("hidden");
+    $("#unavailable").classList.remove("hidden");
+    document.title = "Booking page not available";
+  }
+
+  function showClosed(closed) {
+    $("#load").classList.add("hidden");
+    form.classList.add("hidden");
+    $("#heading").classList.add("hidden");
+    $("#done").classList.add("hidden");
+    const info = closed || {};
+    $("#closedTxt").textContent = info.message || "This company is not taking online requests right now. Please contact them directly to book.";
+    const box = $("#closedContact");
+    box.innerHTML = "";
+    if (info.phone) {
+      const a = document.createElement("a");
+      a.className = "btn";
+      a.href = "tel:" + String(info.phone).replace(/[^0-9+]/g, "");
+      a.textContent = "Call " + info.phone;
+      box.appendChild(a);
+    }
+    if (info.email) {
+      const a = document.createElement("a");
+      a.className = "btn ghost";
+      a.href = "mailto:" + info.email;
+      a.textContent = "Email " + info.email;
+      box.appendChild(a);
+    }
+    $("#closed").classList.remove("hidden");
+  }
+
+  async function api(path, options) {
+    const headers = { "X-Nudge-Client": "1" };
+    if (options && options.body) headers["Content-Type"] = "application/json";
+    const response = await fetch(path, {
+      method: (options && options.method) || "GET",
+      headers,
+      body: options && options.body ? JSON.stringify(options.body) : undefined,
+      credentials: "same-origin",
+    });
+    const data = await response.json().catch(() => ({ ok: false, error: "Unexpected response." }));
+    return { status: response.status, data };
+  }
+
+  let companyName = "";
+  let quoteInfo = null;
+  let quoteSeq = 0;
+  let quoteTimer = 0;
+  let lastFocus = "dropoff";
+
+  function hoursText(h) {
+    const whole = Math.floor(h);
+    const mins = Math.round((h - whole) * 60);
+    return whole + (mins ? ":" + String(mins).padStart(2, "0") : "") + " hour" + (h === 1 ? "" : "s");
+  }
+
+  function selectedVehicle() {
+    if (!quoteInfo) return null;
+    return (quoteInfo.vehicles || []).find((v) => v.id === form.vehicle.value) || null;
+  }
+
+  function fillHours() {
+    const v = selectedVehicle();
+    const min = Math.max(1, (v && v.minHours) || 1);
+    const keep = form.hours.value;
+    form.hours.innerHTML = '<option value="">Select hours</option>';
+    for (let h = min; h <= 12; h += 0.5) {
+      const o = document.createElement("option");
+      o.value = String(h);
+      o.textContent = hoursText(h) + (v && v.minHours && h === v.minHours ? " (minimum)" : "");
+      form.hours.appendChild(o);
+    }
+    if (keep && Number(keep) >= min) form.hours.value = keep;
+  }
+
+  function syncTripFields() {
+    const hourly = form.tripType.value === "hourly";
+    $("#hoursWrap").classList.toggle("hidden", !hourly);
+    $("#dropLabel").textContent = hourly ? "Drop-off address (optional for hourly)" : "Drop-off address";
+    form.dropoff.required = !hourly;
+    fillHours();
+  }
+
+  function setupQuotes(info) {
+    quoteInfo = info && Array.isArray(info.vehicles) && info.vehicles.length ? info : null;
+    $("#vehicleWrap").classList.toggle("hidden", !quoteInfo);
+    $("#quote").classList.toggle("hidden", !quoteInfo);
+    if (!quoteInfo) return;
+    form.vehicle.innerHTML = "";
+    quoteInfo.vehicles.forEach((v) => {
+      const o = document.createElement("option");
+      o.value = v.id;
+      o.textContent = v.name + (v.seats ? " (up to " + v.seats + ")" : "");
+      form.vehicle.appendChild(o);
+    });
+    const places = $("#places");
+    places.innerHTML = "";
+    (quoteInfo.places || []).forEach((name) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chip";
+      b.textContent = name;
+      b.onclick = () => {
+        const target = lastFocus === "pickup" && !form.pickup.value ? form.pickup : (!form.dropoff.value || lastFocus === "dropoff" ? form.dropoff : form.pickup);
+        target.value = name;
+        scheduleQuote(0);
+      };
+      places.appendChild(b);
+    });
+    places.classList.toggle("hidden", !(quoteInfo.places || []).length);
+    $("#fineprint").textContent = "Your request goes to " + companyName.replace(/\.+$/, "") + " for approval. The estimate is not a charge. Nothing is emailed or texted.";
+    fillHours();
+    renderQuote(null);
+  }
+
+  function tripBody() {
+    return {
+      tripType: form.tripType.value,
+      vehicle: form.vehicle.value,
+      hours: form.hours.value ? Number(form.hours.value) : null,
+      pickup: form.pickup.value,
+      dropoff: form.dropoff.value,
+      passengers: Number(form.passengers.value || 1),
+    };
+  }
+
+  function renderQuote(q, pending) {
+    const price = $("#qPrice");
+    const labelEl = $("#qLabel");
+    const lines = $("#qLines");
+    const notes = $("#qNotes");
+    const confirm = $("#qConfirm");
+    $("#quote").dataset.state = pending ? "pending" : q && q.available ? "ok" : "none";
+    lines.innerHTML = "";
+    lines.classList.add("hidden");
+    notes.textContent = "";
+    confirm.textContent = "";
+    $("#qKind").textContent = "Instant estimate";
+    if (pending) {
+      price.textContent = "\u2026";
+      labelEl.textContent = "Calculating your estimate\u2026";
+      return;
+    }
+    if (!q) {
+      price.textContent = "\u2013";
+      labelEl.textContent = form.tripType.value === "hourly" ? "Choose a vehicle and hours to see an estimate." : "Enter pickup and drop-off to see an estimate.";
+      return;
+    }
+    if (!q.available) {
+      price.textContent = "Price on request";
+      labelEl.textContent = q.message || "Send the request and the operator will confirm the price.";
+      return;
+    }
+    $("#qKind").textContent = q.estimate ? "Estimate by road distance" : "Instant estimate";
+    price.textContent = (q.estimate ? "About " : "") + q.total;
+    labelEl.textContent = q.label + (q.vehicle ? " \u00b7 " + q.vehicle : "") + (q.miles ? " \u00b7 " + q.miles + " mi" + (q.minutes ? ", about " + q.minutes + " min" : "") : "");
+    (q.lines || []).forEach((line) => {
+      const tr = document.createElement("tr");
+      const a = document.createElement("td");
+      const b = document.createElement("td");
+      a.textContent = line.label;
+      b.textContent = line.amount;
+      tr.append(a, b);
+      lines.appendChild(tr);
+    });
+    lines.classList.toggle("hidden", !(q.lines || []).length);
+    notes.textContent = (q.notes || []).join(" ");
+    confirm.textContent = q.confirm || "";
+  }
+
+  async function requestQuote() {
+    if (!quoteInfo) return;
+    const body = tripBody();
+    const hourly = body.tripType === "hourly";
+    if (!body.vehicle || (hourly ? !body.hours : body.pickup.trim().length < 3 || body.dropoff.trim().length < 3)) {
+      renderQuote(null);
+      return;
+    }
+    const my = ++quoteSeq;
+    renderQuote(null, true);
+    try {
+      const result = await api("/api/public/book/" + encodeURIComponent(slug) + "/quote", { method: "POST", body });
+      if (my !== quoteSeq) return;
+      if (!result.data.ok) {
+        renderQuote({ available: false, message: result.data.error || "Send the request and the operator will confirm the price." });
+        return;
+      }
+      renderQuote(result.data.quote);
+    } catch {
+      if (my === quoteSeq) renderQuote({ available: false, message: "Send the request and the operator will confirm the price." });
+    }
+  }
+
+  function scheduleQuote(delay) {
+    if (!quoteInfo) return;
+    clearTimeout(quoteTimer);
+    quoteTimer = setTimeout(requestQuote, delay == null ? 600 : delay);
+  }
+
+  async function loadCompany() {
+    if (!slug) {
+      showUnavailable();
+      return;
+    }
+    const result = await api("/api/public/book/" + encodeURIComponent(slug));
+    if (!result.data.ok) {
+      showUnavailable();
+      return;
+    }
+    companyName = result.data.companyName || "the operator";
+    $("#coName").textContent = companyName;
+    document.title = "Book a ride | " + companyName;
+    if (result.data.logoDataUrl) {
+      $("#coLogo").src = result.data.logoDataUrl;
+    }
+    const titleEl = document.querySelector('meta[name="apple-mobile-web-app-title"]');
+    if (titleEl) titleEl.setAttribute("content", companyName);
+    if (result.data.open === false) {
+      showClosed(result.data.closed);
+      return;
+    }
+    $("#load").classList.add("hidden");
+    $("#heading").classList.remove("hidden");
+    form.classList.remove("hidden");
+    setupQuotes(result.data.quotes);
+  }
+
+  if ("serviceWorker" in navigator && slug) {
+    const scope = "/book/" + encodeURIComponent(slug) + "/";
+    navigator.serviceWorker.register(scope + "sw.js", { scope }).catch(() => {});
+  }
+
+  function resetForm() {
+    form.reset();
+    setDateDefaults();
+    form.passengers.value = "1";
+    if (quoteInfo && quoteInfo.vehicles.length) form.vehicle.value = quoteInfo.vehicles[0].id;
+    syncTripFields();
+    renderQuote(null);
+    showErr("");
+    form.classList.remove("hidden");
+    $("#heading").classList.remove("hidden");
+    $("#done").classList.add("hidden");
+    window.scrollTo(0, 0);
+  }
+
+  fillTimes();
+  setDateDefaults();
+  syncTripFields();
+  ["pickup", "dropoff"].forEach((name) => {
+    form[name].addEventListener("focus", () => { lastFocus = name; });
+    form[name].addEventListener("input", () => scheduleQuote());
+    form[name].addEventListener("change", () => scheduleQuote(0));
+  });
+  form.tripType.addEventListener("change", () => { syncTripFields(); scheduleQuote(0); });
+  form.vehicle.addEventListener("change", () => { fillHours(); scheduleQuote(0); });
+  form.hours.addEventListener("change", () => scheduleQuote(0));
+  form.passengers.addEventListener("change", () => scheduleQuote(0));
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    showErr("");
+    const go = $("#go");
+    go.disabled = true;
+    try {
+      if (form.tripType.value === "hourly" && !form.hours.value) {
+        showErr("Please choose how many hours.");
+        return;
+      }
+      const body = {
+        name: form.name.value,
+        phone: form.phone.value,
+        email: form.email.value,
+        date: form.date.value,
+        time: form.time.value,
+        pickup: form.pickup.value,
+        dropoff: form.dropoff.value,
+        passengers: Number(form.passengers.value || 1),
+        tripType: form.tripType.value,
+        vehicle: quoteInfo ? form.vehicle.value : "",
+        hours: form.tripType.value === "hourly" && form.hours.value ? Number(form.hours.value) : null,
+        flight: form.flight.value,
+        notes: form.notes.value,
+        company_website: form.company_website.value,
+      };
+      const result = await api("/api/public/book/" + encodeURIComponent(slug), { method: "POST", body });
+      if (!result.data.ok) {
+        if (result.data.closed) {
+          showClosed(result.data.closed);
+          return;
+        }
+        showErr(result.data.error || "Could not send the request.");
+        return;
+      }
+      const sentTo = String(result.data.companyName || companyName).replace(/\.+$/, "");
+      const est = result.data.estimate;
+      $("#doneTxt").textContent = "Request sent to " + sentTo + ". They will confirm with you." +
+        (est ? " " + (est.estimate ? "Estimated price: about " : "Estimated price: ") + est.total + ". " + est.confirm : "");
+      form.classList.add("hidden");
+      $("#heading").classList.add("hidden");
+      $("#done").classList.remove("hidden");
+      window.scrollTo(0, 0);
+    } catch {
+      showErr("Could not send the request. Check your connection and try again.");
+    } finally {
+      go.disabled = false;
+    }
+  });
+
+  $("#again").onclick = resetForm;
+  loadCompany().catch(showUnavailable);
+})();
