@@ -1282,6 +1282,10 @@ function rideJson(row, role = "owner") {
     tripTypeLabel: TRIP_LABELS[row.trip_type] || "",
     vehicleName: row.vehicle_name || "",
     hours: row.hours ?? null,
+    airport: parseStoredAirport(row.airport_json),
+    airportLine: airportSummary(parseStoredAirport(row.airport_json)),
+    luggage: row.luggage ?? null,
+    flightAlert: row.flight_alert ? { kind: row.flight_alert_kind, message: row.flight_alert, at: row.flight_alert_at } : null,
     updatedAt: row.updated_at,
     ...owner ? { clientId: row.client_id, clientPhone: row.client_phone || "", clientEmail: row.client_email || "", fareCents: row.fare_cents, fare: money(row.fare_cents), notes: row.notes, payment: row.payment, source: row.source || "", quote: rideQuoteJson(row) } : {},
     schedule: rideSchedule({
@@ -1498,11 +1502,56 @@ async function getTrial(request, env) {
   return json({ ok: true, trial: trialJson(t), banner: trialBanner(t) });
 }
 __name(getTrial, "getTrial");
-async function publicQuoteInfo(env, companyId) {
+async function loadBookingSettings(env, companyId) {
+  let row = null;
+  try {
+    row = await env.DB.prepare("SELECT airports_json, capacities_json, flight_rules_json, updated_at FROM booking_settings WHERE company_id = ?").bind(companyId).first();
+  } catch {
+    row = null;
+  }
+  const parse = (text, fallback) => {
+    try { return JSON.parse(text || ""); } catch { return fallback; }
+  };
+  const airports = validateAirportConfig(row ? parse(row.airports_json, null) : null).config || { version: 1, airports: [] };
+  const capacities = validateCapacities(row ? parse(row.capacities_json, null) : null).capacities || { ...DEFAULT_CAPACITIES };
+  return { airports, capacities, flightRules: flightRules(row ? parse(row.flight_rules_json, {}) : {}), updatedAt: row ? row.updated_at : null };
+}
+__name(loadBookingSettings, "loadBookingSettings");
+async function fleetClassSet(env, companyId) {
+  const rows = await env.DB.prepare("SELECT vehicle, deleted_at FROM drivers WHERE company_id = ? AND deleted_at IS NULL").bind(companyId).all();
+  return fleetClasses(rows.results || []);
+}
+__name(fleetClassSet, "fleetClassSet");
+// Rate-sheet vehicles this fleet can run (an SUV-only roster hides Sedan), with seats capped by the
+// fleet's passenger limit for that class (sedans hold 3 by default).
+function offeredVehicles(sheet, classes, capacities) {
+  return bookableVehicles(sheet.vehicles || [], classes).map((v) => ({ ...v, seats: seatsFor(v, capacities) }));
+}
+__name(offeredVehicles, "offeredVehicles");
+async function publicQuoteInfo(env, companyId, settings) {
   const saved = await loadRateSheet(env, companyId);
-  return saved && saved.enabled && saved.sheet ? publicSheetInfo(saved.sheet) : null;
+  if (!(saved && saved.enabled && saved.sheet)) return null;
+  const s = settings || await loadBookingSettings(env, companyId);
+  const classes = await fleetClassSet(env, companyId);
+  const info = publicSheetInfo({ ...saved.sheet, vehicles: offeredVehicles(saved.sheet, classes, s.capacities) });
+  info.vehicles = info.vehicles.map((v) => ({ ...v, vehicleClass: vehicleClassOf(v.name) }));
+  return info;
 }
 __name(publicQuoteInfo, "publicQuoteInfo");
+function placesEnabled(env) {
+  return String(env.PLACES_AUTOCOMPLETE || "off").toLowerCase() === "on" && !!env.GOOGLE_MAPS_SERVER_KEY;
+}
+__name(placesEnabled, "placesEnabled");
+// Airport side of a public booking or quote. Replaces the typed pickup or drop-off with the terminal.
+function applyAirportChoice(body, settings, vehicleName) {
+  const choice = readAirportChoice(body, settings.airports, vehicleClassOf(vehicleName));
+  if (choice.error) return { error: choice.error };
+  if (!choice.airport) return { airport: null, pickup: str(body.pickup, 200), dropoff: str(body.dropoff, 200) };
+  const pickup = choice.airport.side === "pickup" ? choice.address : str(body.pickup, 200);
+  const dropoff = choice.airport.side === "dropoff" ? choice.address : str(body.dropoff, 200);
+  return { airport: choice.airport, pickup, dropoff };
+}
+__name(applyAirportChoice, "applyAirportChoice");
 async function getPublicBook(request, env, slug) {
   const company = await publicBookingCompany(env, slug);
   if (!company) return fail(404, "Booking page not found.");
@@ -1510,6 +1559,7 @@ async function getPublicBook(request, env, slug) {
     return json({ ok: true, open: false, companyName: publicCompanyName(company), logoDataUrl: company.logo_data_url || "", quotes: null, closed: publicPausedView(company) });
   }
   const trial = await companyTrial(env, company.id, company);
+  const settings = await loadBookingSettings(env, company.id);
   if (trial && !trial.open) {
     return json({
       ok: true,
@@ -1525,7 +1575,10 @@ async function getPublicBook(request, env, slug) {
     open: true,
     companyName: publicCompanyName(company),
     logoDataUrl: company.logo_data_url || "",
-    quotes: await publicQuoteInfo(env, company.id)
+    quotes: await publicQuoteInfo(env, company.id, settings),
+    airports: publicAirportInfo(settings.airports),
+    capacities: settings.capacities,
+    places: placesEnabled(env)
   });
 }
 __name(getPublicBook, "getPublicBook");
@@ -1569,12 +1622,27 @@ async function postPublicBook(request, env, slug) {
   const email = emailRaw ? normEmail(emailRaw) : "";
   const date = str(body.date, 10);
   const time = str(body.time, 5);
-  const pickup = str(body.pickup, 200);
   const tripTypeIn = TRIP_TYPES.includes(body.tripType) ? body.tripType : "";
-  const dropoff = str(body.dropoff, 200) || (tripTypeIn === "hourly" ? "As directed (hourly)" : "");
+  const settings = await loadBookingSettings(env, company.id);
+  const rates = await loadRateSheet(env, company.id);
+  const sheet = rates && rates.enabled ? rates.sheet : null;
+  const classes = sheet ? await fleetClassSet(env, company.id) : /* @__PURE__ */ new Set();
+  const offered = sheet ? offeredVehicles(sheet, classes, settings.capacities) : [];
+  const passengers = Number(body.passengers ?? 1);
+  let vehicleRow = sheet ? offered.find((v) => v.id === str(body.vehicle, 40)) || null : null;
+  if (sheet && str(body.vehicle, 40) && !vehicleRow) return fail(400, "That vehicle isn't available. Choose another.");
+  if (sheet && !vehicleRow && Number.isInteger(passengers)) vehicleRow = vehicleForPassengers(offered, passengers, settings.capacities);
+  if (sheet && vehicleRow && Number.isInteger(passengers) && !vehiclesForPassengers([vehicleRow], passengers, settings.capacities).length) {
+    return fail(400, `${vehicleRow.name} seats up to ${vehicleRow.seats}. Choose a larger vehicle.`);
+  }
+  const placed = applyAirportChoice(body, settings, vehicleRow ? vehicleRow.name : "");
+  if (placed.error) return fail(400, placed.error);
+  const pickup = placed.pickup;
+  const dropoff = placed.dropoff || (tripTypeIn === "hourly" ? "As directed (hourly)" : "");
   const flight = str(body.flight, 12).toUpperCase();
   const notes = str(body.notes, 2e3);
-  const passengers = Number(body.passengers ?? 1);
+  const luggageRaw = body.luggage === "" || body.luggage == null ? null : Number(body.luggage);
+  if (luggageRaw !== null && (!Number.isInteger(luggageRaw) || luggageRaw < 0 || luggageRaw > 30)) return fail(400, "Enter luggage from 0 to 30 pieces.");
   if (!name) return fail(400, "Enter your name.");
   if (phoneDigits(phone).length < 7) return fail(400, "Enter a valid mobile phone.");
   if (emailRaw && !email) return fail(400, "Enter a valid email, or leave it blank.");
@@ -1584,9 +1652,7 @@ async function postPublicBook(request, env, slug) {
   if (!pickup) return fail(400, "Enter the pickup address.");
   if (!dropoff) return fail(400, "Enter the drop-off address.");
   if (!Number.isInteger(passengers) || passengers < 1 || passengers > 14) return fail(400, "Enter passengers from 1 to 14.");
-  const rates = await loadRateSheet(env, company.id);
-  const sheet = rates && rates.enabled ? rates.sheet : null;
-  const trip = readTrip({ ...body, dropoff }, sheet);
+  const trip = readTrip({ ...body, pickup, dropoff, vehicle: vehicleRow ? vehicleRow.id : "" }, sheet);
   if (tripTypeIn === "hourly" && trip.hours === null) return fail(400, "Choose how many hours.");
   // Server-side estimate only. Any price fields in the request body are ignored.
   const q = sheet ? await quoteTrip(env, request, company.id, sheet, trip) : null;
@@ -1606,16 +1672,23 @@ async function postPublicBook(request, env, slug) {
   }
   const rideId = crypto.randomUUID();
   await env.DB.prepare(
-    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json)
-     VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?)`
+    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage)
+     VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     rideId, company.id, clientId, date, time, pickup, dropoff, passengers, flight, notes, now, now,
     trip.tripType, trip.vehicleName, trip.tripType === "hourly" ? trip.hours : null,
     quoted ? quoted.totalCents : null,
-    quoted ? JSON.stringify({ v: 1, basis: quoted.basis, label: quoted.label, vehicle: quoted.vehicle, lines: quoted.lines, notes: quoted.notes, miles: quoted.miles ?? null, minutes: quoted.minutes ?? null, at: now }) : null
+    quoted ? JSON.stringify({ v: 1, basis: quoted.basis, label: quoted.label, vehicle: quoted.vehicle, lines: quoted.lines, notes: quoted.notes, miles: quoted.miles ?? null, minutes: quoted.minutes ?? null, at: now }) : null,
+    placed.airport ? JSON.stringify(placed.airport) : null,
+    luggageRaw
   ).run();
   const view = quoted ? quoteView(quoted, publicCompanyName(company)) : null;
-  return json({ ok: true, companyName: publicCompanyName(company), estimate: view ? { total: view.total, estimate: view.estimate, label: view.label, confirm: view.confirm } : null }, 201);
+  return json({
+    ok: true,
+    companyName: publicCompanyName(company),
+    estimate: view ? { total: view.total, estimate: view.estimate, label: view.label, confirm: view.confirm } : null,
+    trip: { pickup, dropoff, vehicle: trip.vehicleName || "", airport: placed.airport ? airportSummary(placed.airport) : "", meeting: riderMeetingNote(placed.airport) }
+  }, 201);
 }
 __name(postPublicBook, "postPublicBook");
 async function decideBooking(request, env, id, decision) {
@@ -1845,11 +1918,146 @@ async function postPublicQuote(request, env, slug) {
   if (!await limitHit(env, "qip:" + ipHash, 120, 15 * 60 * 1e3) || !await limitHit(env, "qslug:" + slug, 600, 15 * 60 * 1e3)) {
     return fail(429, "Please wait a few minutes and try again.");
   }
-  const trip = readTrip(body, saved.sheet);
+  const settings = await loadBookingSettings(env, company.id);
+  const classes = await fleetClassSet(env, company.id);
+  const offered = offeredVehicles(saved.sheet, classes, settings.capacities);
+  const vehicleRow = offered.find((v) => v.id === str(body.vehicle, 40)) || vehicleForPassengers(offered, Number(body.passengers ?? 1), settings.capacities);
+  const placed = applyAirportChoice(body, settings, vehicleRow ? vehicleRow.name : "");
+  if (placed.error) return json({ ok: true, quote: null });
+  const trip = readTrip({ ...body, pickup: placed.pickup, dropoff: placed.dropoff, vehicle: vehicleRow ? vehicleRow.id : "" }, saved.sheet);
   const q = await quoteTrip(env, request, company.id, saved.sheet, trip);
-  return json({ ok: true, quote: quoteView(q, publicCompanyName(company)) });
+  return json({ ok: true, quote: quoteView(q, publicCompanyName(company)), pickup: placed.pickup, dropoff: placed.dropoff });
 }
 __name(postPublicQuote, "postPublicQuote");
+async function getBookingSettings(request, env) {
+  const user = await authed(request, env, false);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const s = await loadBookingSettings(env, user.companyId);
+  const classes = await fleetClassSet(env, user.companyId);
+  return json({ ok: true, settings: { airports: s.airports, capacities: s.capacities, flightRules: s.flightRules }, fleetClasses: [...classes], flightTracking: flightProvider(env).ready, presets: ["ATL"] });
+}
+__name(getBookingSettings, "getBookingSettings");
+async function putBookingSettings(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const current = await loadBookingSettings(env, user.companyId);
+  let airports = current.airports;
+  if (Array.isArray(body.preset)) {
+    airports = presetConfig(body.preset);
+  } else if (body.airports !== void 0) {
+    const v = validateAirportConfig(body.airports);
+    if (v.error) return fail(400, v.error);
+    airports = v.config;
+  }
+  let capacities = current.capacities;
+  if (body.capacities !== void 0) {
+    const v = validateCapacities(body.capacities);
+    if (v.error) return fail(400, v.error);
+    capacities = v.capacities;
+  }
+  let rules = current.flightRules;
+  if (body.flightRules !== void 0) {
+    const early = Number(body.flightRules && body.flightRules.earlyMinutes);
+    if (body.flightRules && body.flightRules.earlyMinutes !== void 0 && !(early >= 15 && early <= 30)) return fail(400, "Early-arrival alerts must be from 15 to 30 minutes.");
+    rules = flightRules(body.flightRules);
+  }
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO booking_settings (company_id, airports_json, capacities_json, flight_rules_json, updated_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(company_id) DO UPDATE SET airports_json = excluded.airports_json, capacities_json = excluded.capacities_json, flight_rules_json = excluded.flight_rules_json, updated_at = excluded.updated_at`
+  ).bind(user.companyId, JSON.stringify(airports), JSON.stringify(capacities), JSON.stringify(rules), now).run();
+  return json({ ok: true, settings: { airports, capacities, flightRules: rules } });
+}
+__name(putBookingSettings, "putBookingSettings");
+// Address suggestions for the booking page. Same-origin proxy so no Google key is in the page.
+// Off unless PLACES_AUTOCOMPLETE=on and GOOGLE_MAPS_SERVER_KEY has the Places API (New) enabled.
+async function postPublicPlaces(request, env, slug) {
+  const company = await publicBookingCompany(env, slug);
+  if (!company) return fail(404, "Booking page not found.");
+  const body = await readPublicJson(request);
+  if (isResponse(body)) return body;
+  const q = str(body.q, 120);
+  if (!placesEnabled(env) || q.length < 3) return json({ ok: true, suggestions: [] });
+  const ipHash = await sha256Hex("book-ip:" + clientIp(request));
+  if (!await limitHit(env, "pip:" + ipHash, 200, 15 * 60 * 1e3) || !await limitHit(env, "pco:" + company.id, 3e3, 24 * 60 * 60 * 1e3)) return json({ ok: true, suggestions: [] });
+  try {
+    const r = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "suggestions.placePrediction.text" },
+      body: JSON.stringify({ input: q, includedRegionCodes: ["us"], sessionToken: str(body.session, 64) || void 0 })
+    });
+    if (!r.ok) return json({ ok: true, suggestions: [] });
+    const data = await r.json();
+    const suggestions = (data.suggestions || []).map((s) => s.placePrediction && s.placePrediction.text && s.placePrediction.text.text).filter(Boolean).slice(0, 5);
+    return json({ ok: true, suggestions });
+  } catch {
+    return json({ ok: true, suggestions: [] });
+  }
+}
+__name(postPublicPlaces, "postPublicPlaces");
+// Cron: watch flights for airport pickups and alert the assigned driver on any change.
+async function runFlightChecks(env, nowMs, fetchImpl) {
+  const provider = flightProvider(env);
+  if (!provider.ready) return { checked: 0, alerts: 0, skipped: provider.problem };
+  const now = nowMs || Date.now();
+  const day = (offset) => new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(now + offset));
+  const rows = await env.DB.prepare(
+    `SELECT id, company_id, pickup_date, pickup_time, pickup, flight, status, approval, airport_json, flight_status_json, flight_checked_at
+     FROM rides WHERE status = 'scheduled' AND flight != '' AND approval != 'declined' AND pickup_date IN (?, ?, ?) LIMIT 200`
+  ).bind(day(-864e5), day(0), day(864e5)).all();
+  let checked = 0, made = 0;
+  for (const row of rows.results || []) {
+    const airport = parseStoredAirport(row.airport_json);
+    const arrival = airport ? airport.side === "pickup" : /\bairport\b|\b[A-Z]{3} airport/i.test(row.pickup || "");
+    if (!arrival) continue;
+    const pickupMs = easternMs(row.pickup_date, row.pickup_time);
+    if (!shouldWatch(row, now, pickupMs)) continue;
+    if (row.flight_checked_at && now - row.flight_checked_at < 4 * 60 * 1e3) continue;
+    const ident = normalizeFlight(row.flight);
+    if (!ident) continue;
+    checked++;
+    let result;
+    try {
+      result = await fetchFlightSnapshot(env, ident, pickupMs, fetchImpl);
+    } catch {
+      result = { ok: false };
+    }
+    await env.DB.prepare("UPDATE rides SET flight_checked_at = ? WHERE id = ? AND company_id = ?").bind(now, row.id, row.company_id).run();
+    if (!result.ok) continue;
+    let prev = null;
+    try { prev = row.flight_status_json ? JSON.parse(row.flight_status_json) : null; } catch { prev = null; }
+    const settings = await loadBookingSettings(env, row.company_id);
+    const alerts = flightAlerts(prev, result.snapshot, settings.flightRules, { flight: ident, pickupTimeLabel: time12(row.pickup_time) });
+    for (const a of alerts) {
+      const res = await env.DB.prepare(
+        "INSERT OR IGNORE INTO flight_alerts (id, company_id, ride_id, kind, alert_key, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      ).bind(crypto.randomUUID(), row.company_id, row.id, a.kind, a.key, a.message, now).run();
+      if (res.meta && res.meta.changes) made++;
+    }
+    await env.DB.prepare("UPDATE rides SET flight_status_json = ? WHERE id = ? AND company_id = ?").bind(JSON.stringify(result.snapshot), row.id, row.company_id).run();
+  }
+  return { checked, alerts: made };
+}
+__name(runFlightChecks, "runFlightChecks");
+function easternMs(date, time) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date || "");
+  const n = /^(\d{2}):(\d{2})$/.exec(time || "");
+  if (!m || !n) return null;
+  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +n[1], +n[2]);
+  for (const offsetH of [4, 5]) {
+    const at = guess + offsetH * 3600e3;
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit", minute: "2-digit" }).format(new Date(at));
+    if (parts.replace(/^24/, "00") === time) return at;
+  }
+  return guess + 5 * 3600e3;
+}
+__name(easternMs, "easternMs");
 async function previewRateSheet(request, env) {
   const user = await authed(request, env, true);
   if (isResponse(user)) return user;
@@ -1971,6 +2179,10 @@ async function handleApi(request, env) {
     if (path === "/api/rate-sheet" && method === "GET") return getRateSheet(request, env);
     if (path === "/api/rate-sheet" && method === "PUT") return putRateSheet(request, env);
     if (path === "/api/rate-sheet/preview" && method === "POST") return previewRateSheet(request, env);
+    if (path === "/api/booking-settings" && method === "GET") return getBookingSettings(request, env);
+    if (path === "/api/booking-settings" && method === "PUT") return putBookingSettings(request, env);
+    const publicPlaces = /^\/api\/public\/book\/([^/]+)\/places$/.exec(path);
+    if (publicPlaces && method === "POST") return postPublicPlaces(request, env, decodeURIComponent(publicPlaces[1]));
     const publicQuote = /^\/api\/public\/book\/([^/]+)\/quote$/.exec(path);
     if (publicQuote && method === "POST") return postPublicQuote(request, env, decodeURIComponent(publicQuote[1]));
     const publicBook = /^\/api\/public\/book\/([^/]+)$/.exec(path);
@@ -2986,7 +3198,11 @@ async function deleteClient(request, env, id) {
 __name(deleteClient, "deleteClient");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
   r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.picked_up_at, r.completed_at,
-  r.driver_user_id, drv.name AS assigned_driver_name, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json
+  r.driver_user_id, drv.name AS assigned_driver_name, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
+  r.airport_json, r.luggage,
+  (SELECT fa.message FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert,
+  (SELECT fa.kind FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_kind,
+  (SELECT fa.created_at FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_at
   FROM rides r JOIN clients c ON c.id = r.client_id AND c.company_id = r.company_id
   LEFT JOIN drivers drv ON drv.user_id = r.driver_user_id AND drv.company_id = r.company_id`;
 async function listRides(request, env) {
@@ -3768,6 +3984,8 @@ import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paid
 import { usCanadaE164, onMyWayMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
+import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
+import { flightProvider, fetchFlightSnapshot, flightAlerts, flightRules, normalizeFlight, shouldWatch } from "./flight-alerts.js";
 var CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 var FILES = {
   "/": { body: indexHtml, type: "text/html; charset=utf-8", cache: "no-cache" },
@@ -3907,6 +4125,9 @@ var index_default = {
       return handleApi(request, env);
     }
     return serveShell(request, env);
+  },
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runFlightChecks(env).then((r) => console.log(JSON.stringify({ level: "info", msg: "flight checks", ...r }))).catch((error) => console.log(JSON.stringify({ level: "error", msg: "flight checks", name: error instanceof Error ? error.name : "Error" }))));
   }
 };
 export {

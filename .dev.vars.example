@@ -2,3 +2,6 @@
 # Comma-separated. Unset or empty means nobody is a platform admin.
 PLATFORM_ADMIN_EMAILS=
 SMS_MODE=off
+# Optional. Off unless set. Do not commit keys.
+# PLACES_AUTOCOMPLETE=off
+# FLIGHT_DATA_PROVIDER=off

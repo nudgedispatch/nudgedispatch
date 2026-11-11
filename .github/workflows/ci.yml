@@ -19,3 +19,23 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  # Required before any booking deploy: phone and desktop client journeys (no submits).
+  booking-walkthrough:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright-core install --with-deps chromium
+      - run: bash scripts/predeploy-e2e.sh
+        env:
+          SCREENSHOT_DIR: e2e-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: booking-walkthrough
+          path: e2e-artifacts

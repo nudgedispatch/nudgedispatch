@@ -30,3 +30,7 @@ fallthrough = true
 type = "Data"
 globs = ["**/*.png"]
 fallthrough = true
+
+# Flight checks for airport pickups (no-op unless FLIGHT_DATA_PROVIDER and FLIGHT_DATA_API_KEY are set).
+[triggers]
+crons = ["*/5 * * * *"]

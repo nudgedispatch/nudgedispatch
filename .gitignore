@@ -5,3 +5,5 @@ dist/
 scripts/seed-local.sql
 *.log
 .DS_Store
+.predeploy/
+e2e-artifacts/
