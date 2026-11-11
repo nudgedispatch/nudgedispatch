@@ -1,4 +1,4 @@
-const CACHE = "nudge-app-shell-v13";
+const CACHE = "nudge-app-shell-v14";
 const SHELL = ["/", "/app.css", "/app.js", "/manifest.webmanifest", "/brand/wordmark.svg", "/brand/wordmark-on-dark.svg", "/brand/mark.svg", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/icon-192-maskable.png", "/icons/icon-512-maskable.png", "/icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (event) => {

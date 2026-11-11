@@ -48,7 +48,9 @@ The operator app reads and writes Cloudflare D1 through the `DB` binding.
 | Production database name | `nudge-app-db` |
 | Local name in this repo | `nudge-app-local` |
 
-Tables: `companies`, `users`, `clients`, `rides`, `sessions`, `memberships`, `invites`, `invoice_settings`, `invoices`, `rate_sheets`, `ride_requests`, `booking_pages`, `booking_limits`, `driver_locations`, `location_links`, `sms_messages`, `stripe_events`, `admin_audit`, `login_attempts`, `static_assets`.
+Tables: `companies`, `users`, `clients`, `rides`, `sessions`, `memberships`, `drivers`, `invites`, `invoice_settings`, `invoices`, `rate_sheets`, `ride_requests`, `booking_pages`, `booking_limits`, `driver_locations`, `location_links`, `sms_messages`, `stripe_events`, `admin_audit`, `login_attempts`, `static_assets`.
+
+`drivers` is the fleet roster (name, vehicle type, plate, passcode hash) and points at the driver user. Rides still store that user id in `rides.driver_user_id`. Renaming a driver updates the roster name only. A fleet owner adds and edits drivers from More, then sets the passcode on that screen. The driver signs in with the company code, their name, and the passcode. Older driver accounts that were invited by email still sign in with email and a password.
 
 This app does not read or write Google Sheets. CSV export is a file download. Distance quotes, when a key is configured, call the Google Routes API (`routes.googleapis.com`), not Sheets. The Iron Gate CRM spreadsheet is a separate system and is not connected here.
 

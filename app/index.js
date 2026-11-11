@@ -911,6 +911,10 @@ async function clearFailures(env, email) {
 }
 __name(clearFailures, "clearFailures");
 async function checkPassword(env, email, password) {
+  if (isRosterEmail(email)) {
+    await dummyVerify(password);
+    return null;
+  }
   const user = await env.DB.prepare(
     "SELECT id, company_id, password_hash, password_salt, password_iterations, password_kdf FROM users WHERE email = ?"
   ).bind(email).first();
@@ -1190,7 +1194,7 @@ function clientHeader(request) {
 __name(clientHeader, "clientHeader");
 function publicUser(user) {
   return {
-    email: user.email,
+    email: isRosterEmail(user.email) ? "" : user.email,
     companyName: user.companyName,
     csrf: user.csrf,
     role: user.role,
@@ -1923,6 +1927,12 @@ async function handleApi(request, env) {
     if (path === "/api/export/clients.csv" && method === "GET") return exportClients(request, env);
     if (path === "/api/drivers" && method === "GET") return listDrivers(request, env);
     if (path === "/api/drivers" && method === "POST") return createDriver(request, env);
+    const driverPass = /^\/api\/drivers\/([0-9a-f-]{36})\/passcode$/.exec(path);
+    if (driverPass && method === "PUT") return setDriverPasscode(request, env, driverPass[1]);
+    if (driverPass && method === "DELETE") return clearDriverPasscode(request, env, driverPass[1]);
+    const driverOne = /^\/api\/drivers\/([0-9a-f-]{36})$/.exec(path);
+    if (driverOne && method === "PATCH") return updateDriver(request, env, driverOne[1]);
+    if (path === "/api/driver-login" && method === "POST") return driverLogin(request, env);
     if (path === "/api/clients" && method === "GET") return listClients(request, env);
     if (path === "/api/clients" && method === "POST") return createClient(request, env);
     const clientMatch = /^\/api\/clients\/([0-9a-f-]{36})$/.exec(path);
@@ -2781,6 +2791,52 @@ async function acceptInvite(request, env) {
   }
 }
 __name(acceptInvite, "acceptInvite");
+async function findDriverCompany(env, code) {
+  const slug = code.toLowerCase();
+  const bySlug = await env.DB.prepare(
+    "SELECT id, name, kind, status, booking_slug FROM companies WHERE booking_slug = ?"
+  ).bind(slug).first();
+  if (bySlug) return bySlug;
+  const rows = await env.DB.prepare(
+    "SELECT id, name, kind, status, booking_slug FROM companies WHERE name = ? COLLATE NOCASE"
+  ).bind(code).all();
+  const list = rows.results || [];
+  return list.length === 1 ? list[0] : null;
+}
+__name(findDriverCompany, "findDriverCompany");
+async function driverLogin(request, env) {
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const code = str(body.company, 80);
+  const named = driverFields({ name: body.name, vehicle: "", plate: "" });
+  const passcode = typeof body.passcode === "string" ? body.passcode.trim() : "";
+  if (!code || named.error || !passcode) return fail(401, "Name or passcode is wrong.");
+  const attemptKey = `driver:${code.toLowerCase()}:${named.name.toLowerCase()}`;
+  if (await loginLocked(env, attemptKey)) return fail(429, "Too many attempts. Wait a few minutes and try again.");
+  const company = await findDriverCompany(env, code);
+  const driver = company && company.kind === "fleet" ? await env.DB.prepare(
+    `SELECT user_id, login, passcode_hash, passcode_salt, passcode_iterations, passcode_kdf
+     FROM drivers WHERE company_id = ? AND name = ? COLLATE NOCASE`
+  ).bind(company.id, named.name).first() : null;
+  const usable = driver && driver.login === "passcode" && driver.passcode_kdf === PASSWORD_KDF && driver.passcode_hash && driver.passcode_salt;
+  const ok = usable ? await verifyPassword(passcode, driver.passcode_salt, driver.passcode_hash, driver.passcode_iterations || PASSWORD_ITERATIONS) : false;
+  if (!usable) await dummyVerify(passcode);
+  if (!ok || !driver) {
+    await noteFailure(env, attemptKey);
+    return fail(401, "Name or passcode is wrong.");
+  }
+  const profile = await accountProfile(env, driver.user_id);
+  if (!profile) {
+    await noteFailure(env, attemptKey);
+    return fail(401, "Name or passcode is wrong.");
+  }
+  if (profile.suspended || company.status !== "active") return fail(403, "This company is suspended.");
+  await clearFailures(env, attemptKey);
+  await env.DB.prepare("UPDATE users SET last_sign_in_at = ? WHERE id = ?").bind(Date.now(), driver.user_id).run();
+  const session = await startSession(env, request, driver.user_id);
+  return json({ ok: true, ...publicUser({ ...profile, csrf: session.csrf, access: await companyAccess(env, profile) }) }, 200, { "set-cookie": session.cookie });
+}
+__name(driverLogin, "driverLogin");
 async function login(request, env) {
   const body = await readJson(request);
   if (isResponse(body)) return body;
@@ -3265,34 +3321,174 @@ async function getInvoice(request, env, id) {
   });
 }
 __name(getInvoice, "getInvoice");
+const DRIVER_ROWS = `SELECT u.id, u.email, m.role,
+  d.name AS driver_name, d.vehicle, d.plate, d.login AS driver_login,
+  CASE WHEN d.login = 'passcode' AND d.passcode_hash <> '' THEN 1 ELSE 0 END AS passcode_set
+  FROM memberships m
+  JOIN users u ON u.id = m.user_id
+  LEFT JOIN drivers d ON d.user_id = u.id AND d.company_id = m.company_id
+  WHERE m.company_id = ?`;
+function driverJson(row) {
+  const login = row.driver_login || "";
+  const email = isRosterEmail(row.email) || login === "passcode" ? "" : row.email || "";
+  return {
+    id: row.id,
+    name: row.driver_name || "",
+    vehicle: row.vehicle || "",
+    plate: row.plate || "",
+    role: row.role,
+    email,
+    login: login || (email ? "email" : ""),
+    passcodeSet: Number(row.passcode_set) === 1
+  };
+}
+__name(driverJson, "driverJson");
+function fleetDrivers(user, action) {
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  if (user.accountKind !== "fleet") {
+    return fail(403, action === "add" ? "An individual account cannot add drivers." : "An individual account cannot change drivers.");
+  }
+  return null;
+}
+__name(fleetDrivers, "fleetDrivers");
+async function nameTaken(env, companyId, name, exceptId) {
+  const row = await env.DB.prepare(
+    "SELECT user_id FROM drivers WHERE company_id = ? AND name = ? COLLATE NOCASE AND user_id <> ?"
+  ).bind(companyId, name, exceptId || "").first();
+  return !!row;
+}
+__name(nameTaken, "nameTaken");
+function duplicateDriver(error) {
+  return error instanceof Error && /UNIQUE/i.test(error.message);
+}
+__name(duplicateDriver, "duplicateDriver");
+async function loadDriver(env, companyId, userId) {
+  return env.DB.prepare(`${DRIVER_ROWS} AND u.id = ?`).bind(companyId, userId).first();
+}
+__name(loadDriver, "loadDriver");
 async function listDrivers(request, env) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;
   const denied = ownerOnly(user);
   if (denied) return denied;
   const rows = await env.DB.prepare(
-    `SELECT u.id, u.email, m.role FROM memberships m JOIN users u ON u.id = m.user_id
-     WHERE m.company_id = ? ORDER BY m.role DESC, u.email`
+    `${DRIVER_ROWS} ORDER BY CASE m.role WHEN 'owner' THEN 0 ELSE 1 END, COALESCE(NULLIF(d.name, ''), u.email) COLLATE NOCASE`
   ).bind(user.companyId).all();
-  return json({ ok: true, drivers: rows.results || [] });
+  return json({ ok: true, drivers: (rows.results || []).map(driverJson) });
 }
 __name(listDrivers, "listDrivers");
 async function createDriver(request, env) {
   const user = await authed(request, env, true);
   if (isResponse(user)) return user;
-  const denied = ownerOnly(user);
+  const denied = fleetDrivers(user, "add");
   if (denied) return denied;
-  if (user.accountKind !== "fleet") return fail(403, "An individual account cannot add drivers.");
   const body = await readJson(request);
   if (isResponse(body)) return body;
-  const email = normEmail(body.email);
-  if (!email) return fail(400, "Enter a valid email.");
-  const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
-  if (existing) return fail(409, "That email already has an account.");
-  const invite = await createInvite(env, email, "invite", user.companyName, null, { accountKind: "fleet", joinCompanyId: user.companyId, joinRole: "driver" });
-  return json({ ok: true, email, expiresAt: invite.expiresAt, inviteToken: invite.token }, 201);
+  const fields = driverFields(body);
+  if (fields.error) return fail(400, fields.error);
+  if (await nameTaken(env, user.companyId, fields.name, "")) return fail(409, "A driver with that name is already on this fleet.");
+  const userId = crypto.randomUUID();
+  const now = Date.now();
+  const secret = await hashPassword(randomToken() + randomToken());
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(userId, user.companyId, rosterEmailFor(userId), secret.hash, secret.salt, secret.iterations, PASSWORD_KDF, now, now),
+      env.DB.prepare("INSERT INTO memberships (company_id, user_id, role, created_at) VALUES (?, ?, 'driver', ?)").bind(user.companyId, userId, now),
+      env.DB.prepare(
+        `INSERT INTO drivers (user_id, company_id, name, vehicle, plate, login, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'passcode', ?, ?)`
+      ).bind(userId, user.companyId, fields.name, fields.vehicle, fields.plate, now, now)
+    ]);
+  } catch (error) {
+    if (duplicateDriver(error)) return fail(409, "A driver with that name is already on this fleet.");
+    throw error;
+  }
+  const row = await loadDriver(env, user.companyId, userId);
+  return json({ ok: true, driver: row ? driverJson(row) : null }, 201);
 }
 __name(createDriver, "createDriver");
+async function updateDriver(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = fleetDrivers(user, "change");
+  if (denied) return denied;
+  const existing = await loadDriver(env, user.companyId, id);
+  if (!existing || existing.role !== "driver") return fail(404, "Driver not found.");
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const fields = driverFields({
+    name: body.name,
+    vehicle: body.vehicle === void 0 ? existing.vehicle || "" : body.vehicle,
+    plate: body.plate === void 0 ? existing.plate || "" : body.plate
+  });
+  if (fields.error) return fail(400, fields.error);
+  if (await nameTaken(env, user.companyId, fields.name, id)) return fail(409, "A driver with that name is already on this fleet.");
+  const now = Date.now();
+  try {
+    if (existing.driver_login) {
+      await env.DB.prepare(
+        "UPDATE drivers SET name = ?, vehicle = ?, plate = ?, updated_at = ? WHERE user_id = ? AND company_id = ?"
+      ).bind(fields.name, fields.vehicle, fields.plate, now, id, user.companyId).run();
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO drivers (user_id, company_id, name, vehicle, plate, login, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'email', ?, ?)`
+      ).bind(id, user.companyId, fields.name, fields.vehicle, fields.plate, now, now).run();
+    }
+  } catch (error) {
+    if (duplicateDriver(error)) return fail(409, "A driver with that name is already on this fleet.");
+    throw error;
+  }
+  const row = await loadDriver(env, user.companyId, id);
+  return json({ ok: true, driver: row ? driverJson(row) : null });
+}
+__name(updateDriver, "updateDriver");
+async function passcodeDriver(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = fleetDrivers(user, "change");
+  if (denied) return denied;
+  const existing = await loadDriver(env, user.companyId, id);
+  if (!existing || existing.role !== "driver") return fail(404, "Driver not found.");
+  if (existing.driver_login !== "passcode") return fail(409, "This driver signs in with email and a password.");
+  return { user, existing };
+}
+__name(passcodeDriver, "passcodeDriver");
+async function setDriverPasscode(request, env, id) {
+  const gate = await passcodeDriver(request, env, id);
+  if (isResponse(gate)) return gate;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const passcode = typeof body.passcode === "string" ? body.passcode.trim() : "";
+  const problem = passcodeProblem(passcode, gate.existing.driver_name);
+  if (problem) return fail(400, problem);
+  const hashed = await hashPassword(passcode);
+  const now = Date.now();
+  await env.DB.prepare(
+    `UPDATE drivers SET passcode_hash = ?, passcode_salt = ?, passcode_iterations = ?, passcode_kdf = ?, updated_at = ?
+     WHERE user_id = ? AND company_id = ? AND login = 'passcode'`
+  ).bind(hashed.hash, hashed.salt, hashed.iterations, hashed.kdf, now, id, gate.user.companyId).run();
+  await revokeAll(env, id);
+  const row = await loadDriver(env, gate.user.companyId, id);
+  return json({ ok: true, driver: row ? driverJson(row) : null });
+}
+__name(setDriverPasscode, "setDriverPasscode");
+async function clearDriverPasscode(request, env, id) {
+  const gate = await passcodeDriver(request, env, id);
+  if (isResponse(gate)) return gate;
+  const now = Date.now();
+  await env.DB.prepare(
+    `UPDATE drivers SET passcode_hash = '', passcode_salt = '', passcode_iterations = 0, passcode_kdf = '', updated_at = ?
+     WHERE user_id = ? AND company_id = ? AND login = 'passcode'`
+  ).bind(now, id, gate.user.companyId).run();
+  await revokeAll(env, id);
+  const row = await loadDriver(env, gate.user.companyId, id);
+  return json({ ok: true, driver: row ? driverJson(row) : null });
+}
+__name(clearDriverPasscode, "clearDriverPasscode");
 async function getSettings(request, env) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;
@@ -3518,6 +3714,7 @@ import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNo
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
+import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 var CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 var FILES = {
   "/": { body: indexHtml, type: "text/html; charset=utf-8", cache: "no-cache" },

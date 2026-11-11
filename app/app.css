@@ -61,6 +61,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 .admin-actions .btn { width: 100%; }
 .actions .btn { flex: 1 1 140px; }
 .err { color: var(--red); min-height: 1.2em; margin: 0 0 8px; }
+.err.ok { color: var(--green); }
 .badge { display: inline-block; border-radius: 999px; padding: 3px 9px; font-size: 13px; font-weight: 700; border: 1px solid currentColor; color: var(--muted); white-space: nowrap; }
 .badge.completed, .badge.paid, .badge.active { color: var(--green); }
 .badge.scheduled, .badge.requested { color: var(--teal-2); }
@@ -130,6 +131,9 @@ body.bookpage .brand small { display: block; color: var(--muted); font-weight: 4
 .btn.approve { background: var(--green); color: #0b0b0b; }
 .card.pending-request { border-color: var(--teal); }
 .booking-link { width: 100%; min-height: 48px; padding: 12px; border-radius: 12px; border: 1px solid #3a3a3a; background: #101010; color: var(--text); font: inherit; font-size: 14px; overflow-x: auto; }
+.driver-row { border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin: 12px 0 0; }
+.driver-row h3 { margin: 0; font-size: 18px; }
+.driver-row .passcode-state { color: var(--teal-2); }
 
 /* Instant quotes (draft, Nov 10, 2026) */
 .bookpage .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: -4px 0 12px; }

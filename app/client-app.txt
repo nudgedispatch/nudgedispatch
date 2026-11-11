@@ -96,7 +96,7 @@ async function api(path, options = {}) {
     state.me.access = { ...(state.me.access || {}), state: "locked", locked: true, banner: null, lockedView: data.lockedView || null };
     setTimeout(() => renderLocked(), 0);
   }
-  if (response.status === 401 && path !== "/api/login" && path !== "/api/invites/accept") {
+  if (response.status === 401 && path !== "/api/login" && path !== "/api/invites/accept" && path !== "/api/driver-login") {
     const hadSession = !!state.me;
     state.me = null;
     const screen = (location.hash || "").replace(/^#\//, "").split("/")[0];
@@ -259,15 +259,39 @@ function renderLogin() {
     <img src="/brand/mark.svg" alt="" class="login-mark">
     <h1>Sign in</h1>
     <p class="note">Private to your company. There is no public signup.</p>
-    <p class="muted">The same sign-in is used for the platform admin console. There is no separate admin login.</p>
+    <p class="muted" id="login-note">The same sign-in is used for the platform admin console. There is no separate admin login.</p>
     <form id="f">
       <label>Email<input id="email" type="email" autocomplete="username" required></label>
       <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
       <p class="err" id="err"></p>
       <button class="btn full" type="submit">Sign in</button>
     </form>
-    <p class="muted">A setup or reset link opens the set-password screen. Nothing is emailed from this app.</p>
+    <form id="driver-login" class="hidden">
+      <label>Company code<input id="company" autocomplete="organization" autocapitalize="none" autocorrect="off" spellcheck="false" required></label>
+      <label>Your name<input id="driver-name" autocomplete="username" autocapitalize="words" required></label>
+      <label>Passcode<input id="passcode" type="password" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" required></label>
+      <p class="err" id="driver-login-err"></p>
+      <button class="btn full" type="submit">Sign in</button>
+    </form>
+    <p class="muted" id="login-foot">A setup or reset link opens the set-password screen. Nothing is emailed from this app.</p>
+    <button class="btn ghost full" id="login-switch" type="button">Driver sign-in</button>
   </section>`);
+  let driverMode = false;
+  const showMode = () => {
+    document.querySelector("#f").classList.toggle("hidden", driverMode);
+    document.querySelector("#driver-login").classList.toggle("hidden", !driverMode);
+    document.querySelector("#login-note").textContent = driverMode
+      ? "Use the company code, your name, and the passcode from your owner."
+      : "The same sign-in is used for the platform admin console. There is no separate admin login.";
+    document.querySelector("#login-foot").textContent = driverMode
+      ? "The owner sets the passcode. Nothing is texted or emailed."
+      : "A setup or reset link opens the set-password screen. Nothing is emailed from this app.";
+    document.querySelector("#login-switch").textContent = driverMode ? "Owner sign-in" : "Driver sign-in";
+  };
+  document.querySelector("#login-switch").onclick = () => {
+    driverMode = !driverMode;
+    showMode();
+  };
   document.querySelector("#f").onsubmit = async (event) => {
     event.preventDefault();
     const result = await api("/api/login", { method: "POST", auth: false, body: { email: email.value, password: password.value } });
@@ -275,6 +299,26 @@ function renderLogin() {
     state.me = result.data;
     setTag();
     location.hash = result.data.platformAdmin ? "#/admin" : "#/rides";
+  };
+  document.querySelector("#driver-login").onsubmit = async (event) => {
+    event.preventDefault();
+    const err = document.querySelector("#driver-login-err");
+    const result = await api("/api/driver-login", {
+      method: "POST",
+      auth: false,
+      body: {
+        company: document.querySelector("#company").value,
+        name: document.querySelector("#driver-name").value,
+        passcode: document.querySelector("#passcode").value,
+      },
+    });
+    if (!result.data.ok) {
+      if (err) err.textContent = result.data.error || "Could not sign in.";
+      return;
+    }
+    state.me = result.data;
+    setTag();
+    location.hash = "#/rides";
   };
   const email = document.querySelector("#email");
   const password = document.querySelector("#password");
@@ -532,7 +576,7 @@ async function renderRide(id, gen) {
       ${ride.status === "scheduled" && !driverView ? `<button class="btn ghost" id="cancel" type="button">Cancel ride</button>` : ""}
       ${ride.status === "completed" && !driverView ? `<button class="btn" id="invoice" type="button">${invoice ? "Open invoice" : "Create invoice"}</button>` : ""}
     </div>
-    ${fleetOwner && ride.status !== "requested" && ride.status !== "declined" ? `<form id="assign" class="card noprint"><label>Assigned driver<select id="driver"><option value="">Unassigned</option>${((drivers && drivers.data && drivers.data.drivers) || []).map((member) => `<option value="${esc(member.id)}">${esc(member.email)} · ${esc(member.role)}</option>`).join("")}</select></label><p class="err" id="assignerr"></p></form>` : ""}
+    ${fleetOwner && ride.status !== "requested" && ride.status !== "declined" ? `<form id="assign" class="card noprint"><label>Assigned driver<select id="driver"><option value="">Unassigned</option>${((drivers && drivers.data && drivers.data.drivers) || []).map((member) => `<option value="${esc(member.id)}">${esc(driverOptionLabel(member))}</option>`).join("")}</select></label><p class="err" id="assignerr"></p></form>` : ""}
     <section class="card noprint${ride.status === "requested" || ride.status === "declined" ? " hidden" : ""}">
       <h2>Your location</h2>
       <p class="note">Sharing stays on only while this ride screen is open and the phone is unlocked. Updates pause when you leave this page or lock the phone. Nudge does not track in the background, and it does not text the location link to anyone.</p>
@@ -818,9 +862,131 @@ function download(name, contents, type) {
   setTimeout(() => URL.revokeObjectURL(link.href), 30000);
 }
 
+function driverOptionLabel(member) {
+  const parts = [member.name, member.vehicle, member.plate].filter(Boolean);
+  if (parts.length) return parts.join(" · ");
+  return (member.email || "Driver") + " · " + (member.role || "driver");
+}
+
+function driverMeta(member) {
+  const parts = [member.vehicle, member.plate].filter(Boolean);
+  return parts.length ? parts.join(" · ") : "No vehicle or plate yet";
+}
+
+function driverCard(member, flash) {
+  const passcode = member.login === "passcode";
+  const title = member.name || member.email || "Driver";
+  const saved = flash && flash.id === member.id && flash.kind === "saved";
+  const passMsg = flash && flash.id === member.id && flash.kind === "passcode" ? flash.message : "";
+  return `<article class="driver-row" data-id="${esc(member.id)}">
+    <h3>${esc(title)}</h3>
+    <p class="sub">${esc(driverMeta(member))}</p>
+    <p class="sub passcode-state">${passcode
+      ? (member.passcodeSet
+        ? "Passcode is set. The driver signs in with the company code, their name, and that passcode."
+        : "Set a passcode before this driver can sign in.")
+      : "Signs in with email and a password."}</p>
+    <form class="edit-driver" data-id="${esc(member.id)}">
+      <label>Name<input name="name" maxlength="80" required value="${esc(member.name)}"></label>
+      <label>Type of vehicle<input name="vehicle" maxlength="40" value="${esc(member.vehicle)}" placeholder="SUV"></label>
+      <label>Plate number<input name="plate" maxlength="12" value="${esc(member.plate)}" placeholder="ABC1234" autocapitalize="characters"></label>
+      <p class="err${saved ? " ok" : ""}">${saved ? "Saved." : ""}</p>
+      <button class="btn ghost full" type="submit">Save driver</button>
+    </form>
+    ${passcode ? `<form class="passcode-driver" data-id="${esc(member.id)}">
+      <label>Sign-in passcode<input name="passcode" data-passcode-for="${esc(member.id)}" maxlength="32" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="4–32 letters or numbers"></label>
+      <p class="err${passMsg ? " ok" : ""}">${esc(passMsg)}</p>
+      <button class="btn full" type="submit">${member.passcodeSet ? "Replace passcode" : "Set passcode"}</button>
+      ${member.passcodeSet ? `<button class="btn ghost full" type="button" data-clear>Remove passcode</button>` : ""}
+    </form>` : ""}
+  </article>`;
+}
+
+function paintDrivers(drivers, flash) {
+  const list = document.querySelector("#driver-list");
+  if (!list) return;
+  if (!drivers) {
+    list.innerHTML = `<p class="sub">Could not load drivers.</p>`;
+    return;
+  }
+  const people = drivers.filter((member) => member.role === "driver");
+  list.classList.toggle("muted", people.length === 0);
+  list.innerHTML = people.length
+    ? people.map((member) => driverCard(member, flash)).join("")
+    : `<p class="sub">No drivers yet. Add one above.</p>`;
+  for (const form of list.querySelectorAll(".edit-driver")) {
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const id = form.dataset.id;
+      const err = form.querySelector(".err");
+      const next = await api("/api/drivers/" + id, {
+        method: "PATCH",
+        body: {
+          name: form.querySelector("[name=name]").value,
+          vehicle: form.querySelector("[name=vehicle]").value,
+          plate: form.querySelector("[name=plate]").value,
+        },
+      });
+      if (!next.data.ok) {
+        if (err) { err.classList.remove("ok"); err.textContent = next.data.error || "Could not save the driver."; }
+        return;
+      }
+      await refreshDrivers({ id, kind: "saved" });
+    };
+  }
+  for (const form of list.querySelectorAll(".passcode-driver")) {
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const id = form.dataset.id;
+      const err = form.querySelector(".err");
+      const next = await api("/api/drivers/" + id + "/passcode", {
+        method: "PUT",
+        body: { passcode: form.querySelector("[name=passcode]").value },
+      });
+      if (!next.data.ok) {
+        if (err) { err.classList.remove("ok"); err.textContent = next.data.error || "Could not save the passcode."; }
+        return;
+      }
+      const typed = form.querySelector("[name=passcode]").value;
+      await refreshDrivers({ id, kind: "passcode", message: "Passcode saved. Tell the driver in person. It is not texted." });
+      const input = document.querySelector(`[data-passcode-for="${CSS.escape(id)}"]`);
+      if (input) input.value = typed;
+    };
+    const clear = form.querySelector("[data-clear]");
+    if (clear) clear.onclick = async () => {
+      const id = form.dataset.id;
+      const err = form.querySelector(".err");
+      const next = await api("/api/drivers/" + id + "/passcode", { method: "DELETE" });
+      if (!next.data.ok) {
+        if (err) { err.classList.remove("ok"); err.textContent = next.data.error || "Could not remove the passcode."; }
+        return;
+      }
+      await refreshDrivers({ id, kind: "passcode", message: "Passcode removed. This driver cannot sign in until you set a new one." });
+    };
+  }
+  if (flash && flash.focusId) {
+    const input = list.querySelector(`[data-passcode-for="${CSS.escape(flash.focusId)}"]`);
+    const row = input && input.closest(".driver-row");
+    if (row) row.scrollIntoView({ block: "nearest" });
+    if (input) input.focus();
+  }
+}
+
+async function refreshDrivers(flash) {
+  const listed = await api("/api/drivers");
+  const list = document.querySelector("#driver-list");
+  if (!list) return listed;
+  if (!listed.data.ok) {
+    list.innerHTML = `<p class="sub">${esc(listed.data.error || "Could not load drivers.")}</p>`;
+    return listed;
+  }
+  paintDrivers(listed.data.drivers || [], flash);
+  return listed;
+}
+
 async function renderSettings(gen) {
   setTabs(true);
-  shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card"><h2>Drivers</h2><form id="add-driver"><label>Driver email<input id="driver-email" type="email" required></label><button class="btn" type="submit">Create a driver setup link</button><p class="err" id="driver-err"></p></form><div id="driver-list" class="muted">Loading drivers…</div><p class="note">The link is shown once on this screen and is not emailed. An individual account cannot add drivers.</p></section>` : ""}<div id="box" class="muted">Loading…</div>`);
+  shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card" id="drivers-card"><h2>Drivers</h2><p class="note">Add a driver by name. Type of vehicle and plate are optional. Then set that driver's sign-in passcode here. Drivers sign in with the company code, their name, and the passcode. Nothing is texted or emailed.</p><p class="sub" id="driver-code">Company code: loading…</p><form id="add-driver"><label>Name<input id="driver-name" maxlength="80" required autocomplete="off"></label><label>Type of vehicle<input id="driver-vehicle" maxlength="40" placeholder="SUV" autocomplete="off"></label><label>Plate number<input id="driver-plate" maxlength="12" placeholder="ABC1234" autocomplete="off" autocapitalize="characters"></label><p class="err" id="driver-err"></p><button class="btn full" type="submit">Add driver</button></form><div id="driver-list" class="muted">Loading drivers…</div></section>` : ""}<div id="box" class="muted">Loading…</div>`);
   const result = await api("/api/settings");
   if (gen !== renderGen) return;
   const box = document.querySelector("#box");
@@ -911,23 +1077,35 @@ async function renderSettings(gen) {
       if (note) { note.style.color = ""; note.textContent = "Copy the link from the box above."; }
     }
   };
+  if (gen !== renderGen) return;
+  const code = document.querySelector("#driver-code");
+  if (code) code.textContent = s.bookingSlug ? "Company code: " + s.bookingSlug : "Company code appears here after the booking page is ready.";
   if (state.me.accountKind === "fleet") {
-    const listed = await api("/api/drivers");
-    const list = document.querySelector("#driver-list");
-    if (list) {
-      list.innerHTML = listed.data.ok ? listed.data.drivers.map((member) => `<p class="sub">${esc(member.email)} · ${esc(member.role)}</p>`).join("") : (listed.data.error || "Could not load drivers.");
-    }
+    await refreshDrivers();
     const add = document.querySelector("#add-driver");
     if (add) add.onsubmit = async (event) => {
       event.preventDefault();
-      const next = await api("/api/drivers", { method: "POST", body: { email: document.querySelector("#driver-email").value } });
       const err = document.querySelector("#driver-err");
-      if (!next.data.ok) { if (err) err.textContent = next.data.error || "Could not create the driver link."; return; }
-      if (err) {
-        err.style.color = "var(--green)";
-        err.textContent = "Give this one-time link to the driver. It is not emailed.";
+      const next = await api("/api/drivers", {
+        method: "POST",
+        body: {
+          name: document.querySelector("#driver-name").value,
+          vehicle: document.querySelector("#driver-vehicle").value,
+          plate: document.querySelector("#driver-plate").value,
+        },
+      });
+      if (!next.data.ok) {
+        if (err) { err.classList.remove("ok"); err.textContent = next.data.error || "Could not add the driver."; }
+        return;
       }
-      if (list) list.insertAdjacentHTML("afterbegin", `<p><input readonly value="${esc(location.origin + "/#/start/" + next.data.inviteToken)}"></p>`);
+      document.querySelector("#driver-name").value = "";
+      document.querySelector("#driver-vehicle").value = "";
+      document.querySelector("#driver-plate").value = "";
+      if (err) {
+        err.classList.add("ok");
+        err.textContent = "Driver added. Set a sign-in passcode below.";
+      }
+      await refreshDrivers({ focusId: next.data.driver && next.data.driver.id });
     };
   }
 }

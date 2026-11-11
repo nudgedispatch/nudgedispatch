@@ -11,6 +11,7 @@ export default [
       "app/billing.js",
       "app/stripe_webhook.js",
       "app/platform-admin.js",
+      "app/drivers.js",
       "test/**/*.js",
       "scripts/**/*.js",
     ],
