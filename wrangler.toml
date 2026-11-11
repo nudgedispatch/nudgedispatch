@@ -1,0 +1,32 @@
+# Local development and CI only.
+# This config does not bind the production D1 database and must not be used to deploy.
+# Production Worker: nudge-app. Production D1 name: nudge-app-db.
+name = "nudge-app"
+main = "app/index.js"
+compatibility_date = "2026-11-08"
+workers_dev = false
+preview_urls = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nudge-app-local"
+database_id = "00000000-0000-0000-0000-000000000001"
+migrations_dir = "migrations"
+
+[vars]
+SMS_MODE = "off"
+BLAND_FROM_NUMBER = ""
+STRIPE_PORTAL_CONFIGURATION = ""
+
+# Shell scripts are .txt so Wrangler imports them as text. The Worker still
+# serves them at /app.js, /sw.js, /book.js, and /book/<slug>/sw.js.
+# fallthrough keeps Wrangler's built-in text rule for .html, .txt, and .sql.
+[[rules]]
+type = "Text"
+globs = ["**/*.css", "**/*.svg", "**/*.webmanifest"]
+fallthrough = true
+
+[[rules]]
+type = "Data"
+globs = ["**/*.png"]
+fallthrough = true

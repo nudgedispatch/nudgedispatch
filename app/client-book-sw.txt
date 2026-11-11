@@ -1,0 +1,44 @@
+const CACHE = "nudge-book-shell-v3";
+
+function scopePath() {
+  const path = new URL(self.registration.scope).pathname;
+  return path.endsWith("/") ? path : path + "/";
+}
+
+self.addEventListener("install", (event) => {
+  const base = scopePath();
+  event.waitUntil(
+    caches.open(CACHE).then((cache) => cache.addAll([
+      base,
+      base + "manifest.webmanifest",
+      base + "icon-192.png",
+      base + "icon-512.png",
+      "/book.js",
+      "/app.css",
+    ])).then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))).then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== "GET" || url.origin !== location.origin) return;
+  if (url.pathname.startsWith("/api/")) return;
+  const base = scopePath();
+  const inScope = url.pathname.startsWith(base) || url.pathname === "/book.js" || url.pathname === "/app.css";
+  if (!inScope) return;
+  event.respondWith(
+    fetch(event.request).then((response) => {
+      if (response.ok) {
+        const copy = response.clone();
+        caches.open(CACHE).then((cache) => cache.put(event.request, copy));
+      }
+      return response;
+    }).catch(() => caches.match(event.request))
+  );
+});
