@@ -258,3 +258,130 @@ test("fleet owners add and edit drivers; drivers cannot", { timeout: 120000 }, a
     await rm(persistTo, { recursive: true, force: true });
   }
 });
+
+test("removing a driver keeps completed rides and drops upcoming ones", { timeout: 120000 }, async () => {
+  const persistTo = await mkdtemp(join(tmpdir(), "nudge-drivers-"));
+  let worker;
+  try {
+    await applyMigrations(persistTo);
+    worker = await unstable_dev("app/index.js", {
+      config: "wrangler.toml",
+      local: true,
+      persist: true,
+      persistTo,
+      logLevel: "error",
+      vars: { ADMIN_TOKEN: ADMIN, SMS_MODE: "off" },
+      experimental: { disableExperimentalWarning: true, watch: false, forceLocal: true },
+    });
+    const fleet = await openOwner(worker, "owner-a@example.test", "Fleet A", "fleet");
+    const other = await openOwner(worker, "owner-b@example.test", "Fleet B", "fleet");
+    const solo = await openOwner(worker, "solo@example.test", "Solo Cars", "individual");
+    const created = await call(worker, "/api/drivers", {
+      method: "POST",
+      session: fleet.session,
+      body: { name: "Riley Cole", vehicle: "SUV", plate: "ATL1042" },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.data));
+    const driver = created.data.driver;
+    const pass = await call(worker, "/api/drivers/" + driver.id + "/passcode", {
+      method: "PUT",
+      session: fleet.session,
+      body: { passcode: "ride22" },
+    });
+    assert.equal(pass.status, 200, JSON.stringify(pass.data));
+    const signedIn = await call(worker, "/api/driver-login", {
+      method: "POST",
+      body: { company: fleet.slug, name: "Riley Cole", passcode: "ride22" },
+    });
+    assert.equal(signedIn.status, 200, JSON.stringify(signedIn.data));
+    const driverSession = sessionOf(signedIn);
+    const denied = await call(worker, "/api/drivers/" + driver.id, { method: "DELETE", session: driverSession });
+    assert.equal(denied.status, 403);
+
+    const client = await call(worker, "/api/clients", {
+      method: "POST",
+      session: fleet.session,
+      body: { name: "Avery Cole" },
+    });
+    assert.equal(client.status, 201, JSON.stringify(client.data));
+    async function makeRide(time) {
+      const ride = await call(worker, "/api/rides", {
+        method: "POST",
+        session: fleet.session,
+        body: {
+          clientId: client.data.client.id,
+          date: "2026-11-18",
+          time,
+          pickup: "Hotel",
+          dropoff: "Airport",
+          passengers: 1,
+          fare: "40",
+        },
+      });
+      assert.equal(ride.status, 201, JSON.stringify(ride.data));
+      const assigned = await call(worker, "/api/rides/" + ride.data.ride.id, {
+        method: "PATCH",
+        session: fleet.session,
+        body: { driverUserId: driver.id },
+      });
+      assert.equal(assigned.status, 200, JSON.stringify(assigned.data));
+      return ride.data.ride.id;
+    }
+    const upcomingId = await makeRide("09:30");
+    const doneId = await makeRide("16:00");
+    for (const [step, from] of [["En route", ""], ["Picked up", "En route"], ["Completed", "Picked up"]]) {
+      const stepResult = await call(worker, "/api/rides/" + doneId + "/progress", {
+        method: "POST",
+        session: fleet.session,
+        body: { step, from },
+      });
+      assert.equal(stepResult.status, 200, JSON.stringify(stepResult.data));
+    }
+
+    const soloDelete = await call(worker, "/api/drivers/" + driver.id, { method: "DELETE", session: solo.session });
+    assert.equal(soloDelete.status, 403);
+    const otherDelete = await call(worker, "/api/drivers/" + driver.id, { method: "DELETE", session: other.session });
+    assert.equal(otherDelete.status, 404);
+
+    const removed = await call(worker, "/api/drivers/" + driver.id, { method: "DELETE", session: fleet.session });
+    assert.equal(removed.status, 200, JSON.stringify(removed.data));
+    assert.equal(removed.data.unassignedRides, 1);
+
+    const listed = await call(worker, "/api/drivers", { session: fleet.session });
+    assert.equal(listed.data.drivers.some((row) => row.id === driver.id), false);
+    const upcoming = await call(worker, "/api/rides/" + upcomingId, { session: fleet.session });
+    assert.equal(upcoming.data.ride.driverUserId, null);
+    const done = await call(worker, "/api/rides/" + doneId, { session: fleet.session });
+    assert.equal(done.data.ride.driverUserId, driver.id);
+    assert.equal(done.data.ride.driverName, "Riley Cole");
+    assert.equal(done.data.ride.status, "completed");
+
+    const stillIn = await call(worker, "/api/me", { session: driverSession });
+    assert.equal(stillIn.status, 401);
+    const signIn = await call(worker, "/api/driver-login", {
+      method: "POST",
+      body: { company: fleet.slug, name: "Riley Cole", passcode: "ride22" },
+    });
+    assert.equal(signIn.status, 401);
+    const reassign = await call(worker, "/api/rides/" + upcomingId, {
+      method: "PATCH",
+      session: fleet.session,
+      body: { driverUserId: driver.id },
+    });
+    assert.equal(reassign.status, 404, JSON.stringify(reassign.data));
+
+    const again = await call(worker, "/api/drivers", {
+      method: "POST",
+      session: fleet.session,
+      body: { name: "riley cole", vehicle: "Sedan" },
+    });
+    assert.equal(again.status, 201, JSON.stringify(again.data));
+    assert.notEqual(again.data.driver.id, driver.id);
+    const history = await call(worker, "/api/rides/" + doneId, { session: fleet.session });
+    assert.equal(history.data.ride.driverUserId, driver.id);
+    assert.equal(history.data.ride.driverName, "Riley Cole");
+  } finally {
+    if (worker) await worker.stop();
+    await rm(persistTo, { recursive: true, force: true });
+  }
+});
