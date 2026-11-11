@@ -466,6 +466,7 @@ function rideCardHtml(ride, pending) {
       <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badge ${esc(ride.status)}">${esc(ride.schedule && ride.schedule.now && ride.status !== "scheduled" ? ride.schedule.now : label(ride.status))}</span></div>
       <div class="sub when">${when}${fare}</div>
       <div class="sub">${esc(ride.pickup)} → ${esc(ride.dropoff)}</div>
+      ${ride.driverName ? `<div class="sub">Driver: ${esc(ride.driverName)}</div>` : ""}
       ${trip}${phone}${notes}${quote}${actions}
     </div>`;
 }
@@ -542,6 +543,11 @@ async function renderRide(id, gen) {
     ["Trip", schedule.tripMinutes == null ? "Not recorded" : schedule.tripMinutes + " min"],
   ];
   const sharing = loc.data.ok && loc.data.location && loc.data.location.sharing;
+  const roster = (drivers && drivers.data && drivers.data.drivers) || [];
+  const onRoster = roster.some((member) => member.id === ride.driverUserId);
+  const formerDriver = ride.driverUserId && ride.driverName && !onRoster
+    ? `<option value="${esc(ride.driverUserId)}">${esc(ride.driverName)} (no longer on the roster)</option>`
+    : "";
   setTimeout(() => {
     const omw = document.querySelector("#sms-omw");
     if (!omw) return;
@@ -563,6 +569,7 @@ async function renderRide(id, gen) {
       ${tripLine(ride) ? `<p class="sub">${esc(tripLine(ride))}</p>` : ""}
       ${ride.quote && !driverView ? quoteBoxHtml(ride.quote) : ""}
       <p class="sub">${esc(ride.passengers)} passenger${ride.passengers === 1 ? "" : "s"}${ride.flight ? " · Flight " + esc(ride.flight) : ""}${ride.fare && ride.fare !== "$0.00" ? " · " + esc(ride.fare) : ""}${ride.clientPhone ? " · " + esc(ride.clientPhone) : ""}</p>
+      ${ride.driverName ? `<p class="sub">Driver: ${esc(ride.driverName)}${onRoster || !ride.driverUserId ? "" : " (no longer on the roster)"}</p>` : ""}
       <table class="times">${rows.map(([name, value]) => `<tr><th>${esc(name)}</th><td>${esc(value)}</td></tr>`).join("")}</table>
       <p class="sub">Arrival is not a step. Waiting time is not clocked. Times are Eastern and come only from taps.</p>
       ${ride.notes ? `<p>${esc(ride.notes)}</p>` : ""}
@@ -576,7 +583,7 @@ async function renderRide(id, gen) {
       ${ride.status === "scheduled" && !driverView ? `<button class="btn ghost" id="cancel" type="button">Cancel ride</button>` : ""}
       ${ride.status === "completed" && !driverView ? `<button class="btn" id="invoice" type="button">${invoice ? "Open invoice" : "Create invoice"}</button>` : ""}
     </div>
-    ${fleetOwner && ride.status !== "requested" && ride.status !== "declined" ? `<form id="assign" class="card noprint"><label>Assigned driver<select id="driver"><option value="">Unassigned</option>${((drivers && drivers.data && drivers.data.drivers) || []).map((member) => `<option value="${esc(member.id)}">${esc(driverOptionLabel(member))}</option>`).join("")}</select></label><p class="err" id="assignerr"></p></form>` : ""}
+    ${fleetOwner && ride.status !== "requested" && ride.status !== "declined" ? `<form id="assign" class="card noprint"><label>Assigned driver<select id="driver"><option value="">Unassigned</option>${formerDriver}${roster.map((member) => `<option value="${esc(member.id)}">${esc(driverOptionLabel(member))}</option>`).join("")}</select></label><p class="err" id="assignerr"></p></form>` : ""}
     <section class="card noprint${ride.status === "requested" || ride.status === "declined" ? " hidden" : ""}">
       <h2>Your location</h2>
       <p class="note">Sharing stays on only while this ride screen is open and the phone is unlocked. Updates pause when you leave this page or lock the phone. Nudge does not track in the background, and it does not text the location link to anyone.</p>
@@ -899,6 +906,15 @@ function driverCard(member, flash) {
       <button class="btn full" type="submit">${member.passcodeSet ? "Replace passcode" : "Set passcode"}</button>
       ${member.passcodeSet ? `<button class="btn ghost full" type="button" data-clear>Remove passcode</button>` : ""}
     </form>` : ""}
+    <div class="remove-driver">
+      <button class="btn danger full" type="button" data-remove>Remove driver</button>
+      <div class="confirm hidden" data-confirm>
+        <p class="note">Remove ${esc(title)} from the roster? They cannot sign in after this. Upcoming rides assigned to them become unassigned. Completed rides keep their name.</p>
+        <button class="btn danger full" type="button" data-confirm-delete>Remove driver</button>
+        <button class="btn ghost full" type="button" data-cancel-delete>Keep driver</button>
+        <p class="err"></p>
+      </div>
+    </div>
   </article>`;
 }
 
@@ -964,6 +980,40 @@ function paintDrivers(drivers, flash) {
       await refreshDrivers({ id, kind: "passcode", message: "Passcode removed. This driver cannot sign in until you set a new one." });
     };
   }
+  for (const row of list.querySelectorAll(".driver-row")) {
+    const remove = row.querySelector("[data-remove]");
+    const confirm = row.querySelector("[data-confirm]");
+    const cancel = row.querySelector("[data-cancel-delete]");
+    const yes = row.querySelector("[data-confirm-delete]");
+    if (remove && confirm) remove.onclick = () => {
+      remove.classList.add("hidden");
+      confirm.classList.remove("hidden");
+    };
+    if (cancel && confirm && remove) cancel.onclick = () => {
+      confirm.classList.add("hidden");
+      remove.classList.remove("hidden");
+    };
+    if (yes) yes.onclick = async () => {
+      const id = row.dataset.id;
+      const err = confirm.querySelector(".err");
+      yes.disabled = true;
+      const next = await api("/api/drivers/" + id, { method: "DELETE" });
+      if (!next.data.ok) {
+        yes.disabled = false;
+        if (err) err.textContent = next.data.error || "Could not remove the driver.";
+        return;
+      }
+      const n = Number(next.data.unassignedRides) || 0;
+      const note = document.querySelector("#driver-err");
+      if (note) {
+        note.classList.add("ok");
+        note.textContent = n === 0
+          ? "Driver removed. They cannot sign in. Completed rides still show their name."
+          : "Driver removed. " + n + " upcoming ride" + (n === 1 ? " is" : "s are") + " unassigned.";
+      }
+      await refreshDrivers();
+    };
+  }
   if (flash && flash.focusId) {
     const input = list.querySelector(`[data-passcode-for="${CSS.escape(flash.focusId)}"]`);
     const row = input && input.closest(".driver-row");
@@ -986,7 +1036,7 @@ async function refreshDrivers(flash) {
 
 async function renderSettings(gen) {
   setTabs(true);
-  shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card" id="drivers-card"><h2>Drivers</h2><p class="note">Add a driver by name. Type of vehicle and plate are optional. Then set that driver's sign-in passcode here. Drivers sign in with the company code, their name, and the passcode. Nothing is texted or emailed.</p><p class="sub" id="driver-code">Company code: loading…</p><form id="add-driver"><label>Name<input id="driver-name" maxlength="80" required autocomplete="off"></label><label>Type of vehicle<input id="driver-vehicle" maxlength="40" placeholder="SUV" autocomplete="off"></label><label>Plate number<input id="driver-plate" maxlength="12" placeholder="ABC1234" autocomplete="off" autocapitalize="characters"></label><p class="err" id="driver-err"></p><button class="btn full" type="submit">Add driver</button></form><div id="driver-list" class="muted">Loading drivers…</div></section>` : ""}<div id="box" class="muted">Loading…</div>`);
+  shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card" id="drivers-card"><h2>Drivers</h2><p class="note">Add a driver by name. Type of vehicle and plate are optional. Then set that driver's sign-in passcode here. Drivers sign in with the company code, their name, and the passcode. Nothing is texted or emailed. Remove a driver to take them off the roster: they cannot sign in, upcoming rides become unassigned, and completed rides keep their name.</p><p class="sub" id="driver-code">Company code: loading…</p><form id="add-driver"><label>Name<input id="driver-name" maxlength="80" required autocomplete="off"></label><label>Type of vehicle<input id="driver-vehicle" maxlength="40" placeholder="SUV" autocomplete="off"></label><label>Plate number<input id="driver-plate" maxlength="12" placeholder="ABC1234" autocomplete="off" autocapitalize="characters"></label><p class="err" id="driver-err"></p><button class="btn full" type="submit">Add driver</button></form><div id="driver-list" class="muted">Loading drivers…</div></section>` : ""}<div id="box" class="muted">Loading…</div>`);
   const result = await api("/api/settings");
   if (gen !== renderGen) return;
   const box = document.querySelector("#box");

@@ -119,4 +119,17 @@ const savedCard = await page.$("#drivers-card");
 await savedCard.screenshot({ path: `${dir}/${prefix}-drivers-saved-card.png` });
 console.log(`${dir}/${prefix}-drivers-saved-card.png`);
 
+const rileyAgain = await page.evaluateHandle(() => [...document.querySelectorAll(".driver-row")].find((row) => row.innerText.includes("Riley Cole")));
+await (await rileyAgain.$("[data-remove]")).click();
+await page.waitForFunction(() => document.body.innerText.includes("cannot sign in after this"));
+const confirmCard = await page.$("#drivers-card");
+await confirmCard.screenshot({ path: `${dir}/${prefix}-drivers-confirm.png` });
+console.log(`${dir}/${prefix}-drivers-confirm.png`);
+
+await (await rileyAgain.$("[data-confirm-delete]")).click();
+await page.waitForFunction(() => document.body.innerText.includes("Driver removed") && !document.body.innerText.includes("Riley Cole"));
+const removedCard = await page.$("#drivers-card");
+await removedCard.screenshot({ path: `${dir}/${prefix}-drivers-removed.png` });
+console.log(`${dir}/${prefix}-drivers-removed.png`);
+
 await browser.close();

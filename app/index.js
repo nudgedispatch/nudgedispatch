@@ -810,13 +810,14 @@ __name(profileFromRow, "profileFromRow");
 async function accountProfile(env, userId) {
   const row = await env.DB.prepare(
     `SELECT u.email, u.company_id, u.platform_admin, c.name AS company_name, c.kind AS company_kind,
-            c.status AS company_status, m.role AS member_role
+            c.status AS company_status, m.role AS member_role, d.deleted_at AS driver_deleted_at
      FROM users u
      LEFT JOIN companies c ON c.id = u.company_id
      LEFT JOIN memberships m ON m.user_id = u.id AND m.company_id = u.company_id
+     LEFT JOIN drivers d ON d.user_id = u.id AND d.company_id = u.company_id
      WHERE u.id = ?`
   ).bind(userId).first();
-  if (!row) return null;
+  if (!row || row.driver_deleted_at) return null;
   return profileFromRow(userId, row, env);
 }
 __name(accountProfile, "accountProfile");
@@ -827,15 +828,16 @@ async function currentUser(request, env) {
   const row = await env.DB.prepare(
     `SELECT s.id AS session_id, s.csrf_token, s.expires_at, u.id AS user_id, u.email,
             u.company_id, u.platform_admin, c.name AS company_name, c.kind AS company_kind,
-            c.status AS company_status, m.role AS member_role, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at
+            c.status AS company_status, m.role AS member_role, d.deleted_at AS driver_deleted_at, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at
      FROM sessions s
      JOIN users u ON u.id = s.user_id
      LEFT JOIN companies c ON c.id = u.company_id
      LEFT JOIN memberships m ON m.user_id = u.id AND m.company_id = u.company_id
+     LEFT JOIN drivers d ON d.user_id = u.id AND d.company_id = u.company_id
      WHERE s.token_hash = ?`
   ).bind(tokenHash).first();
   if (!row) return null;
-  if (row.expires_at < Date.now()) {
+  if (row.expires_at < Date.now() || row.driver_deleted_at) {
     await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(row.session_id).run();
     return null;
   }
@@ -1273,6 +1275,7 @@ function rideJson(row, role = "owner") {
     passengers: row.passengers,
     flight: row.flight,
     driverUserId: row.driver_user_id,
+    driverName: row.assigned_driver_name || "",
     status,
     approval: row.approval || "none",
     tripType: row.trip_type || "",
@@ -1932,6 +1935,7 @@ async function handleApi(request, env) {
     if (driverPass && method === "DELETE") return clearDriverPasscode(request, env, driverPass[1]);
     const driverOne = /^\/api\/drivers\/([0-9a-f-]{36})$/.exec(path);
     if (driverOne && method === "PATCH") return updateDriver(request, env, driverOne[1]);
+    if (driverOne && method === "DELETE") return deleteDriver(request, env, driverOne[1]);
     if (path === "/api/driver-login" && method === "POST") return driverLogin(request, env);
     if (path === "/api/clients" && method === "GET") return listClients(request, env);
     if (path === "/api/clients" && method === "POST") return createClient(request, env);
@@ -2189,7 +2193,7 @@ async function platformAccounts(request, env) {
     `SELECT c.id, c.name, c.kind, c.status, c.created_at, c.billing_plan, c.sms_addon_enabled, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_paid_through, c.billing_last_paid_at, c.billing_past_due_at, c.billing_event_at, c.billing_updated_at,
             (SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id
               WHERE m.company_id = c.id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1) AS owner_email,
-            (SELECT COUNT(*) FROM memberships m WHERE m.company_id = c.id AND m.role = 'driver') AS driver_count,
+            (SELECT COUNT(*) FROM memberships m LEFT JOIN drivers d ON d.user_id = m.user_id AND d.company_id = m.company_id WHERE m.company_id = c.id AND m.role = 'driver' AND d.deleted_at IS NULL) AS driver_count,
             (SELECT MAX(u.last_sign_in_at) FROM users u WHERE u.company_id = c.id) AS last_sign_in_at,
             (SELECT COUNT(*) FROM sms_messages s WHERE s.company_id = c.id AND s.status = 'sent' AND s.created_at >= ?) AS texts_month
      FROM companies c
@@ -2322,7 +2326,11 @@ async function peekInvite(request, env) {
 }
 __name(peekInvite, "peekInvite");
 async function driverCountFor(env, companyId) {
-  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM memberships WHERE company_id = ? AND role = 'driver'").bind(companyId).first();
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM memberships m
+     LEFT JOIN drivers d ON d.user_id = m.user_id AND d.company_id = m.company_id
+     WHERE m.company_id = ? AND m.role = 'driver' AND d.deleted_at IS NULL`
+  ).bind(companyId).first();
   return (row && row.n) || 0;
 }
 __name(driverCountFor, "driverCountFor");
@@ -2816,7 +2824,7 @@ async function driverLogin(request, env) {
   const company = await findDriverCompany(env, code);
   const driver = company && company.kind === "fleet" ? await env.DB.prepare(
     `SELECT user_id, login, passcode_hash, passcode_salt, passcode_iterations, passcode_kdf
-     FROM drivers WHERE company_id = ? AND name = ? COLLATE NOCASE`
+     FROM drivers WHERE company_id = ? AND name = ? COLLATE NOCASE AND deleted_at IS NULL`
   ).bind(company.id, named.name).first() : null;
   const usable = driver && driver.login === "passcode" && driver.passcode_kdf === PASSWORD_KDF && driver.passcode_hash && driver.passcode_salt;
   const ok = usable ? await verifyPassword(passcode, driver.passcode_salt, driver.passcode_hash, driver.passcode_iterations || PASSWORD_ITERATIONS) : false;
@@ -2978,8 +2986,9 @@ async function deleteClient(request, env, id) {
 __name(deleteClient, "deleteClient");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
   r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.picked_up_at, r.completed_at,
-  r.driver_user_id, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json
-  FROM rides r JOIN clients c ON c.id = r.client_id AND c.company_id = r.company_id`;
+  r.driver_user_id, drv.name AS assigned_driver_name, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json
+  FROM rides r JOIN clients c ON c.id = r.client_id AND c.company_id = r.company_id
+  LEFT JOIN drivers drv ON drv.user_id = r.driver_user_id AND drv.company_id = r.company_id`;
 async function listRides(request, env) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;
@@ -3083,7 +3092,11 @@ async function updateRide(request, env, id) {
     if (user.accountKind !== "fleet") return fail(403, "An individual account cannot assign drivers.");
     const driverId = body.driverUserId === null || body.driverUserId === "" ? null : str(body.driverUserId, 36);
     if (driverId) {
-      const member = await env.DB.prepare("SELECT role FROM memberships WHERE company_id = ? AND user_id = ?").bind(user.companyId, driverId).first();
+      const member = await env.DB.prepare(
+        `SELECT m.role FROM memberships m
+         LEFT JOIN drivers d ON d.user_id = m.user_id AND d.company_id = m.company_id
+         WHERE m.company_id = ? AND m.user_id = ? AND d.deleted_at IS NULL`
+      ).bind(user.companyId, driverId).first();
       if (!member) return fail(404, "That driver is not in this company.");
     }
     await env.DB.prepare("UPDATE rides SET driver_user_id = ?, updated_at = ? WHERE company_id = ? AND id = ?").bind(driverId, now, user.companyId, id).run();
@@ -3327,7 +3340,7 @@ const DRIVER_ROWS = `SELECT u.id, u.email, m.role,
   FROM memberships m
   JOIN users u ON u.id = m.user_id
   LEFT JOIN drivers d ON d.user_id = u.id AND d.company_id = m.company_id
-  WHERE m.company_id = ?`;
+  WHERE m.company_id = ? AND d.deleted_at IS NULL`;
 function driverJson(row) {
   const login = row.driver_login || "";
   const email = isRosterEmail(row.email) || login === "passcode" ? "" : row.email || "";
@@ -3354,7 +3367,7 @@ function fleetDrivers(user, action) {
 __name(fleetDrivers, "fleetDrivers");
 async function nameTaken(env, companyId, name, exceptId) {
   const row = await env.DB.prepare(
-    "SELECT user_id FROM drivers WHERE company_id = ? AND name = ? COLLATE NOCASE AND user_id <> ?"
+    "SELECT user_id FROM drivers WHERE company_id = ? AND name = ? COLLATE NOCASE AND user_id <> ? AND deleted_at IS NULL"
   ).bind(companyId, name, exceptId || "").first();
   return !!row;
 }
@@ -3489,6 +3502,46 @@ async function clearDriverPasscode(request, env, id) {
   return json({ ok: true, driver: row ? driverJson(row) : null });
 }
 __name(clearDriverPasscode, "clearDriverPasscode");
+async function deleteDriver(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = fleetDrivers(user, "change");
+  if (denied) return denied;
+  const existing = await loadDriver(env, user.companyId, id);
+  if (!existing || existing.role !== "driver") return fail(404, "Driver not found.");
+  const now = Date.now();
+  const name = existing.driver_name || str(existing.email, 80) || "Driver";
+  const statements = [];
+  if (existing.driver_login) {
+    statements.push(env.DB.prepare(
+      `UPDATE drivers SET deleted_at = ?, passcode_hash = '', passcode_salt = '', passcode_iterations = 0, passcode_kdf = '', updated_at = ?
+       WHERE user_id = ? AND company_id = ? AND deleted_at IS NULL`
+    ).bind(now, now, id, user.companyId));
+  } else {
+    statements.push(env.DB.prepare(
+      `INSERT INTO drivers (user_id, company_id, name, vehicle, plate, login, deleted_at, created_at, updated_at)
+       VALUES (?, ?, ?, '', '', 'email', ?, ?, ?)`
+    ).bind(id, user.companyId, name, now, now, now));
+  }
+  // Upcoming work must not stay with someone who can no longer sign in.
+  // Completed and cancelled rides keep driver_user_id so the name stays on the record.
+  statements.push(env.DB.prepare(
+    `UPDATE rides SET driver_user_id = NULL, updated_at = ?
+     WHERE company_id = ? AND driver_user_id = ? AND status NOT IN ('completed', 'cancelled')`
+  ).bind(now, user.companyId, id));
+  statements.push(env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id));
+  statements.push(env.DB.prepare(
+    `UPDATE driver_locations SET sharing = 0, lat = NULL, lng = NULL, acc = NULL, fix_at = NULL, saved_at = NULL, updated_at = ?
+     WHERE user_id = ? AND company_id = ?`
+  ).bind(now, id, user.companyId));
+  statements.push(env.DB.prepare(
+    "UPDATE location_links SET revoked_at = ? WHERE company_id = ? AND user_id = ? AND revoked_at IS NULL"
+  ).bind(now, user.companyId, id));
+  const results = await env.DB.batch(statements);
+  const unassigned = results[1] && results[1].meta ? results[1].meta.changes || 0 : 0;
+  return json({ ok: true, unassignedRides: unassigned });
+}
+__name(deleteDriver, "deleteDriver");
 async function getSettings(request, env) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;

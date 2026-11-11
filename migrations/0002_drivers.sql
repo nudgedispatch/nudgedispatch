@@ -13,9 +13,12 @@ CREATE TABLE drivers (
   passcode_salt TEXT NOT NULL DEFAULT '',
   passcode_iterations INTEGER NOT NULL DEFAULT 0,
   passcode_kdf TEXT NOT NULL DEFAULT '',
+  deleted_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 
-CREATE UNIQUE INDEX drivers_company_name ON drivers(company_id, name COLLATE NOCASE);
+-- Active names only. A removed driver keeps the row (and the name on past rides)
+-- without blocking a later driver who uses the same name.
+CREATE UNIQUE INDEX drivers_company_name ON drivers(company_id, name COLLATE NOCASE) WHERE deleted_at IS NULL;
 CREATE INDEX drivers_company ON drivers(company_id);
