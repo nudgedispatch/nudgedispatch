@@ -482,7 +482,8 @@ async function renderRides(gen) {
   const list = document.querySelector("#list");
   if (!result.data.ok) { list.textContent = result.data.error || "Could not load rides."; return; }
   const rides = result.data.rides || [];
-  if (!rides.length) { list.innerHTML = `<p>No rides yet. Use + New, or share your booking page from More.</p>`; return; }
+  const emptyRides = driverView ? "No rides assigned to you yet." : "No rides yet. Use + New, or share your booking page from More.";
+  if (!rides.length) { list.innerHTML = `<p>${emptyRides}</p>`; return; }
   const pending = rides.filter((ride) => ride.status === "requested");
   const rest = rides.filter((ride) => ride.status !== "requested");
   const parts = [];
@@ -493,7 +494,7 @@ async function renderRides(gen) {
     if (pending.length && !driverView) parts.push("<h2>Rides</h2>");
     parts.push(rest.map((ride) => rideCardHtml(ride, false)).join(""));
   }
-  list.innerHTML = parts.join("") || `<p>No rides yet. Use + New, or share your booking page from More.</p>`;
+  list.innerHTML = parts.join("") || `<p>${emptyRides}</p>`;
   wireApproveBlock(list);
   list.onclick = async (event) => {
     const approve = event.target.closest("[data-approve]");
