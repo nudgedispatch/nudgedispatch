@@ -116,6 +116,15 @@ async function signOut() {
   location.hash = "#/login";
 }
 
+function signOutButtonHtml() {
+  return `<button class="btn ghost full" id="out" type="button">Sign out</button>`;
+}
+
+function wireSignOut() {
+  const button = document.querySelector("#out");
+  if (button) button.onclick = () => signOut();
+}
+
 // ---- Billing access (draft Nov 10, 2026): grace banner, ending banner, locked page ----
 function billingLocked() {
   return !!(state.me && !state.me.platformAdmin && state.me.access && state.me.access.locked);
@@ -474,7 +483,8 @@ function rideCardHtml(ride, pending) {
 async function renderRides(gen) {
   setTabs(true);
   const driverView = state.me && state.me.role === "driver";
-  shell(`<h1>Rides</h1><div id="trial"></div><p class="note">${driverView ? "You are the driver. Tap On my way, Picked up, then Dropped off. Nothing is texted." : "Requested rides wait here until you approve them. Nothing is texted."}</p><div id="list" class="muted">Loading…</div>`);
+  shell(`<h1>Rides</h1><div id="trial"></div><p class="note">${driverView ? "You are the driver. Tap On my way, Picked up, then Dropped off. Nothing is texted." : "Requested rides wait here until you approve them. Nothing is texted."}</p>${driverView ? signOutButtonHtml() : ""}<div id="list" class="muted">Loading…</div>`);
+  if (driverView) wireSignOut();
   const [result] = await Promise.all([api("/api/rides"), loadTrial()]);
   if (gen !== renderGen) return;
   const trialBox = document.querySelector("#trial");
@@ -519,8 +529,9 @@ async function renderRides(gen) {
 
 async function renderRide(id, gen) {
   setTabs(true);
-  shell(`<p class="muted"><a href="#/rides">Rides</a></p><div id="box" class="muted">Loading…</div>`);
   const driverView = state.me && state.me.role === "driver";
+  shell(`<p class="muted"><a href="#/rides">Rides</a></p>${driverView ? signOutButtonHtml() : ""}<div id="box" class="muted">Loading…</div>`);
+  if (driverView) wireSignOut();
   const fleetOwner = state.me && state.me.accountKind === "fleet" && state.me.role === "owner";
   const requests = [api("/api/rides/" + id), api("/api/location?rideId=" + encodeURIComponent(id))];
   requests.push(fleetOwner ? api("/api/drivers") : Promise.resolve(null));
