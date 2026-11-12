@@ -253,6 +253,10 @@ export function findFlatFare(sheet, vehicleId, pickup, dropoff) {
   return best;
 }
 
+function normStreet(s) {
+  return String(s || "").toLowerCase().replace(/[.,#]/g, " ").replace(/\s+/g, " ").trim();
+}
+
 const roundUp = (cents, dollars) => Math.ceil(cents / (Math.max(1, dollars) * 100) - 1e-9) * Math.max(1, dollars) * 100;
 const fmt = (c) => "$" + (c / 100).toFixed(2).replace(/\.00$/, "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 function hoursText(h) {
@@ -300,6 +304,8 @@ export function computeQuote(sheet, req, route) {
     label = "Hourly, " + hoursText(Math.max(h, 0));
   } else {
     if (!req.pickup || !req.dropoff) return { available: false, reason: "addresses", message: "Enter pickup and drop-off to see an estimate." };
+    const sameStreet = normStreet(req.pickup) === normStreet(req.dropoff) && !!normStreet(req.pickup);
+    if (sameStreet) return { available: false, reason: "same-address", message: "Pickup and drop-off are the same address. Enter a different drop-off, or choose a drop-off at the airport." };
     const legs = tripType === "round-trip";
     const flat = findFlatFare(sheet, v.id, req.pickup, req.dropoff);
     if (flat) {

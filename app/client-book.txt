@@ -2,8 +2,10 @@
 
 // Public booking page. Field order (Iron Gate's airport-pickup flow is the reference):
 // trip type -> airport connection -> pickup (terminal dropdown or typed address) -> meeting point
-// -> date and time -> flight number (tracking only) -> passengers and luggage -> drop-off -> quote
+// -> drop-off (typed address or terminal, plus topside/curbside at Delta) -> date and time
+// -> flight number (tracking only) -> passengers and luggage -> quote
 // (only once both ends are filled) -> vehicle (by passenger count) -> contact -> review -> submit.
+// Drop-off sits with pickup so the address box stays on a phone first screen when Pickup at ATL is on.
 // The airport side always follows "Airport connection". A prefill or a place chip never writes the
 // airport into the other side.
 (function () {
@@ -304,9 +306,19 @@
   function placeChip(name) {
     const st = sideState();
     const hit = airportOf(name);
-    // Airport chip: it goes on the airport side, never into the other field.
+    // Airport chip: switch the airport-connection control, never paste the airport into the other field.
+    // If pickup already has a street address (the usual case), the chip sets Drop-off at ATL.
     if (hit && airports.length) {
-      const side = st.side !== "none" ? st.side : (lastFocus === "pickup" && !form.pickup.value ? "pickup" : "dropoff");
+      let side = st.side !== "none" ? st.side : "";
+      if (!side) {
+        const pickFilled = !!form.pickup.value.trim();
+        const dropFilled = !!form.dropoff.value.trim();
+        if (lastFocus === "pickup" && !pickFilled) side = "pickup";
+        else if (lastFocus === "dropoff" && !dropFilled) side = "dropoff";
+        else if (pickFilled && !dropFilled) side = "dropoff";
+        else if (!pickFilled && dropFilled) side = "pickup";
+        else side = "dropoff";
+      }
       if (hit.spot) spotValue = hit.spot;
       setSide(side + ":" + hit.airport.code);
       scheduleQuote(0);
@@ -397,11 +409,26 @@
     confirm.textContent = q.confirm || "";
   }
   let lastQuote = null;
+  function normStreet(s) {
+    return String(s || "").toLowerCase().replace(/[.,#]/g, " ").replace(/\s+/g, " ").trim();
+  }
+  function sameStreetEnds() {
+    const st = sideState();
+    if (st.side !== "none") return false;
+    const a = normStreet(form.pickup.value);
+    const b = normStreet(form.dropoff.value);
+    return !!(a && a === b);
+  }
   async function requestQuote() {
     if (!quoteInfo) return;
     if (!addressesReady() || !form.vehicle.value) {
       lastQuote = null;
       renderQuote(null);
+      return;
+    }
+    if (sameStreetEnds()) {
+      lastQuote = null;
+      renderQuote({ available: false, message: "Pickup and drop-off are the same address. Enter a different drop-off, or choose a drop-off at the airport." });
       return;
     }
     const my = ++quoteSeq;
@@ -516,6 +543,26 @@
     scheduleQuote(0);
     document.body.dataset.ready = "1";
   }
+
+  async function refreshAirports() {
+    if (!slug || form.classList.contains("hidden")) return;
+    try {
+      const result = await api("/api/public/book/" + encodeURIComponent(slug));
+      if (!result.data.ok || result.data.open === false) return;
+      const list = Array.isArray(result.data.airports) ? result.data.airports : [];
+      const prev = airports.map((a) => a.code).join(",");
+      const next = list.map((a) => a.code).join(",");
+      if (prev === next) return;
+      const keep = form.airportSide.value;
+      setupAirports(list);
+      if ([...form.airportSide.options].some((o) => o.value === keep)) form.airportSide.value = keep;
+      syncAirportFields();
+    } catch { /* keep the form the rider already filled in */ }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshAirports();
+  });
+  window.addEventListener("pageshow", refreshAirports);
 
   if ("serviceWorker" in navigator && slug) {
     const scope = "/book/" + encodeURIComponent(slug) + "/";
@@ -682,7 +729,7 @@
         flight: form.flight.value,
         notes: form.notes.value,
         airport: airportBody(),
-        company_website: form.company_website.value,
+        hp_extra: form.hp_extra ? form.hp_extra.value : "",
       };
       const result = await api("/api/public/book/" + encodeURIComponent(slug), { method: "POST", body });
       if (!result.data.ok) {

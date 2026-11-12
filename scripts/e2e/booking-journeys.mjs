@@ -41,7 +41,8 @@ async function call(worker, path, { method = "GET", body, session, admin } = {})
   const cookie = cookies.map((l) => l.split(";")[0]).find((p) => p.startsWith("nudge_session=")) || (session && session.cookie) || "";
   return { status: res.status, data, cookie };
 }
-async function tenant(worker, email, name, drivers) {
+const sessions = new Map();
+async function tenant(worker, email, name, drivers, opts = {}) {
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName: name, accountKind: "fleet" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
   const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "e2e-owner-pass-1" } });
@@ -59,9 +60,13 @@ async function tenant(worker, email, name, drivers) {
     const res = await call(worker, "/api/drivers", { method: "POST", session, body: d });
     assert.equal(res.status, 201, JSON.stringify(res.data));
   }
-  const air = await call(worker, "/api/booking-settings", { method: "PUT", session, body: { preset: ["ATL"] } });
-  assert.equal(air.status, 200, JSON.stringify(air.data));
-  return settings.data.settings.bookingSlug;
+  if (opts.airports !== false) {
+    const air = await call(worker, "/api/booking-settings", { method: "PUT", session, body: { preset: ["ATL"] } });
+    assert.equal(air.status, 200, JSON.stringify(air.data));
+  }
+  const slug = settings.data.settings.bookingSlug;
+  sessions.set(slug, session);
+  return slug;
 }
 
 const persistTo = mkdtempSync(join(tmpdir(), "nudge-e2e-"));
@@ -110,8 +115,11 @@ try {
     check(`${tag} black SUV meets at Legacy West Curb`, (await val("#meet")) === "legacy-west-curb" && /Legacy West Curb, zones W1 and W2/.test(await page.locator("#meetNote").textContent()));
     check(`${tag} black SUV: Legacy West Curb is fixed (no meeting choice, no inside option)`, !(await vis("#meet")) && (await vis("#meetFixed")) && (await page.locator("#meetFixed").textContent()) === "Legacy West Curb (W1 and W2)" && JSON.stringify(await page.locator("#meet option").allTextContents()) === JSON.stringify(["Legacy West Curb (W1 and W2)"]));
     check(`${tag} arrival labels and tracking hint`, (await page.locator("#dateLabel").textContent()) === "Arrival date" && (await vis("#timeHint")) && (await vis("#flight")));
-    const order = await page.evaluate(() => ["#pickupSpot", "#meetWrap", "[name=date]", "[name=time]", "#flight", "[name=passengers]", "[name=luggage]", "#dropoff", "#quote", "#vehicle"].map((s) => document.querySelector(s).getBoundingClientRect().top + window.scrollY));
+    const order = await page.evaluate(() => ["#pickupSpot", "#meetWrap", "#dropoff", "[name=date]", "[name=time]", "#flight", "[name=passengers]", "[name=luggage]", "#quote", "#vehicle"].map((s) => document.querySelector(s).getBoundingClientRect().top + window.scrollY));
     check(`${tag} airport-pickup field order`, order.every((y, i) => i === 0 || y >= order[i - 1] - 1), JSON.stringify(order));
+    const dropTop = await page.evaluate(() => document.querySelector("#dropoffTextWrap").getBoundingClientRect().top);
+    check(`${tag} drop-off address box is on the first phone screen after Pickup at ATL`, dropTop >= 0 && dropTop < 844 && await vis("#dropoff"), "top="+dropTop);
+
     check(`${tag} quote after addresses ($145 SUV)`, (await quoteText()) === "$145");
     check(`${tag} SUV-only fleet: no sedan offered`, JSON.stringify(await page.locator("#vehicle option").allTextContents()) === JSON.stringify(["SUV (up to 6)"]));
     await shot("prefill-airport-pickup");
@@ -203,9 +211,143 @@ try {
     const review2 = await page.locator("#reviewTable").textContent();
     check(`${tag} drop-off review shows Curbside`, /Drop-off at terminalCurbside/.test(review2), review2);
     await shot("review-airport-dropoff");
+
+    // 8. Desktop-style autofill: both address boxes get the same saved street (Jesse's live page).
+    await open(suvOnly);
+    const ac = await page.evaluate(() => ({
+      pickup: document.querySelector("#pickup").getAttribute("autocomplete") || "",
+      dropoff: document.querySelector("#dropoff").getAttribute("autocomplete") || "",
+      decoy: !!(document.querySelector('input[name="street_autofill"]') && document.querySelector('input[name="street_autofill"]').getAttribute("autocomplete") === "street-address"),
+      bookJs: document.querySelector('script[src*="book.js"]') && document.querySelector('script[src*="book.js"]').getAttribute("src") || "",
+    }));
+    check(`${tag} pickup/drop-off autocomplete use distinct section tokens`, ac.pickup.includes("section-nudge-pickup") && ac.dropoff.includes("section-nudge-dropoff") && ac.pickup !== ac.dropoff, JSON.stringify(ac));
+    check(`${tag} hidden street-address decoy is present`, ac.decoy, JSON.stringify(ac));
+    check(`${tag} book.js is cache-busted`, /\/book\.js\?v=/.test(ac.bookJs), ac.bookJs);
+    const home = "10300 Virginia Pine Ln, Alpharetta GA 30022";
+    await page.fill("#pickup", home);
+    await page.fill("#dropoff", home);
+    await page.waitForFunction(() => { const q = document.querySelector("#quote"); return q && !q.classList.contains("hidden") && q.dataset.state !== "pending"; }, null, { timeout: 8000 }).catch(() => {});
+    const sameQuote = ((await vis("#quote")) ? await page.locator("#quote").textContent() : "") || "";
+    check(`${tag} same autofilled address is not a silent Price on request`, /same address/i.test(sameQuote) && /Price on request/.test(sameQuote), sameQuote);
+    await shot("same-address-autofill");
+    check(`${tag} ATL Airport chip is visible`, await vis("#places") && (await page.locator("#places button", { hasText: "ATL Airport" }).count()) > 0);
+    await page.locator("#places button", { hasText: "ATL Airport" }).click();
+    check(`${tag} ATL Airport chip switches to Drop-off at ATL`, (await val("#airportSide")) === "dropoff:ATL" && (await vis("#dropoffSpot")) && !(await vis("#dropoff")), await val("#airportSide"));
+    check(`${tag} chip leaves the street address on Pickup`, (await vis("#pickup")) && (await val("#pickup")) === home);
+    await page.waitForFunction(() => {
+      const spot = document.querySelector("#dropoffSpot");
+      const q = document.querySelector("#quote");
+      return spot && spot.value === "" && (!q || q.classList.contains("hidden") || q.dataset.state !== "ok");
+    }, null, { timeout: 4000 }).catch(() => {});
+    check(`${tag} chip asks for a terminal before quoting`, (await val("#dropoffSpot")) === "" && !/\$/.test((await vis("#quote") && (await page.locator("#qPrice").textContent())) || ""), await page.locator("#quote").textContent().catch(() => ""));
+    await page.selectOption("#dropoffSpot", "domestic-south");
+    check(`${tag} quote after the chip and a terminal is the ATL flat fare`, (await quoteText()) === "$145", await page.locator("#quote").textContent());
+    await shot("chip-to-atl-dropoff");
     await ctx.close();
   }
-  check("no booking was submitted", submits === 0, String(submits));
+
+  // 9. Stale tab: page loaded before ATL was turned on, then settings appear without a reload.
+  const staleSlug = await tenant(worker, "stale-atl@example.test", "Late ATL Cars", [{ name: "Dee Driver", vehicle: "Black Chevy Suburban" }], { airports: false });
+  const staleCtx = await browser.newContext({ viewport: { width: 1024, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block" });
+  const stalePage = await staleCtx.newPage();
+  await stalePage.route(/\/api\/public\/book\/[^/]+$/, (route) => {
+    if (route.request().method() === "POST") { submits++; return route.abort(); }
+    return route.continue();
+  });
+  await stalePage.goto(`${base}/book/${staleSlug}/`, { waitUntil: "domcontentloaded" });
+  await stalePage.waitForSelector("body[data-ready='1']", { timeout: 20000 });
+  const hiddenBefore = await stalePage.locator("#airportWrap").evaluate((el) => el.classList.contains("hidden"));
+  check("stale tab before ATL: airport connection is hidden", hiddenBefore && !(await stalePage.locator("#airportWrap").isVisible()));
+  check("stale tab before ATL: ATL Airport chip still shows (rate-sheet place)", await stalePage.locator("#places button", { hasText: "ATL Airport" }).count() > 0);
+  await stalePage.fill("#pickup", "10300 Virginia Pine Ln, Alpharetta GA 30022");
+  await stalePage.fill("#dropoff", "10300 Virginia Pine Ln, Alpharetta GA 30022");
+  await stalePage.screenshot({ path: join(shots, "nudge-desktop-1024-stale-tab-before-atl.png"), fullPage: true });
+  const enable = await call(worker, "/api/booking-settings", { method: "PUT", session: sessions.get(staleSlug), body: { preset: ["ATL"] } });
+  assert.equal(enable.status, 200, JSON.stringify(enable.data));
+  await stalePage.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await stalePage.waitForFunction(() => { const w = document.querySelector("#airportWrap"); return w && !w.classList.contains("hidden"); }, null, { timeout: 8000 }).catch(() => {});
+  check("stale tab after visibility refresh: airport connection appears", await stalePage.locator("#airportWrap").isVisible());
+  await stalePage.locator("#places button", { hasText: "ATL Airport" }).click();
+  check("stale tab chip then sets Drop-off at ATL", (await stalePage.locator("#airportSide").inputValue()) === "dropoff:ATL" && await stalePage.locator("#dropoffSpot").isVisible());
+  await stalePage.screenshot({ path: join(shots, "nudge-desktop-1024-stale-tab-after-refresh.png"), fullPage: true });
+  await staleCtx.close();
+
+  // 10. Booking HTML/JS/SW are not cacheable; a SW-enabled reload still shows ATL.
+  for (const path of [`/book/${suvOnly}/`, "/book.js", `/book/${suvOnly}/sw.js`]) {
+    const res = await worker.fetch("http://127.0.0.1" + path);
+    const cc = res.headers.get("cache-control") || "";
+    check(`cache-control no-store on ${path}`, /no-store/i.test(cc), cc);
+  }
+  const swCtx = await browser.newContext({ viewport: { width: 1024, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "allow" });
+  const swPage = await swCtx.newPage();
+  await swPage.route(/\/api\/public\/book\/[^/]+$/, (route) => {
+    if (route.request().method() === "POST") { submits++; return route.abort(); }
+    return route.continue();
+  });
+  await swPage.goto(`${base}/book/${suvOnly}/`, { waitUntil: "domcontentloaded" });
+  await swPage.waitForSelector("body[data-ready='1']", { timeout: 20000 });
+  const ready = await swPage.evaluate(async () => {
+    if (!("serviceWorker" in navigator)) return { sw: false };
+    const reg = await navigator.serviceWorker.ready;
+    return { sw: !!reg, src: document.querySelector("script[src*='book.js']").getAttribute("src") };
+  });
+  check("cached-page profile: service worker is ready", ready.sw, JSON.stringify(ready));
+  await swPage.reload({ waitUntil: "domcontentloaded" });
+  await swPage.waitForSelector("body[data-ready='1']", { timeout: 20000 });
+  check("cached-page reload still shows airport connection", await swPage.locator("#airportWrap").isVisible());
+  await swPage.screenshot({ path: join(shots, "nudge-desktop-1024-cached-page-reload.png"), fullPage: true });
+  await swCtx.close();
+
+  // 11. A real local booking must land in the owner dashboard; a honeypot POST must not.
+  // Uses worker.fetch (not the browser), so the earlier journeys can still assert they never submitted.
+  const ownerSession = sessions.get(suvOnly);
+  const listedBefore = await call(worker, "/api/rides", { session: ownerSession });
+  const beforeIds = new Set((listedBefore.data.rides || []).map((r) => r.id));
+  const bookBody = {
+    name: "Jesse Test",
+    phone: "404-555-0199",
+    date: "2026-11-13",
+    time: "15:30",
+    pickup: "10300 Virginia Pine Ln, Alpharetta GA 30022",
+    dropoff: "",
+    passengers: 2,
+    luggage: 2,
+    tripType: "one-way",
+    vehicle: "suv",
+    flight: "DL1234",
+    airport: { code: "ATL", side: "dropoff", spot: "domestic-south", style: "topside" },
+  };
+  const trapped = await call(worker, "/api/public/book/" + suvOnly, { method: "POST", body: { ...bookBody, hp_extra: "http://spam.example" } });
+  check("honeypot POST returns a silent 201", trapped.status === 201 && trapped.data.ok === true, JSON.stringify({ status: trapped.status, ok: trapped.data.ok }));
+  const afterTrap = await call(worker, "/api/rides", { session: ownerSession });
+  check("honeypot 201 does not create a ride", (afterTrap.data.rides || []).length === beforeIds.size, String((afterTrap.data.rides || []).length));
+
+  const autofilled = await call(worker, "/api/public/book/" + suvOnly, { method: "POST", body: { ...bookBody, company_website: "https://baileyconsulting.example" } });
+  check("company_website autofill is no longer treated as a honeypot", autofilled.status === 201 && autofilled.data.ok === true, JSON.stringify({ status: autofilled.status, error: autofilled.data.error }));
+  const afterAutofill = await call(worker, "/api/rides", { session: ownerSession });
+  const autofillRide = (afterAutofill.data.rides || []).find((r) => !beforeIds.has(r.id) && r.status === "requested");
+  check("autofill payload still persists as a requested booking", !!(autofillRide && autofillRide.approval === "requested"), autofillRide ? autofillRide.status : "missing");
+
+  const created = await call(worker, "/api/public/book/" + suvOnly, { method: "POST", body: bookBody });
+  check("clean booking POST returns 201", created.status === 201 && created.data.ok === true, JSON.stringify({ status: created.status, error: created.data.error }));
+  const listed = await call(worker, "/api/rides", { session: ownerSession });
+  const pending = (listed.data.rides || []).filter((r) => r.status === "requested" && r.source === "booking-page");
+  const fresh = pending.find((r) => !beforeIds.has(r.id) && r.pickup && r.pickup.includes("Virginia Pine") && /ATL|Domestic Terminal South/i.test(r.dropoff || ""));
+  check("submitted booking appears in owner /api/rides as status requested", !!fresh, JSON.stringify((listed.data.rides || []).map((r) => ({ status: r.status, approval: r.approval, source: r.source, date: r.date }))));
+
+  const dashCtx = await browser.newContext({ viewport: { width: 1024, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block" });
+  const cookieHeader = ownerSession.cookie || "";
+  const cookieVal = cookieHeader.includes("=") ? cookieHeader.slice(cookieHeader.indexOf("=") + 1) : cookieHeader;
+  await dashCtx.addCookies([{ name: "nudge_session", value: cookieVal, url: base }]);
+  const dash = await dashCtx.newPage();
+  await dash.goto(base + "/#/rides", { waitUntil: "domcontentloaded" });
+  await dash.waitForSelector("text=Needs your approval", { timeout: 20000 }).catch(() => {});
+  const dashText = await dash.locator("#list").textContent().catch(() => "");
+  check("owner dashboard shows Needs your approval for the submitted booking", /Needs your approval/i.test(dashText) && /Virginia Pine/i.test(dashText), String(dashText).slice(0, 400));
+  await dash.screenshot({ path: join(shots, "nudge-desktop-1024-owner-dashboard-request.png"), fullPage: true });
+  await dashCtx.close();
+
+  check("browser journeys did not submit a booking", submits === 0, String(submits));
 } catch (error) {
   check("journeys ran", false, error && error.stack ? error.stack : String(error));
 } finally {

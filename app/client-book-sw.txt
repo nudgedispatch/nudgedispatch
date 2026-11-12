@@ -1,4 +1,4 @@
-const CACHE = "nudge-book-shell-v3";
+const CACHE = "nudge-book-shell-v4";
 
 function scopePath() {
   const path = new URL(self.registration.scope).pathname;
