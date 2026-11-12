@@ -4,7 +4,8 @@ import { billingAccess } from "../app/access.js";
 import { isListedPlatformAdmin, platformAdminEmails } from "../app/platform-admin.js";
 import { kindForPlan, normPlan, smsAllowed, stripeKeyProblem } from "../app/billing.js";
 import { computeQuote, validateRateSheet } from "../app/quote-engine.js";
-import { sendBlandSms, smsMode, textingProblem, usCanadaE164 } from "../app/sms.js";
+import { arrivedMessage, onMyWayMessage, sendBlandSms, smsMode, textingProblem, usCanadaE164 } from "../app/sms.js";
+import { meetingPointForArrived, shouldAutoOpenMaps } from "../app/progress-nav.js";
 import { verifyStripeSignature } from "../app/stripe_webhook.js";
 import { trialState } from "../app/trial.js";
 
@@ -146,4 +147,33 @@ test("Stripe webhook signatures reject a tampered body", async () => {
   const hex = [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
   assert.equal(await verifyStripeSignature(body, `t=${t},v1=${hex}`, secret, t), "");
   assert.equal(await verifyStripeSignature(body + " ", `t=${t},v1=${hex}`, secret, t), "signature mismatch");
+});
+
+test("the arrived passenger text matches the on-my-way style and stays short", () => {
+  assert.match(onMyWayMessage("Fleet A", "Avery Cole", "09:30"), /Reply STOP to opt out\.$/);
+  assert.equal(
+    arrivedMessage({ companyName: "Fleet A", driverName: "Riley Cole", vehicle: "SUV", plate: "ATL1042", meetingPoint: "Legacy West Curb (W1 and W2)" }),
+    "Fleet A: Your driver Riley has arrived in SUV ATL1042 at Legacy West Curb (W1 and W2). Reply STOP to opt out.",
+  );
+  assert.equal(
+    arrivedMessage({ companyName: "Fleet A", driverName: "Mike" }),
+    "Fleet A: Your driver Mike has arrived. Reply STOP to opt out.",
+  );
+  assert.equal(
+    arrivedMessage({ companyName: "", driverName: "", vehicle: "", plate: "", meetingPoint: "" }),
+    "Your car service: Your driver has arrived. Reply STOP to opt out.",
+  );
+  assert.equal(meetingPointForArrived({ side: "pickup", meet: { label: "Legacy West Curb (W1 and W2)" }, spotLabel: "Domestic Terminal North" }), "Legacy West Curb (W1 and W2)");
+  assert.equal(meetingPointForArrived({ side: "pickup", spotLabel: "Domestic Terminal North" }), "Domestic Terminal North");
+  assert.equal(meetingPointForArrived({ side: "dropoff", meet: { label: "Curbside" } }), "");
+});
+
+test("Maps auto-opens only after On my way and Picked up, never after Arrived, drop-off, or undo", () => {
+  assert.equal(shouldAutoOpenMaps("En route"), true);
+  assert.equal(shouldAutoOpenMaps("Picked up"), true);
+  assert.equal(shouldAutoOpenMaps("Arrived"), false);
+  assert.equal(shouldAutoOpenMaps("Completed"), false);
+  assert.equal(shouldAutoOpenMaps("En route", true), false);
+  assert.equal(shouldAutoOpenMaps("Picked up", true), false);
+  assert.equal(shouldAutoOpenMaps(""), false);
 });

@@ -28,6 +28,21 @@ export function onMyWayMessage(companyName, clientName, pickupTime) {
   return `${from}: Hi ${first}, your driver is on the way for your ${time12(pickupTime)} pickup. Reply STOP to opt out.`;
 }
 
+// Arrived text. Same style as on-my-way (company prefix, STOP opt-out). Vehicle, plate,
+// and a pickup meeting point are added only when known so the message stays short.
+export function arrivedMessage({ companyName, driverName, vehicle, plate, meetingPoint } = {}) {
+  const from = String(companyName || "").trim().slice(0, 60) || "Your car service";
+  const first = String(driverName || "").trim().split(/\s+/)[0] || "";
+  const who = first ? `Your driver ${first}` : "Your driver";
+  let body = `${who} has arrived`;
+  const veh = String(vehicle || "").trim();
+  const plat = String(plate || "").trim();
+  if (veh || plat) body += " in " + [veh, plat].filter(Boolean).join(" ");
+  const meet = String(meetingPoint || "").trim();
+  if (meet) body += " at " + meet;
+  return `${from}: ${body}. Reply STOP to opt out.`;
+}
+
 export function blandFailureReason(status, body) {
   if (status === 429 || hasLimitCode(body)) return LIMIT_MESSAGE;
   return "The text could not be sent.";

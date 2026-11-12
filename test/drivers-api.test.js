@@ -329,7 +329,7 @@ test("removing a driver keeps completed rides and drops upcoming ones", { timeou
     }
     const upcomingId = await makeRide("09:30");
     const doneId = await makeRide("16:00");
-    for (const [step, from] of [["En route", ""], ["Picked up", "En route"], ["Completed", "Picked up"]]) {
+    for (const [step, from] of [["En route", ""], ["Arrived", "En route"], ["Picked up", "Arrived"], ["Completed", "Picked up"]]) {
       const stepResult = await call(worker, "/api/rides/" + doneId + "/progress", {
         method: "POST",
         session: fleet.session,
