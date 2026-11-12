@@ -108,8 +108,9 @@ try {
     check(`${tag} prefill pickup: Pickup is not a text box`, !(await vis("#pickup")));
     check(`${tag} prefill pickup: Drop-off is a typed address`, (await vis("#dropoff")) && (await val("#dropoff")) === "100 Main St, Alpharetta" && !(await vis("#dropoffSpot")));
     check(`${tag} black SUV meets at Legacy West Curb`, (await val("#meet")) === "legacy-west-curb" && /Legacy West Curb, zones W1 and W2/.test(await page.locator("#meetNote").textContent()));
+    check(`${tag} black SUV: Legacy West Curb is fixed (no meeting choice, no inside option)`, !(await vis("#meet")) && (await vis("#meetFixed")) && (await page.locator("#meetFixed").textContent()) === "Legacy West Curb (W1 and W2)" && JSON.stringify(await page.locator("#meet option").allTextContents()) === JSON.stringify(["Legacy West Curb (W1 and W2)"]));
     check(`${tag} arrival labels and tracking hint`, (await page.locator("#dateLabel").textContent()) === "Arrival date" && (await vis("#timeHint")) && (await vis("#flight")));
-    const order = await page.evaluate(() => ["#pickupSpot", "#meet", "[name=date]", "[name=time]", "#flight", "[name=passengers]", "[name=luggage]", "#dropoff", "#quote", "#vehicle"].map((s) => document.querySelector(s).getBoundingClientRect().top + window.scrollY));
+    const order = await page.evaluate(() => ["#pickupSpot", "#meetWrap", "[name=date]", "[name=time]", "#flight", "[name=passengers]", "[name=luggage]", "#dropoff", "#quote", "#vehicle"].map((s) => document.querySelector(s).getBoundingClientRect().top + window.scrollY));
     check(`${tag} airport-pickup field order`, order.every((y, i) => i === 0 || y >= order[i - 1] - 1), JSON.stringify(order));
     check(`${tag} quote after addresses ($145 SUV)`, (await quoteText()) === "$145");
     check(`${tag} SUV-only fleet: no sedan offered`, JSON.stringify(await page.locator("#vehicle option").allTextContents()) === JSON.stringify(["SUV (up to 6)"]));
@@ -127,7 +128,12 @@ try {
     await page.selectOption("#airportSide", "dropoff:ATL");
     check(`${tag} switch to Drop-off at ATL: terminal moves to Drop-off`, (await vis("#dropoffSpot")) && (await val("#dropoffSpot")) === "international" && !(await vis("#pickupSpot")));
     check(`${tag} ... Pickup is a typed address without the airport`, (await vis("#pickup")) && !/ATL|Airport/i.test(await val("#pickup")));
-    check(`${tag} ... drop-off defaults to topside`, (await vis("#style")) && (await val("#style")) === "topside" && !(await vis("#meet")));
+    check(`${tag} ... International drop-off: no topside/curbside choice`, !(await vis("#styleWrap")) && !(await vis("#meetWrap")) && !/topside/i.test(await page.locator("form").innerText()));
+    await page.selectOption("#dropoffSpot", "domestic-south");
+    check(`${tag} ... Delta (Domestic South) drop-off defaults to topside`, (await vis("#style")) && (await val("#style")) === "topside" && !(await vis("#meetWrap")));
+    await page.selectOption("#dropoffSpot", "domestic-north");
+    check(`${tag} ... Domestic North drop-off: no topside/curbside choice`, !(await vis("#styleWrap")) && !/topside/i.test(await page.locator("form").innerText()));
+    await page.selectOption("#dropoffSpot", "international");
     await page.selectOption("#airportSide", "pickup:ATL");
     check(`${tag} switch back to Pickup at ATL: terminal on Pickup`, (await vis("#pickupSpot")) && (await val("#pickupSpot")) === "international" && (await vis("#dropoff")) && !(await vis("#dropoffSpot")));
     await page.selectOption("#airportSide", "none");
@@ -158,6 +164,16 @@ try {
     await page.dispatchEvent("[name=passengers]", "change");
     check(`${tag} 4 passengers: SUV only`, JSON.stringify(await page.locator("#vehicle option").allTextContents()) === JSON.stringify(["SUV (up to 6)"]));
     await shot("mixed-fleet-4-passengers");
+    // Mixed fleet: a sedan keeps its own meeting choices; the SUV gets Legacy West Curb only.
+    await page.fill("[name=passengers]", "2");
+    await page.dispatchEvent("[name=passengers]", "change");
+    await page.selectOption("#airportSide", "pickup:ATL");
+    await page.selectOption("#pickupSpot", "domestic-north");
+    await page.selectOption("#vehicle", "sedan");
+    check(`${tag} sedan pickup: curbside or inside meet-and-greet`, (await vis("#meet")) && JSON.stringify(await page.locator("#meet option").allTextContents()) === JSON.stringify(["Curbside", "Inside meet-and-greet"]));
+    await page.selectOption("#vehicle", "suv");
+    check(`${tag} SUV pickup in a mixed fleet: Legacy West Curb only`, !(await vis("#meet")) && (await page.locator("#meetFixed").textContent()) === "Legacy West Curb (W1 and W2)");
+    await shot("mixed-fleet-meeting-points");
 
     // 6. Airport pickup through to review (no submit).
     await open(suvOnly, "?airport=pickup&spot=domestic-south&dropoff=" + encodeURIComponent("100 Main St, Alpharetta"));

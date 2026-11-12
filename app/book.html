@@ -46,7 +46,7 @@
         <label id="pickupSelectWrap" class="hidden"><span id="pickupSelectLabel">Pickup terminal</span><select name="pickupSpot" id="pickupSpot"></select></label>
         <label id="pickupTextWrap" class="addr"><span>Pickup address</span><input name="pickup" id="pickup" autocomplete="street-address" required><span class="sugg hidden" id="pickupSugg" role="listbox"></span></label>
       </div>
-      <label id="meetWrap" class="hidden">Where to meet your driver<select name="meet" id="meet"></select><span class="fine" id="meetNote"></span></label>
+      <label id="meetWrap" class="hidden">Where to meet your driver<select name="meet" id="meet"></select><span class="fixedval hidden" id="meetFixed" role="note"></span><span class="fine" id="meetNote"></span></label>
       <div class="two" data-field="when"><label><span id="dateLabel">Pickup date</span><input name="date" type="date" required></label><label><span id="timeLabel">Pickup time</span><select name="time" required><option value="">Select time</option></select></label></div>
       <p class="fine hidden" id="timeHint">Choose the time you want to be picked up. Your flight number is used only to watch for delays and early arrivals.</p>
       <label id="flightWrap" data-field="flight">Flight number <span id="flightOpt">(optional)</span><input name="flight" id="flight" placeholder="e.g. DL1234" autocapitalize="characters"></label>

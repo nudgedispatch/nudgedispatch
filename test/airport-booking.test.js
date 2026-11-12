@@ -31,8 +31,9 @@ test("a black SUV pickup at ATL defaults to the Legacy West Curb (W1 and W2)", (
   assert.equal(r.airport.meet.id, "legacy-west-curb");
   assert.match(riderMeetingNote(r.airport), /Legacy West Curb \(W1 and W2\)/);
   assert.match(airportSummary(r.airport), /Meet at Legacy West Curb/);
-  const inside = readAirportChoice({ airport: { side: "pickup", spot: "international", meet: "inside" } }, atl, "suv");
-  assert.equal(inside.airport.meet.id, "inside");
+  // Black SUVs: Legacy West Curb is the only pickup point (no inside meet-and-greet).
+  assert.match(readAirportChoice({ airport: { side: "pickup", spot: "international", meet: "inside" } }, atl, "suv").error, /meet/);
+  assert.equal(readAirportChoice({ airport: { side: "pickup", spot: "international", meet: "inside" } }, atl, "sedan").airport.meet.id, "inside");
   // Curbside is for sedans and vans in the example; an SUV cannot pick it.
   assert.match(readAirportChoice({ airport: { side: "pickup", spot: "international", meet: "curbside" } }, atl, "suv").error, /meet/);
   assert.equal(readAirportChoice({ airport: { side: "pickup", spot: "international" } }, atl, "sedan").airport.meet.id, "curbside");
@@ -54,6 +55,18 @@ test("drop-off is topside for black SUVs by default and the client can pick curb
   assert.equal(curb.airport.style.id, "curbside");
   assert.match(airportSummary(curb.airport), /Curbside drop-off/);
   assert.equal(readAirportChoice({ airport: { side: "dropoff", spot: "domestic-south" } }, atl, "sedan").airport.style.id, "curbside");
+});
+
+test("topside or curbside is offered only at Domestic Terminal South (Delta)", () => {
+  for (const spot of ["domestic-north", "international"]) {
+    const r = readAirportChoice({ airport: { side: "dropoff", spot, style: "topside" } }, atl, "suv");
+    assert.equal(r.error, undefined);
+    assert.equal(r.airport.style, undefined);
+    assert.doesNotMatch(riderMeetingNote(r.airport) || "", /topside|curbside/i);
+  }
+  const pub = publicAirportInfo(atl);
+  assert.deepEqual(pub[0].dropoffStyle.spots, ["domestic-south"]);
+  assert.deepEqual(pub[0].pickupMeet.options.filter((o) => !o.classes || o.classes.includes("suv")).map((o) => o.id), ["legacy-west-curb"]);
 });
 
 test("vehicle classes come from roster text; an SUV-only fleet hides the sedan", () => {

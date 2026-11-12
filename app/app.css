@@ -120,6 +120,7 @@ body.bookpage .brand small { display: block; color: var(--muted); font-weight: 4
 .bookpage .two label { flex: 1; min-width: 0; }
 .bookpage .err { color: var(--red); margin: 12px 0 0; min-height: 0; }
 .bookpage .fine { font-size: 13px; margin: 6px 0 0; }
+.bookpage .fixedval { display: block; margin-top: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; font-weight: 600; }
 .bookpage .okcard { border-color: var(--green); }
 .bookpage .btn { display: block; width: 100%; margin: 10px 0; }
 .bookpage .hp { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }

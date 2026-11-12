@@ -3,7 +3,7 @@
 // Every fleet sets its own airports. Nothing here is specific to one operator: a fleet with no
 // airport settings gets the plain booking page (typed pickup and drop-off). AIRPORT_PRESETS.ATL is
 // the example config, taken from Iron Gate's live booking flow (terminal list, Legacy West Curb
-// for black SUV pickups, topside or curbside drop-off).
+// as the only black SUV pickup point, topside or curbside drop-off at Domestic Terminal South only).
 //
 // Config (stored per company in booking_settings.airports_json):
 // {
@@ -228,7 +228,8 @@ export const AIRPORT_PRESETS = {
           classes: ["suv"],
         },
         { id: "curbside", label: "Curbside", detail: "Your driver meets you at the arrivals curb.", classes: ["sedan", "van"] },
-        { id: "inside", label: "Inside meet-and-greet", detail: "Your driver meets you inside at baggage claim and walks you to the car." },
+        // Black SUVs use the Legacy West Curb only (ATL rule); other classes keep their own choices.
+        { id: "inside", label: "Inside meet-and-greet", detail: "Your driver meets you inside at baggage claim and walks you to the car.", classes: ["sedan", "van", "sprinter", "bus"] },
       ],
       default: "curbside",
       defaultByClass: { suv: "legacy-west-curb" },
@@ -240,6 +241,8 @@ export const AIRPORT_PRESETS = {
       ],
       default: "curbside",
       defaultByClass: { suv: "topside" },
+      // Topside or curbside is a Delta (Domestic Terminal South) choice only.
+      spots: ["domestic-south"],
     },
   },
 };
