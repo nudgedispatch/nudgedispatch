@@ -14,6 +14,83 @@
   const slugMatch = /^\/book\/([^/]+)\/?$/.exec(location.pathname);
   const slug = slugMatch ? decodeURIComponent(slugMatch[1]) : "";
 
+  const INSTALL_DISMISS_KEY = "nudge-book-install-dismissed";
+
+  function bookingShortName(name) {
+    const text = String(name || "").trim() || "Book a ride";
+    if (text.length <= 12) return text;
+    const first = text.split(/\s+/)[0];
+    if (first.length >= 3 && first.length <= 12) return first;
+    return text.slice(0, 12).trim();
+  }
+  function isStandalone() {
+    return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+  }
+  function isIos() {
+    const ua = navigator.userAgent || "";
+    return /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }
+  function installStorageKey() {
+    return INSTALL_DISMISS_KEY + ":" + (slug || "page");
+  }
+  function installDismissed() {
+    try { return localStorage.getItem(installStorageKey()) === "1"; } catch { return false; }
+  }
+  function rememberInstallDismissed() {
+    try { localStorage.setItem(installStorageKey(), "1"); } catch { /* ignore quota / private mode */ }
+  }
+  function hideInstallUi() {
+    const bar = $("#installBar");
+    const btn = $("#installApp");
+    const hint = $("#iosInstallHint");
+    if (btn) btn.classList.add("hidden");
+    if (hint) hint.classList.add("hidden");
+    if (bar) bar.classList.add("hidden");
+  }
+  function setupInstallPrompt() {
+    const bar = $("#installBar");
+    const btn = $("#installApp");
+    const hint = $("#iosInstallHint");
+    const dismiss = $("#dismissInstall");
+    if (!bar || !btn || !hint) return;
+    if (isStandalone() || installDismissed()) return;
+    let deferred = null;
+    window.addEventListener("beforeinstallprompt", (event) => {
+      event.preventDefault();
+      deferred = event;
+      hint.classList.add("hidden");
+      bar.classList.remove("hidden");
+      btn.classList.remove("hidden");
+    });
+    window.addEventListener("appinstalled", () => {
+      deferred = null;
+      rememberInstallDismissed();
+      hideInstallUi();
+    });
+    btn.addEventListener("click", async () => {
+      if (!deferred || typeof deferred.prompt !== "function") return;
+      deferred.prompt();
+      let outcome = "";
+      try {
+        const choice = await deferred.userChoice;
+        outcome = choice && choice.outcome || "";
+      } catch { /* prompt may be dismissed without a choice */ }
+      deferred = null;
+      if (outcome === "accepted") hideInstallUi();
+    });
+    if (dismiss) {
+      dismiss.addEventListener("click", () => {
+        rememberInstallDismissed();
+        hideInstallUi();
+      });
+    }
+    if (isIos()) {
+      bar.classList.remove("hidden");
+      hint.classList.remove("hidden");
+    }
+  }
+
+
   function todayIso() {
     return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
   }
@@ -527,11 +604,11 @@
     if (!result.data.ok) { showUnavailable(); return; }
     companyName = result.data.companyName || "the operator";
     $("#coName").textContent = companyName;
-    document.title = "Book a ride | " + companyName;
+    document.title = companyName;
     if (result.data.logoDataUrl) $("#coLogo").src = result.data.logoDataUrl;
     const titleEl = document.querySelector('meta[name="apple-mobile-web-app-title"]');
-    if (titleEl) titleEl.setAttribute("content", companyName);
-    if (result.data.open === false) { showClosed(result.data.closed); return; }
+    if (titleEl) titleEl.setAttribute("content", bookingShortName(companyName));
+    if (result.data.open === false) { showClosed(result.data.closed); setupInstallPrompt(); return; }
     $("#load").classList.add("hidden");
     $("#heading").classList.remove("hidden");
     form.classList.remove("hidden");
@@ -542,6 +619,7 @@
     applyPrefill();
     scheduleQuote(0);
     document.body.dataset.ready = "1";
+    setupInstallPrompt();
   }
 
   async function refreshAirports() {

@@ -4053,6 +4053,7 @@ import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNo
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { meetingPointForArrived } from "./progress-nav.js";
+import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
@@ -4084,8 +4085,8 @@ function assetTag(s) {
 }
 __name(assetTag, "assetTag");
 var BOOK_JS_SRC = "/book.js?v=" + assetTag(bookJs);
-function bookPageHtml() {
-  return bookHtml.replace('src="/book.js"', 'src="' + BOOK_JS_SRC + '"');
+function bookPageHtml(companyName) {
+  return applyBookingPageHtml(bookHtml, { jsSrc: BOOK_JS_SRC, companyName });
 }
 __name(bookPageHtml, "bookPageHtml");
 function bookServiceWorker() {
@@ -4099,14 +4100,6 @@ function bookingPageMatch(pathname) {
   return { slug: match[1], rest: match[2] || "" };
 }
 __name(bookingPageMatch, "bookingPageMatch");
-function bookingShortName(name) {
-  const text = String(name || "").trim() || "Book a ride";
-  if (text.length <= 12) return text;
-  const first = text.split(/\s+/)[0];
-  if (first.length >= 3 && first.length <= 12) return first;
-  return text.slice(0, 12).trim();
-}
-__name(bookingShortName, "bookingShortName");
 async function serveBookingManifest(env, slug) {
   const company = await publicBookingCompany(env, slug);
   if (!company) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
@@ -4156,7 +4149,9 @@ async function serveBookingAsset(request, env, slug, rest, url) {
     return new Response(null, { status: 308, headers: securityHeaders("text/plain; charset=utf-8", "no-store", { Location: location }) });
   }
   if (rest === "/") {
-    return new Response(bookPageHtml(), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+    const company = await publicBookingCompany(env, slug);
+    const companyName = company ? publicCompanyName(company) : "";
+    return new Response(bookPageHtml(companyName), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/manifest.webmanifest") return serveBookingManifest(env, slug);
   if (rest === "/sw.js") {

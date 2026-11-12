@@ -256,3 +256,9 @@ label.check input { width: 22px; min-height: 22px; height: 22px; flex: 0 0 auto;
 .bookpage #doneMeet { margin-top: 8px; color: var(--text); }
 .flight-alert { color: var(--red); font-weight: 600; }
 .airport-line { color: var(--teal-2); }
+
+.bookpage .install-bar { margin: 0 0 12px; }
+.bookpage .install-bar #installApp { margin: 0 0 8px; }
+.bookpage .install-hint { display: flex; align-items: flex-start; gap: 10px; background: #12211f; border: 1px solid #1f3d38; color: var(--teal-2); border-radius: 12px; padding: 10px 12px; font-size: 14px; }
+.bookpage .install-hint p { margin: 0; flex: 1; min-width: 0; line-height: 1.4; }
+.bookpage .install-dismiss { flex: 0 0 auto; background: none; border: 0; color: var(--muted); font-size: 13px; font-weight: 600; padding: 2px 0 2px 8px; min-height: 0; }
