@@ -1,12 +1,13 @@
-// Nudge Dispatch plan billing + SMS texting add-on (DRAFT, Nov 10, 2026). Stripe TEST MODE ONLY.
-// Pure helpers plus a tiny Stripe REST client. The client refuses any key that is not a test key,
-// so this build can never touch live mode. Texting itself (sending SMS) is NOT built.
+// Nudge Dispatch plan billing + SMS texting add-on.
+// Pure helpers plus a tiny Stripe REST client. The mode comes from STRIPE_SECRET_KEY
+// (sk_/rk_ test versus live). A live key is used only when STRIPE_MODE is live, so swapping
+// the secret alone cannot start live charges. Test keys keep working with STRIPE_MODE unset.
 
 export const BILLING_PLANS = ["solo", "small", "fleet"];
 export const PLAN_LABELS = { solo: "Solo", small: "Small fleet", fleet: "Fleet" };
 export const SMS_PLANS = ["small", "fleet"]; // website: texting add-on is for Small fleet and Fleet only
 
-// Stripe lookup keys (same keys can be recreated in live mode later; IDs differ per mode).
+// Stripe lookup keys. The same keys exist in test and live; price IDs differ per mode.
 export const LOOKUP = {
   solo: { base: "nudge_solo_monthly", extra: null, setup: "nudge_setup_solo" },
   small: { base: "nudge_small_base_monthly", extra: "nudge_small_extra_driver_monthly", setup: "nudge_setup_small" },
@@ -97,6 +98,7 @@ export function billingJson(company, driverCount) {
     subscribed: !!(company && company.stripe_subscription_id),
     subscriptionId: (company && company.stripe_subscription_id) || "",
     customerId: (company && company.stripe_customer_id) || "",
+    livemode: Number(company && company.stripe_livemode) === 1,
     monthlyEstimate: dollars(monthlyCents(plan, driverCount, smsOn(company))),
     billingStatus: (company && company.billing_status) || "",
     paidThrough: (company && company.billing_paid_through) || null,
@@ -105,12 +107,90 @@ export function billingJson(company, driverCount) {
   };
 }
 
-// ---- Stripe REST client (test mode only) ----
+// ---- Stripe REST client (test or live, from the key) ----
+const STRIPE_KEY_PREFIXES = ["sk_test_", "rk_test_", "sk_live_", "rk_live_"];
+const NOT_CONNECTED = "Stripe is not connected yet: the preview has no Stripe test key (STRIPE_SECRET_KEY). Texting was saved on the account only.";
+
+// Prefix only: sk_test_, rk_test_, sk_live_, rk_live_, empty, or other. Never the key itself.
+export function stripeKeyClass(key) {
+  const value = typeof key === "string" ? key : "";
+  if (!value) return "empty";
+  return STRIPE_KEY_PREFIXES.find((prefix) => value.startsWith(prefix)) || "other";
+}
+
+// "test", "live", or "" when the key is missing or not an sk_/rk_ key.
+export function stripeKeyMode(env) {
+  const cls = stripeKeyClass(env && env.STRIPE_SECRET_KEY);
+  if (cls === "sk_test_" || cls === "rk_test_") return "test";
+  if (cls === "sk_live_" || cls === "rk_live_") return "live";
+  return "";
+}
+
+// "" when unset (test keys allowed, live keys refused), "test", "live", or "invalid".
+export function stripeModeOptIn(env) {
+  const raw = env && typeof env.STRIPE_MODE === "string" ? env.STRIPE_MODE.trim() : "";
+  if (!raw) return "";
+  if (raw === "test" || raw === "live") return raw;
+  return "invalid";
+}
+
 export function stripeKeyProblem(env) {
   const key = (env && env.STRIPE_SECRET_KEY) || "";
-  if (!key) return "Stripe is not connected yet: the preview has no Stripe test key (STRIPE_SECRET_KEY). Texting was saved on the account only.";
-  if (!/^(sk|rk)_test_/.test(key)) return "Refusing to use a Stripe key that is not a test-mode key.";
+  if (!key) return NOT_CONNECTED;
+  const mode = stripeKeyMode(env);
+  if (!mode) return "Refusing to use a Stripe key that is not an sk_ or rk_ test or live key.";
+  const opt = stripeModeOptIn(env);
+  if (opt === "invalid") return "STRIPE_MODE must be test or live.";
+  // Live is opt-in. A live key with STRIPE_MODE unset or set to test never calls Stripe.
+  if (mode === "live" && opt !== "live") return "Refusing to use a live Stripe key until STRIPE_MODE is live.";
+  if (opt && opt !== mode) return "STRIPE_MODE is " + opt + " but the Stripe key is " + mode + ".";
   return "";
+}
+
+// What /api/platform/billing reports. testMode stays true unless a live key is actually enabled.
+export function billingConnection(env) {
+  const problem = stripeKeyProblem(env);
+  const active = problem ? "" : stripeKeyMode(env);
+  return {
+    stripeConnected: !problem,
+    testMode: active !== "live",
+    mode: active === "live" ? "live" : active === "test" ? "test" : "off",
+    problem
+  };
+}
+
+// Webhooks: no key and no live opt-in keeps today's test-mode handling.
+// A live opt-in, a live key, or a bad key fails closed until the key and STRIPE_MODE agree.
+export function stripeWebhookMode(env) {
+  const opt = stripeModeOptIn(env);
+  const key = typeof (env && env.STRIPE_SECRET_KEY) === "string" ? env.STRIPE_SECRET_KEY : "";
+  if (!key && (opt === "" || opt === "test")) return { mode: "test", problem: "" };
+  const problem = stripeKeyProblem(env);
+  if (problem) return { mode: "", problem };
+  return { mode: stripeKeyMode(env) || "test", problem: "" };
+}
+
+// "" when every livemode flag matches the key, otherwise the error to throw.
+// Objects that omit livemode (list wrappers, deleted ids) are allowed.
+export function livemodeConflict(mode, data) {
+  const expectLive = mode === "live";
+  let conflict = false;
+  const visit = (value) => {
+    if (typeof value === "boolean" && value !== expectLive) conflict = true;
+  };
+  const walk = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+    visit(obj.livemode);
+  };
+  walk(data);
+  if (data && Array.isArray(data.data)) for (const item of data.data) walk(item);
+  if (data && data.latest_invoice && typeof data.latest_invoice === "object") walk(data.latest_invoice);
+  const items = data && data.items && data.items.data;
+  if (Array.isArray(items)) for (const item of items) walk(item);
+  if (!conflict) return "";
+  return expectLive
+    ? "Stripe returned a test-mode object; stopping."
+    : "Stripe returned a live-mode object; stopping.";
 }
 
 function apiBase(env) {
@@ -158,7 +238,8 @@ export async function stripe(env, method, path, params, idempotencyKey) {
   const res = await fetch(url, { method, headers, body });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new StripeError(res.status, (data.error && data.error.message) || "Stripe request failed.");
-  if (data && data.livemode === true) throw new StripeError(500, "Stripe returned a live-mode object; stopping.");
+  const conflict = livemodeConflict(stripeKeyMode(env), data);
+  if (conflict) throw new StripeError(500, conflict);
   return data;
 }
 
@@ -190,7 +271,7 @@ export function subscriptionPlanItems(plan, driverCount, sms, prices, beta, prom
   return { items, addInvoiceItems, missing };
 }
 
-// Report one sent text to the Stripe test meter (counted against the 500 included, then $0.03 each).
+// Report one sent text to the Stripe meter (counted against the 500 included, then $0.03 each).
 export async function reportSmsUsage(env, customerId, identifier, value = 1) {
   return stripe(env, "POST", "/v1/billing/meter_events", {
     event_name: SMS_METER_EVENT,

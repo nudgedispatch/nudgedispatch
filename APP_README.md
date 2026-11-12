@@ -6,7 +6,7 @@ Canonical repository: [nudgedispatch/nudgedispatch](https://github.com/nudgedisp
 
 ## What is in this tree
 
-The Worker in `app/` is the operator app recovered from the deployed Cloudflare Worker `nudge-app` (version 29, uploaded 2026-11-10). `app/index.js` is that Worker's esbuild bundle. The other files under `app/` are the modules it imports (shell, quote engine, trial, billing access, Stripe test-mode helpers, and the Bland texting module).
+The Worker in `app/` is the operator app recovered from the deployed Cloudflare Worker `nudge-app` (version 29, uploaded 2026-11-10). `app/index.js` is that Worker's esbuild bundle. The other files under `app/` are the modules it imports (shell, quote engine, trial, billing access, Stripe billing helpers, and the Bland texting module).
 
 The private repository `nudgedispatch/Nudge-Dispatch-` was not readable from this environment. Its installation token can see only this public repository, so the unmerged branches were not fetched as git history. The deployed Worker is the combined app those branches grew into, plus trial and Stripe test-mode billing that landed after the 2026-11-09 handoff. The Iron Gate CRM port (`cursor/crm-on-stack-146d`, `cursor/crm-d1-146d`) is not in this Worker. The Iron Gate CRM Worker, its Apps Script, and the Iron Gate D1 database are not part of this tree.
 
@@ -73,11 +73,45 @@ Set these on the Worker host. Do not commit values.
 | `PLACES_AUTOCOMPLETE` | plain text | `on` shows address suggestions on the booking page through the Worker (`/api/public/book/<slug>/places`, Places API (New) on `GOOGLE_MAPS_SERVER_KEY`). Default off. The key needs Places API (New) enabled |
 | `FLIGHT_DATA_PROVIDER` | plain text | `aeroapi` (FlightAware AeroAPI) turns on flight alerts for airport pickups. Default off |
 | `FLIGHT_DATA_API_KEY` | secret | AeroAPI key. Unset means no flight lookups |
-| `STRIPE_SECRET_KEY` | secret | Stripe test key only. Live keys are refused |
-| `STRIPE_WEBHOOK_SECRET` | secret | Stripe webhook signing secret |
-| `STRIPE_PORTAL_CONFIGURATION` | plain text | Stripe customer portal configuration id |
+| `STRIPE_SECRET_KEY` | secret | `sk_test_` / `rk_test_` or `sk_live_` / `rk_live_`. The key selects the mode |
+| `STRIPE_MODE` | plain text | Unset or `test` allows a test key only. `live` is required before a live key is used. A mismatch is refused |
+| `STRIPE_WEBHOOK_SECRET` | secret | Signing secret for the webhook endpoint on this Worker. One secret at a time |
+| `STRIPE_PORTAL_CONFIGURATION` | plain text | Stripe customer portal configuration id for the same mode as the secret key |
 | `BLAND_API_BASE` | optional | Local mock only (`http://127.0.0.1:<port>`) |
 | `STRIPE_API_BASE` | optional | Local mock only (`http://127.0.0.1:<port>`) |
+
+## Stripe go-live
+
+Production host: `https://app.nudgedispatch.com` (Worker `nudge-app`). The mode follows `STRIPE_SECRET_KEY`. Test keys behave as they do today while `STRIPE_MODE` is unset. A live key does nothing until `STRIPE_MODE` is `live`, so replacing the secret by itself cannot start live charges. Do not change `SMS_MODE` or the Bland settings as part of this.
+
+Lookup keys stay the same in live mode (`nudge_solo_monthly`, `nudge_setup_solo`, `nudge_small_base_monthly`, `nudge_small_extra_driver_monthly`, `nudge_setup_small`, `nudge_fleet_base_monthly`, `nudge_fleet_extra_driver_monthly`, `nudge_setup_fleet`, `nudge_sms_monthly`, `nudge_sms_overage_metered`, `nudge_sms_setup`). The meter event stays `nudge_sms_text` with payload keys `stripe_customer_id` and `value`. Price IDs differ per mode; the app looks them up by those keys. `BETA50` is looked up in whichever mode the key is in, so a live beta signup needs that promotion code on the live account.
+
+Checklist, in order:
+
+1. Deploy this code while the Worker still has the test secret key and `STRIPE_MODE` is unset. Billing stays in test mode.
+2. In the live Stripe dashboard, add a webhook endpoint `https://app.nudgedispatch.com/api/stripe/webhook`. Subscribe to `invoice.paid`, `invoice.payment_succeeded`, `invoice.payment_failed`, `customer.subscription.updated`, and `customer.subscription.deleted`. Those are `HANDLED_EVENTS` in `app/stripe_webhook.js`. Live events are ignored until step 4, so the endpoint can exist first.
+3. Point `STRIPE_PORTAL_CONFIGURATION` at the live customer portal configuration (card update and invoice history). Test and live configuration ids are different.
+4. Set the Worker secret `STRIPE_SECRET_KEY` to the live secret or restricted key, the Worker secret `STRIPE_WEBHOOK_SECRET` to that endpoint's signing secret, and the plain var `STRIPE_MODE` to `live`. This Worker keeps one webhook secret. Remove any test-mode endpoint that posts to the same URL so test deliveries are not signed with a different secret. `wrangler secret put` deploys a new version; set the key and `STRIPE_MODE` in the same change. Until they agree, billing calls fail closed and live webhook events are not applied.
+5. Run the signed self-check below. Expect `keyClass` of `sk_live_` or `rk_live_`, `mode` `live`, `testMode` false, and `stripe` `ok`. The platform billing card should say live mode, not "No real charges."
+
+Self-check (does not print the secret). `STRIPE_WEBHOOK_SECRET` must already be in the environment. The event type `nudge.self_check` is handled before the livemode gate and returns key classes only.
+
+```bash
+BODY='{"id":"evt_self_check","type":"nudge.self_check"}'
+node --input-type=module -e '
+import { signForTest } from "./app/stripe_webhook.js";
+const body = process.argv[1];
+const secret = process.env.STRIPE_WEBHOOK_SECRET;
+if (!secret) { console.error("Set STRIPE_WEBHOOK_SECRET in the environment."); process.exit(1); }
+const header = await signForTest(body, secret, Math.floor(Date.now() / 1000));
+const res = await fetch("https://app.nudgedispatch.com/api/stripe/webhook", {
+  method: "POST",
+  headers: { "stripe-signature": header, "content-type": "application/json" },
+  body
+});
+console.log(res.status, await res.text());
+' "$BODY"
+```
 
 ## Airport bookings, vehicles, and flight alerts
 

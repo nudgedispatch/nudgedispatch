@@ -111,8 +111,10 @@ test("plan names and texting eligibility stay on the published plans", () => {
   assert.equal(kindForPlan("solo"), "individual");
 });
 
-test("Stripe live keys are refused and a missing key does not call Stripe", () => {
-  assert.match(stripeKeyProblem({ STRIPE_SECRET_KEY: "sk_live_example" }), /not a test-mode key/);
+test("a live Stripe key is refused unless STRIPE_MODE is live, and a missing key stays disconnected", () => {
+  assert.match(stripeKeyProblem({ STRIPE_SECRET_KEY: "sk_live_example" }), /STRIPE_MODE is live/);
+  assert.equal(stripeKeyProblem({ STRIPE_SECRET_KEY: "sk_live_example", STRIPE_MODE: "live" }), "");
+  assert.equal(stripeKeyProblem({ STRIPE_SECRET_KEY: "sk_test_example" }), "");
   assert.match(stripeKeyProblem({}), /not connected/);
 });
 
