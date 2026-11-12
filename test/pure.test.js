@@ -56,6 +56,28 @@ test("a flat airport fare does not need a distance lookup", () => {
   assert.equal(quote.totalCents, 12500);
 });
 
+test("the same pickup and drop-off is not quoted as a zero-mile trip", () => {
+  const parsed = validateRateSheet({
+    vehicles: [{ name: "SUV", seats: 6, base: "20", perMile: "3" }],
+    flatFares: [{
+      place: "ATL Airport",
+      placeKeywords: "atl, airport",
+      prices: { SUV: { oneWay: "145" } },
+    }],
+  });
+  assert.equal(parsed.error, undefined);
+  const quote = computeQuote(parsed.sheet, {
+    tripType: "one-way",
+    vehicle: parsed.sheet.vehicles[0].id,
+    pickup: "10300 Virginia Pine Ln, Alpharetta GA 30022",
+    dropoff: "10300 Virginia Pine Ln, Alpharetta, GA 30022",
+  }, { miles: 0, minutes: 0 });
+  assert.equal(quote.available, false);
+  assert.equal(quote.reason, "same-address");
+  assert.match(quote.message, /same address/i);
+});
+
+
 test("the free trial ends at 15 completed rides", () => {
   const now = Date.UTC(2026, 10, 11);
   const state = trialState({

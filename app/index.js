@@ -1612,7 +1612,10 @@ async function postPublicBook(request, env, slug) {
   }
   const body = await readPublicJson(request);
   if (isResponse(body)) return body;
-  if (str(body.company_website, 200) || str(body.website, 200)) {
+  // Trap only fields a real browser form never autofills. "company_website" used to be
+  // the honeypot name in the form; browsers filled it from a saved profile, the API
+  // returned 201 with the company name, and no ride was stored.
+  if (str(body.hp_extra, 200) || str(body.website, 200)) {
     return json({ ok: true, companyName: publicCompanyName(company) }, 201);
   }
   if (!await bookingAllowed(env, request, slug)) return fail(429, "Please wait a few minutes and try again.");
@@ -4003,8 +4006,24 @@ var FILES = {
   "/icons/icon-512.png": { body: icon512, type: "image/png", cache: "public, max-age=300" },
   "/icons/icon-192-maskable.png": { body: icon192Maskable, type: "image/png", cache: "public, max-age=300" },
   "/icons/icon-512-maskable.png": { body: icon512Maskable, type: "image/png", cache: "public, max-age=300" },
-  "/book.js": { body: bookJs, type: "text/javascript; charset=utf-8", cache: "no-cache" }
+  "/book.js": { body: bookJs, type: "text/javascript; charset=utf-8", cache: "no-store" }
 };
+function assetTag(s) {
+  let h = 0;
+  const text = String(s);
+  for (let i = 0; i < text.length; i++) h = Math.imul(31, h) + text.charCodeAt(i) | 0;
+  return (h >>> 0).toString(36);
+}
+__name(assetTag, "assetTag");
+var BOOK_JS_SRC = "/book.js?v=" + assetTag(bookJs);
+function bookPageHtml() {
+  return bookHtml.replace('src="/book.js"', 'src="' + BOOK_JS_SRC + '"');
+}
+__name(bookPageHtml, "bookPageHtml");
+function bookServiceWorker() {
+  return bookSwJs.replaceAll('"/book.js"', '"' + BOOK_JS_SRC + '"');
+}
+__name(bookServiceWorker, "bookServiceWorker");
 function bookingPageMatch(pathname) {
   const match = /^\/book\/([^/]+)(\/.*)?$/.exec(pathname);
   if (!match) return null;
@@ -4042,7 +4061,7 @@ async function serveBookingManifest(env, slug) {
       { src: base + "icon-512-maskable.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
     ]
   });
-  return new Response(body, { status: 200, headers: securityHeaders("application/manifest+json", "no-cache") });
+  return new Response(body, { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
 }
 __name(serveBookingManifest, "serveBookingManifest");
 async function serveBookingIcon(env, slug, spec) {
@@ -4069,13 +4088,13 @@ async function serveBookingAsset(request, env, slug, rest, url) {
     return new Response(null, { status: 308, headers: securityHeaders("text/plain; charset=utf-8", "no-store", { Location: location }) });
   }
   if (rest === "/") {
-    return new Response(bookHtml, { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-cache") });
+    return new Response(bookPageHtml(), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/manifest.webmanifest") return serveBookingManifest(env, slug);
   if (rest === "/sw.js") {
     const company = await publicBookingCompany(env, slug);
     if (!company) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
-    return new Response(bookSwJs, { status: 200, headers: securityHeaders("text/javascript; charset=utf-8", "no-cache") });
+    return new Response(bookServiceWorker(), { status: 200, headers: securityHeaders("text/javascript; charset=utf-8", "no-store") });
   }
   const icons = {
     "/icon-192.png": { size: 192, maskable: false, fallback: icon192 },
