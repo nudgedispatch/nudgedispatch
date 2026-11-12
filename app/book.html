@@ -26,6 +26,13 @@
   </div>
 </header>
 <main id="bk">
+  <div id="installBar" class="install-bar hidden">
+    <button type="button" id="installApp" class="btn ghost hidden">Install app</button>
+    <div id="iosInstallHint" class="install-hint hidden" role="status">
+      <p>Tap Share, then Add to Home Screen</p>
+      <button type="button" id="dismissInstall" class="install-dismiss">Dismiss</button>
+    </div>
+  </div>
   <p id="load" class="muted">Loading the booking page…</p>
   <p id="unavailable" class="err hidden" role="alert">This booking page is not available.</p>
   <div id="closed" class="hidden">

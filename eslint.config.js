@@ -13,6 +13,7 @@ export default [
       "app/platform-admin.js",
       "app/drivers.js",
       "app/progress-nav.js",
+      "app/booking-shell.js",
       "test/**/*.js",
       "scripts/**/*.js",
     ],
