@@ -12,6 +12,7 @@ export default [
       "app/stripe_webhook.js",
       "app/platform-admin.js",
       "app/drivers.js",
+      "app/progress-nav.js",
       "test/**/*.js",
       "scripts/**/*.js",
     ],

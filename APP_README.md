@@ -52,6 +52,8 @@ Tables: `booking_settings`, `flight_alerts`, `companies`, `users`, `clients`, `r
 
 `drivers` is the fleet roster (name, vehicle type, plate, passcode hash, `deleted_at`) and points at the driver user. Rides still store that user id in `rides.driver_user_id`. Renaming a driver updates the roster name only. A fleet owner adds, edits, and removes drivers from More, then sets the passcode on that screen. Removing a driver sets `deleted_at`, clears the passcode, and ends their sessions. Upcoming rides (not completed or cancelled) become unassigned. Completed and cancelled rides keep the driver id, so the name stays on those records. The driver signs in with the company code, their name, and the passcode. Older driver accounts that were invited by email still sign in with email and a password until they are removed.
 
+Driver ride progress is `""` (not started), `En route`, `Arrived`, `Picked up`, then `Completed`, stored on `rides.progress` with timestamps `en_route_at`, `arrived_at`, `picked_up_at`, and `completed_at`. Older rides without `arrived_at` stay valid. Tapping Arrived can send one passenger text through Bland when the company texting add-on is on and `SMS_MODE` allows it; a texting failure does not block the step.
+
 This app does not read or write Google Sheets. CSV export is a file download. Distance quotes, when a key is configured, call the Google Routes API (`routes.googleapis.com`), not Sheets. The Iron Gate CRM spreadsheet is a separate system and is not connected here.
 
 ## Environment and secrets

@@ -961,15 +961,17 @@ __name(revokeAll, "revokeAll");
 
 // src/trip.ts
 var TRIP_ZONE = "America/New_York";
-var PROGRESS_STEPS = ["", "En route", "Picked up", "Completed"];
+var PROGRESS_STEPS = ["", "En route", "Arrived", "Picked up", "Completed"];
 var STEP_BUTTON = {
   "En route": "On my way",
+  Arrived: "Arrived",
   "Picked up": "Picked up",
   Completed: "Dropped off \xB7 complete ride"
 };
 var STEP_NOW = {
   "": "Not started",
   "En route": "On the way to pickup",
+  Arrived: "Driver arrived",
   "Picked up": "Rider on board",
   Completed: "Ride complete"
 };
@@ -1045,8 +1047,10 @@ function rideSchedule(ride) {
   const next = index >= 0 && index < PROGRESS_STEPS.length - 1 ? PROGRESS_STEPS[index + 1] : null;
   const previous = index > 0 ? PROGRESS_STEPS[index - 1] : null;
   const plannedPickupAt = zonedWallToUnix(ride.pickupDate, ride.pickupTime);
-  const navAddress = progress === "En route" ? ride.pickup : progress === "Picked up" || progress === "Completed" ? ride.dropoff : "";
-  const navLabel = progress === "En route" ? "Pickup in Maps" : navAddress ? "Drop-off in Maps" : "";
+  const toDropoff = progress === "Picked up" || progress === "Completed";
+  const navAddress = toDropoff ? ride.dropoff : ride.pickup;
+  const navLabel = toDropoff ? "Navigate to drop-off" : "Navigate to pickup";
+  const arrivedAt = ride.arrivedAt == null ? null : ride.arrivedAt;
   return {
     progress,
     now: ride.status === "requested" ? "Requested" : ride.status === "declined" ? "Declined" : STEP_NOW[progress],
@@ -1056,14 +1060,16 @@ function rideSchedule(ride) {
     plannedPickupAt,
     plannedDropoffAt: null,
     enRouteAt: ride.enRouteAt,
+    arrivedAt,
     pickedUpAt: ride.pickedUpAt,
     droppedOffAt: ride.completedAt,
     enRouteLabel: ride.enRouteAt === null ? null : formatEt(ride.enRouteAt),
+    arrivedLabel: arrivedAt === null ? null : formatEt(arrivedAt),
     pickedUpLabel: ride.pickedUpAt === null ? null : formatEt(ride.pickedUpAt),
     droppedOffLabel: ride.completedAt === null ? null : formatEt(ride.completedAt),
-    toPickupMinutes: minutesBetween(ride.enRouteAt, ride.pickedUpAt),
+    toPickupMinutes: minutesBetween(ride.enRouteAt, arrivedAt == null ? ride.pickedUpAt : arrivedAt),
+    waitingMinutes: minutesBetween(arrivedAt, ride.pickedUpAt),
     tripMinutes: minutesBetween(ride.pickedUpAt, ride.completedAt),
-    waitingMinutes: null,
     nav: navAddress ? { label: navLabel, url: mapsDirectionsUrl(navAddress) } : null
   };
 }
@@ -1296,6 +1302,7 @@ function rideJson(row, role = "owner") {
       progress: row.progress || "",
       status,
       enRouteAt: row.en_route_at,
+      arrivedAt: row.arrived_at,
       pickedUpAt: row.picked_up_at,
       completedAt: row.completed_at
     })
@@ -3200,8 +3207,8 @@ async function deleteClient(request, env, id) {
 }
 __name(deleteClient, "deleteClient");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
-  r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.picked_up_at, r.completed_at,
-  r.driver_user_id, drv.name AS assigned_driver_name, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
+  r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.arrived_at, r.picked_up_at, r.completed_at,
+  r.driver_user_id, drv.name AS assigned_driver_name, drv.vehicle AS assigned_driver_vehicle, drv.plate AS assigned_driver_plate, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
   r.airport_json, r.luggage,
   (SELECT fa.message FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert,
   (SELECT fa.kind FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_kind,
@@ -3377,13 +3384,14 @@ async function applyProgress(env, user, existing, step, from, undo) {
   let result;
   if (!undo) {
     result = await env.DB.prepare(
-      `UPDATE rides SET progress = ?, status = ?, en_route_at = COALESCE(en_route_at, ?), picked_up_at = COALESCE(picked_up_at, ?),
+      `UPDATE rides SET progress = ?, status = ?, en_route_at = COALESCE(en_route_at, ?), arrived_at = COALESCE(arrived_at, ?), picked_up_at = COALESCE(picked_up_at, ?),
         completed_at = COALESCE(completed_at, ?), updated_at = ?
        WHERE company_id = ? AND id = ? AND progress = ? AND status != 'cancelled'`
     ).bind(
       step,
       step === "Completed" ? "completed" : "scheduled",
       stamp("En route"),
+      stamp("Arrived"),
       stamp("Picked up"),
       stamp("Completed"),
       now,
@@ -3395,11 +3403,12 @@ async function applyProgress(env, user, existing, step, from, undo) {
     result = await env.DB.prepare(
       `UPDATE rides SET progress = ?, status = 'scheduled',
         en_route_at = CASE WHEN ? = 'En route' THEN NULL ELSE en_route_at END,
+        arrived_at = CASE WHEN ? = 'Arrived' THEN NULL ELSE arrived_at END,
         picked_up_at = CASE WHEN ? = 'Picked up' THEN NULL ELSE picked_up_at END,
         completed_at = CASE WHEN ? = 'Completed' THEN NULL ELSE completed_at END,
         updated_at = ?
        WHERE company_id = ? AND id = ? AND progress = ?`
-    ).bind(step, current, current, current, now, companyId, existing.id, current).run();
+    ).bind(step, current, current, current, current, now, companyId, existing.id, current).run();
   }
   if (!result.meta.changes) {
     const raced = await ownedRide(env, user, existing.id);
@@ -3407,9 +3416,64 @@ async function applyProgress(env, user, existing, step, from, undo) {
     return fail(409, "That step is out of order. Refresh the ride and try the next one.");
   }
   const row = await ownedRide(env, user, existing.id);
-  return json({ ok: true, ride: row ? rideJson(row, user.role) : null });
+  if (!undo && step === "Arrived" && row) {
+    try {
+      await maybeSendArrivedText(env, user, row);
+    } catch (error) {
+      console.log(JSON.stringify({ level: "warn", msg: "arrived text", name: error instanceof Error ? error.name : "Error" }));
+    }
+  }
+  const fresh = !undo && step === "Arrived" ? await ownedRide(env, user, existing.id) : row;
+  return json({ ok: true, ride: fresh ? rideJson(fresh, user.role) : null });
 }
 __name(applyProgress, "applyProgress");
+async function maybeSendArrivedText(env, user, ride) {
+  const company = await billingRow(env, user.companyId);
+  if (!company || !smsOn(company) || !smsAllowed(planOf(company)) || !payingNow(company)) return;
+  if (textingProblem(env)) return;
+  const already = await env.DB.prepare("SELECT id FROM sms_messages WHERE ride_id = ? AND kind = 'arrived' AND status = 'sent'").bind(ride.id).first();
+  if (already) return;
+  const to = usCanadaE164(ride.client_phone || "");
+  const now = Date.now();
+  const msgId = crypto.randomUUID();
+  const last4 = to ? to.slice(-4) : null;
+  const blocked = recipientProblem(env, to);
+  if (blocked) {
+    await env.DB.prepare("INSERT INTO sms_messages (id, company_id, ride_id, user_id, kind, to_last4, status, reason, created_at) VALUES (?, ?, ?, ?, 'arrived', ?, 'blocked', ?, ?)")
+      .bind(msgId, company.id, ride.id, user.userId, last4, blocked, now).run();
+    return;
+  }
+  const settings = await env.DB.prepare("SELECT business_name FROM invoice_settings WHERE company_id = ?").bind(company.id).first();
+  const message = arrivedMessage({
+    companyName: (settings && settings.business_name) || company.name,
+    driverName: ride.assigned_driver_name || "",
+    vehicle: ride.assigned_driver_vehicle || ride.vehicle_name || "",
+    plate: ride.assigned_driver_plate || "",
+    meetingPoint: meetingPointForArrived(parseStoredAirport(ride.airport_json))
+  });
+  const sent = await sendBlandSms(env, to, message, "nudge-" + ride.id + "-arrived");
+  if (!sent.ok) {
+    await env.DB.prepare("INSERT INTO sms_messages (id, company_id, ride_id, user_id, kind, to_last4, status, reason, created_at) VALUES (?, ?, ?, ?, 'arrived', ?, 'failed', ?, ?)")
+      .bind(msgId, company.id, ride.id, user.userId, last4, sent.reason, now).run();
+    return;
+  }
+  try {
+    await env.DB.prepare("INSERT INTO sms_messages (id, company_id, ride_id, user_id, kind, to_last4, status, provider_message_id, created_at) VALUES (?, ?, ?, ?, 'arrived', ?, 'sent', ?, ?)")
+      .bind(msgId, company.id, ride.id, user.userId, last4, sent.messageId || null, now).run();
+  } catch (error) {
+    if (error instanceof Error && /UNIQUE/i.test(error.message)) return;
+    throw error;
+  }
+  if (company.stripe_customer_id && !stripeKeyProblem(env)) {
+    try {
+      await reportSmsUsage(env, company.stripe_customer_id, msgId, 1);
+      await env.DB.prepare("UPDATE sms_messages SET meter_reported_at = ? WHERE id = ?").bind(Date.now(), msgId).run();
+    } catch (error) {
+      console.log(JSON.stringify({ level: "warn", msg: "sms meter", name: error instanceof Error ? error.name : "Error" }));
+    }
+  }
+}
+__name(maybeSendArrivedText, "maybeSendArrivedText");
 function invoiceText(settings, ride, number, issuedOn) {
   const contact = [settings.address, settings.phone, settings.email, settings.website].filter(Boolean).join(" | ");
   const trip = [
@@ -3427,13 +3491,16 @@ function invoiceText(settings, ride, number, issuedOn) {
     progress: ride.progress || "",
     status: ride.status,
     enRouteAt: ride.en_route_at,
+    arrivedAt: ride.arrived_at,
     pickedUpAt: ride.picked_up_at,
     completedAt: ride.completed_at
   });
   if (clock.enRouteLabel) trip.push(`On my way: ${clock.enRouteLabel} ET`);
+  if (clock.arrivedLabel) trip.push(`Driver arrived: ${clock.arrivedLabel} ET`);
   if (clock.pickedUpLabel) trip.push(`Picked up: ${clock.pickedUpLabel} ET`);
   if (clock.droppedOffLabel) trip.push(`Dropped off: ${clock.droppedOffLabel} ET`);
   if (clock.toPickupMinutes !== null) trip.push(`On my way to pickup: ${clock.toPickupMinutes} min`);
+  if (clock.waitingMinutes !== null) trip.push(`Waiting: ${clock.waitingMinutes} min`);
   if (clock.tripMinutes !== null) trip.push(`Trip: ${clock.tripMinutes} min`);
   const pay = settings.payment_instructions || "Pay the operator directly. This invoice is not sent for you.";
   return [
@@ -3984,7 +4051,8 @@ import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJs
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
 import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, StripeError, pricesByLookup, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs } from "./stripe_webhook.js";
-import { usCanadaE164, onMyWayMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
+import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
+import { meetingPointForArrived } from "./progress-nav.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";

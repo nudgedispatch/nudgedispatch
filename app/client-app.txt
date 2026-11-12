@@ -472,7 +472,7 @@ function rideCardHtml(ride, pending) {
   const quote = pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">No estimate was shown to the client.</div>`) : "";
   const actions = pending && owner ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, `data-fare="${esc(ride.id)}"`, `data-approve="${esc(ride.id)}"`)}<div class="pend-actions"><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : "";
   return `<div class="list-btn${pending ? " pending-request card" : ""}" data-id="${esc(ride.id)}">
-      <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badge ${esc(ride.status)}">${esc(ride.schedule && ride.schedule.now && ride.status !== "scheduled" ? ride.schedule.now : label(ride.status))}</span></div>
+      <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badge ${esc(ride.status)}">${esc(rideBadgeText(ride))}</span></div>
       <div class="sub when">${when}${fare}</div>
       <div class="sub">${esc(ride.pickup)} → ${esc(ride.dropoff)}</div>
       ${ride.driverName ? `<div class="sub">Driver: ${esc(ride.driverName)}</div>` : ""}
@@ -483,7 +483,7 @@ function rideCardHtml(ride, pending) {
 async function renderRides(gen) {
   setTabs(true);
   const driverView = state.me && state.me.role === "driver";
-  shell(`<h1>Rides</h1><div id="trial"></div><p class="note">${driverView ? "You are the driver. Tap On my way, Picked up, then Dropped off. Nothing is texted." : "Requested rides wait here until you approve them. Nothing is texted."}</p>${driverView ? signOutButtonHtml() : ""}<div id="list" class="muted">Loading…</div>`);
+  shell(`<h1>Rides</h1><div id="trial"></div><p class="note">${driverView ? "You are the driver. Tap On my way, Arrived, Picked up, then Dropped off. Arrived texts the passenger only when texting is on for this account." : "Requested rides wait here until you approve them. Nothing is texted unless you send it."}</p>${driverView ? signOutButtonHtml() : ""}<div id="list" class="muted">Loading…</div>`);
   if (driverView) wireSignOut();
   const [result] = await Promise.all([api("/api/rides"), loadTrial()]);
   if (gen !== renderGen) return;
@@ -548,10 +548,11 @@ async function renderRide(id, gen) {
     ["Planned pickup", ride.date + " at " + time12(ride.time) + " ET"],
     ["Planned drop-off", "Not stored"],
     ["On my way", schedule.enRouteLabel ? schedule.enRouteLabel + " ET" : "Not recorded"],
+    ["Driver arrived", schedule.arrivedLabel ? schedule.arrivedLabel + " ET" : "Not recorded"],
     ["Picked up", schedule.pickedUpLabel ? schedule.pickedUpLabel + " ET" : "Not recorded"],
     ["Dropped off", schedule.droppedOffLabel ? schedule.droppedOffLabel + " ET" : "Not recorded"],
     ["On my way to pickup", schedule.toPickupMinutes == null ? "Not recorded" : schedule.toPickupMinutes + " min"],
-    ["Waiting", "Not recorded"],
+    ["Waiting", schedule.waitingMinutes == null ? "Not recorded" : schedule.waitingMinutes + " min"],
     ["Trip", schedule.tripMinutes == null ? "Not recorded" : schedule.tripMinutes + " min"],
   ];
   const sharing = loc.data.ok && loc.data.location && loc.data.location.sharing;
@@ -582,16 +583,17 @@ async function renderRide(id, gen) {
       ${airportHtml(ride, "p")}
       ${ride.quote && !driverView ? quoteBoxHtml(ride.quote) : ""}
       <p class="sub">${esc(ride.passengers)} passenger${ride.passengers === 1 ? "" : "s"}${ride.flight ? " · Flight " + esc(ride.flight) : ""}${ride.fare && ride.fare !== "$0.00" ? " · " + esc(ride.fare) : ""}${ride.clientPhone ? " · " + esc(ride.clientPhone) : ""}</p>
-      ${ride.driverName ? `<p class="sub">Driver: ${esc(ride.driverName)}${onRoster || !ride.driverUserId ? "" : " (no longer on the roster)"}</p>` : ""}
+      ${ride.driverName ? `<p class="sub">Driver: ${esc(ride.driverName)}${driverView || onRoster || !ride.driverUserId ? "" : " (no longer on the roster)"}</p>` : ""}
       <table class="times">${rows.map(([name, value]) => `<tr><th>${esc(name)}</th><td>${esc(value)}</td></tr>`).join("")}</table>
-      <p class="sub">Arrival is not a step. Waiting time is not clocked. Times are Eastern and come only from taps.</p>
+      <p class="sub">Times are Eastern and come only from taps. Waiting is from Arrived to Picked up.</p>
       ${ride.notes ? `<p>${esc(ride.notes)}</p>` : ""}
     </article>
     <div class="stack noprint">
       ${ride.status === "requested" && !driverView ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, 'id="final-fare"', 'id="approve"')}<div class="pend-actions"><button class="btn ghost" id="decline" type="button">Decline</button></div>` : ""}
-      ${schedule.nextLabel ? `<button class="btn stage" id="step" type="button">${esc(schedule.nextLabel)}</button>` : ""}
-      ${smsInfo && smsInfo.data && smsInfo.data.ok && smsInfo.data.addon && ride.status === "scheduled" ? `<div class="card sms-box"><button class="btn ghost" id="sms-omw" type="button" ${smsInfo.data.ready ? "" : "disabled"}>Text client: on my way</button><p class="sub" id="sms-msg">${smsInfo.data.ready ? "You'll see the text before it is sent." : esc(smsInfo.data.problem)}</p></div>` : ""}
       ${schedule.nav ? `<a class="btn ghost" id="maps" href="${esc(schedule.nav.url)}" target="_blank" rel="noopener">${esc(schedule.nav.label)}</a>` : ""}
+      ${flightChipHtml(ride)}
+      ${schedule.nextLabel ? `<p class="sub progress-now">Progress: ${esc(schedule.now || "")}</p><button class="btn stage" id="step" type="button">${esc(schedule.nextLabel)}</button><p class="step-note" id="step-note">${esc(stepContactNote(schedule.nextStep, smsInfo))}</p>` : ""}
+      ${smsInfo && smsInfo.data && smsInfo.data.ok && smsInfo.data.addon && ride.status === "scheduled" && !driverView ? `<div class="card sms-box"><button class="btn ghost" id="sms-omw" type="button" ${smsInfo.data.ready ? "" : "disabled"}>Text client: on my way</button><p class="sub" id="sms-msg">${smsInfo.data.ready ? "You'll see the text before it is sent." : esc(smsInfo.data.problem)}</p></div>` : ""}
       ${schedule.undoStep != null && ride.status !== "cancelled" && ride.status !== "requested" && ride.status !== "declined" ? `<button class="btn ghost" id="undo" type="button">Undo last step</button>` : ""}
       ${ride.status === "scheduled" && !driverView ? `<button class="btn ghost" id="cancel" type="button">Cancel ride</button>` : ""}
       ${ride.status === "completed" && !driverView ? `<button class="btn" id="invoice" type="button">${invoice ? "Open invoice" : "Create invoice"}</button>` : ""}
@@ -635,11 +637,13 @@ async function renderRide(id, gen) {
   const step = document.querySelector("#step");
   if (step) step.onclick = async () => {
     const goingTo = schedule.nextStep;
+    const maps = openMapsWhenStepSaved(goingTo);
     const next = await api("/api/rides/" + id + "/progress", { method: "POST", body: { step: goingTo, from: schedule.progress || "" } });
-    if (gen !== renderGen) return;
-    if (!next.data.ok) return formError(next.data.error);
+    if (gen !== renderGen) { maps.cancel(); return; }
+    if (!next.data.ok) { maps.cancel(); return formError(next.data.error); }
     const nav = next.data.ride && next.data.ride.schedule && next.data.ride.schedule.nav;
-    if (nav && (goingTo === "En route" || goingTo === "Picked up")) window.open(nav.url, "_blank", "noopener");
+    if (shouldAutoOpenMaps(goingTo, false)) maps.go(nav && nav.url);
+    else maps.cancel();
     route();
   };
   const undo = document.querySelector("#undo");
@@ -1599,6 +1603,54 @@ function quoteBoxHtml(quote) {
       ${quote.lines && quote.lines.length ? `<table class="qlines">${quote.lines.map((line) => `<tr><td>${esc(line.label)}</td><td>${esc(line.amount)}</td></tr>`).join("")}</table>` : ""}
       ${quote.notes && quote.notes.length ? `<div class="sub">${esc(quote.notes.join(" "))}</div>` : ""}
     </div>`;
+}
+
+function flightTrackUrl(flight) {
+  const ident = String(flight || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return ident ? "https://www.flightaware.com/live/flight/" + ident : "";
+}
+
+function flightChipHtml(ride) {
+  const url = flightTrackUrl(ride && ride.flight);
+  if (!url) return "";
+  return `<a class="flight-chip" id="flight-track" href="${esc(url)}" target="_blank" rel="noopener">Flight ${esc(String(ride.flight).trim())} – track</a>`;
+}
+
+// Keep in sync with app/progress-nav.js shouldAutoOpenMaps.
+function shouldAutoOpenMaps(step, undo) {
+  return undo !== true && (step === "En route" || step === "Picked up");
+}
+
+// Open a window in the click (sync) so iOS Safari / Android Chrome PWAs don't block Maps
+// after the step save. If the pre-opened tab is missing, fall back to this window.
+function openMapsWhenStepSaved(step) {
+  if (!shouldAutoOpenMaps(step, false)) return { go() {}, cancel() {} };
+  let win = null;
+  try { win = window.open("about:blank", "_blank"); } catch (e) { win = null; }
+  return {
+    go(url) {
+      if (!url) { this.cancel(); return; }
+      if (win && !win.closed) {
+        try { win.location = url; return; } catch (e) {}
+      }
+      location.href = url;
+    },
+    cancel() {
+      if (win && !win.closed) { try { win.close(); } catch (e) {} }
+    }
+  };
+}
+
+function stepContactNote(nextStep, smsInfo) {
+  const canText = !!(smsInfo && smsInfo.data && smsInfo.data.ok && smsInfo.data.addon && smsInfo.data.ready);
+  if (nextStep === "Arrived" && canText) return "Texts the passenger that you've arrived.";
+  return "Updates your dashboard only. The passenger is not contacted.";
+}
+
+function rideBadgeText(ride) {
+  const schedule = ride.schedule || {};
+  if (schedule.now && (ride.status !== "scheduled" || schedule.progress)) return schedule.now;
+  return label(ride.status);
 }
 
 // Meeting point or topside/curbside choice, luggage, and the latest flight alert.
