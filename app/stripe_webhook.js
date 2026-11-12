@@ -65,6 +65,17 @@ export function refsOf(type, obj) {
   return { customer: idOf(obj.customer), subscription: sub };
 }
 
+// Test keys ignore livemode events (same as the test-only build). Live keys ignore everything else.
+export function webhookLivemodeDecision(event, mode) {
+  const liveEvent = !!(event && event.livemode === true);
+  if (mode === "live") {
+    if (!liveEvent) return { process: false, ignored: "test mode event", livemode: 0 };
+    return { process: true, livemode: 1 };
+  }
+  if (liveEvent) return { process: false, ignored: "livemode event", livemode: 1 };
+  return { process: true, livemode: 0 };
+}
+
 // Paid-through = latest period end on the invoice's subscription lines (falls back to invoice.period_end).
 export function paidThroughMs(invoice) {
   let end = 0;

@@ -1064,7 +1064,7 @@ async function renderSettings(gen) {
     const card = document.querySelector("#plan-card");
     if (!card || !b.data.ok) return;
     const x = b.data.billing;
-    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">Update your card or see past invoices on Stripe's secure billing page (test mode).</p>${portalButtonHtml(true)}` : ""}`;
+    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">Update your card or see past invoices on Stripe's secure billing page (${x.livemode ? "live" : "test"} mode).</p>${portalButtonHtml(true)}` : ""}`;
     card.hidden = false;
   }).catch(() => {});
   box.innerHTML = `<section class="card" id="booking-card">
@@ -1227,17 +1227,19 @@ function accessLine(a) {
     : `Access: LOCKED${a.until ? " since " + etDay(a.until) : ""} (${a.reason === "payment" ? "payment failed, 7-day grace over" : "canceled, paid period over"}). Data kept.`;
   return `<p class="sub billing-access" data-access="${esc(a.state)}"><strong>${esc(text)}</strong></p>`;
 }
-function adminBillingHtml(b) {
+function adminBillingHtml(b, workerTestMode = true) {
   if (!b) return "";
+  const testMode = b.subscribed ? !b.livemode : workerTestMode !== false;
+  const word = testMode ? "test" : "live";
   return `<div class="billing-admin">
       <h3>Plan and texting</h3>
       ${b.subscribed ? `<p class="sub billing-status" data-status="${esc(b.billingStatus || "none")}"><strong>Billing: ${esc(BILLING_STATUS_LABEL[b.billingStatus] || "waiting for Stripe")}</strong>${b.paidThrough ? " · paid through " + esc(new Date(b.paidThrough).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric" })) : ""}${b.lastPaidAt ? " · last paid " + esc(when(b.lastPaidAt)) : ""}</p>${accessLine(b.access)}` : ""}
-      <p class="sub">${esc(b.planLabel)} · about ${esc(b.monthlyEstimate)}/mo${b.extraDrivers ? " incl. " + esc(b.extraDrivers) + " extra driver" + (b.extraDrivers === 1 ? "" : "s") : ""} · ${b.subscribed ? "Stripe test subscription " + esc(b.subscriptionId) : "no Stripe subscription yet"}</p>
+      <p class="sub">${esc(b.planLabel)} · about ${esc(b.monthlyEstimate)}/mo${b.extraDrivers ? " incl. " + esc(b.extraDrivers) + " extra driver" + (b.extraDrivers === 1 ? "" : "s") : ""} · ${b.subscribed ? "Stripe " + word + " subscription " + esc(b.subscriptionId) : "no Stripe subscription yet"}</p>
       <label class="check"><input type="checkbox" data-sms-toggle ${b.smsAddon ? "checked" : ""} ${b.smsCanEnable || b.smsAddon ? "" : "disabled"}> Texting add-on</label>
       ${!b.smsAddon && b.smsEnableNote ? `<p class="sub sms-enable-note"><strong>${esc(b.smsEnableNote)}</strong></p>` : ""}
       <p class="sub">${b.smsAllowed ? esc(b.smsPriceText) + "." : "Texting is for Small fleet and Fleet plans."} ${b.textingReady ? "Texting is connected." : "Texting is not sending yet (provider setup pending)."} Texts sent this month: ${esc(b.textsThisMonth || 0)} of 500 included.</p>
       ${b.subscribed ? "" : `<label class="check"><input type="checkbox" name="beta"> Beta tester (BETA50: 50% off the plan setup fee)</label>
-      <button class="btn ghost full" type="button" data-act="billing-start">Start test subscription (Stripe test mode)</button>`}
+      <button class="btn ghost full" type="button" data-act="billing-start">Start ${word} subscription (Stripe ${word} mode)</button>`}
       <p class="err billing-msg"></p>
     </div>`;
 }
@@ -1280,7 +1282,7 @@ async function renderAdmin(gen) {
       <button class="btn full" type="submit">Create setup link</button>
       <div id="inv-once"></div>
     </form>
-    <section class="card" id="billing-status"><h2>Billing (Stripe test mode)</h2><p class="sub" id="billing-line">Checking…</p>
+    <section class="card" id="billing-status"><h2 id="billing-title">Billing (Stripe test mode)</h2><p class="sub" id="billing-line">Checking…</p>
       <button class="btn ghost full" type="button" id="sms-meter">Set up texting meter (one time)</button><p class="err" id="billing-msg"></p></section>
     <div id="accounts" class="muted">Loading…</div>
     <h2>Audit</h2>
@@ -1288,14 +1290,21 @@ async function renderAdmin(gen) {
   document.querySelector("#out").onclick = () => signOut();
   api("/api/platform/billing").then((b) => {
     const line = document.querySelector("#billing-line");
+    const title = document.querySelector("#billing-title");
     if (!line) return;
-    line.textContent = b.data.ok ? (b.data.stripeConnected ? "Connected to Stripe in test mode. No real charges." : b.data.problem) : "Could not check billing.";
+    const live = !!(b.data && b.data.ok && b.data.testMode === false);
+    if (title) title.textContent = live ? "Billing (Stripe live mode)" : "Billing (Stripe test mode)";
+    if (!b.data.ok) { line.textContent = "Could not check billing."; return; }
+    line.textContent = b.data.stripeConnected
+      ? (live ? "Connected to Stripe in live mode. Charges are real." : "Connected to Stripe in test mode. No real charges.")
+      : b.data.problem;
   }).catch(() => {});
   document.querySelector("#sms-meter").onclick = (event) => busy(event.currentTarget, async () => {
     const msg = document.querySelector("#billing-msg");
     try {
       const r = await api("/api/platform/billing/sms-meter", { method: "POST", body: {} });
-      setMsg(msg, r.data.ok ? (r.data.created ? "Texting meter and extra-text price created in Stripe test mode." : "Texting meter is already set up.") : (r.data.error || "Could not set up the meter."), r.data.ok);
+      const where = r.data.testMode === false ? "Stripe live mode" : "Stripe test mode";
+      setMsg(msg, r.data.ok ? (r.data.created ? "Texting meter and extra-text price created in " + where + "." : "Texting meter is already set up.") : (r.data.error || "Could not set up the meter."), r.data.ok);
     } catch (e) { setMsg(msg, SOMETHING_WRONG(e), false); }
   });
   const listed = await api("/api/platform/accounts");
@@ -1323,7 +1332,7 @@ async function renderAdmin(gen) {
       </div>
       <div class="once" aria-live="polite"></div>
       ${adminTrialHtml(trialById[account.id])}
-      ${adminBillingHtml(account.billing)}
+      ${adminBillingHtml(account.billing, listed.data.stripeTestMode)}
     </article>`).join("") : `<p>No customer accounts yet.</p>`;
   if (trials.data.ok) accounts.insertAdjacentHTML("afterbegin", `<p class="sub" id="beta-spots">Beta spots: ${esc(trials.data.betaSpots.onTrial)} of ${esc(trials.data.betaSpots.limit)} on a free trial now.</p>`);
   auditBox.innerHTML = audit.data.ok && audit.data.audit.length ? audit.data.audit.map((row) => {
@@ -1381,9 +1390,11 @@ async function renderAdmin(gen) {
       const msg = box.querySelector(".billing-msg");
       const beta = box.querySelector("[name=beta]").checked;
       const result = await api("/api/platform/companies/" + id + "/subscription", { method: "POST", body: { beta } });
-      if (!result.data.ok) { setMsg(msg, result.data.error || "Could not start the test subscription.", false); return; }
+      if (!result.data.ok) { setMsg(msg, result.data.error || (result.data.testMode === false ? "Could not start the live subscription." : "Could not start the test subscription."), false); return; }
+      const testInvoice = result.data.testMode !== false;
+      const word = testInvoice ? "Test" : "Live";
       msg.style.color = "var(--green)";
-      msg.innerHTML = "Test subscription " + esc(result.data.subscriptionId) + " (" + esc(result.data.status) + ")." + (result.data.invoiceUrl ? ` First invoice (test): <a href="${esc(result.data.invoiceUrl)}" target="_blank" rel="noopener">open</a>` : "");
+      msg.innerHTML = word + " subscription " + esc(result.data.subscriptionId) + " (" + esc(result.data.status) + ")." + (result.data.invoiceUrl ? ` First invoice (${testInvoice ? "test" : "live"}): <a href="${esc(result.data.invoiceUrl)}" target="_blank" rel="noopener">open</a>` : "");
       return;
     }
     if (button.dataset.act.startsWith("trial-")) {

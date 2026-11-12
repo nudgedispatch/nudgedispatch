@@ -26,9 +26,12 @@ export interface NudgeEnv {
   BLAND_API_BASE?: string;
   /** Google Routes API for distance quotes. Absent means distance quotes are skipped. */
   GOOGLE_MAPS_SERVER_KEY?: string;
-  /** Must be a Stripe test key (sk_test_ or rk_test_). Live keys are refused. */
+  /** sk_ or rk_ test or live key. A live key is used only when STRIPE_MODE is live. */
   STRIPE_SECRET_KEY?: string;
+  /** Unset allows test keys only. Set to live together with a live secret key. test also allowed. */
+  STRIPE_MODE?: string;
   STRIPE_WEBHOOK_SECRET?: string;
+  /** Customer portal configuration id for the same Stripe mode as the secret key. */
   STRIPE_PORTAL_CONFIGURATION?: string;
   STRIPE_API_BASE?: string;
 }

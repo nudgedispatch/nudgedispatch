@@ -2412,7 +2412,7 @@ async function platformAccounts(request, env) {
   const user = await platformUser(request, env, false);
   if (isResponse(user)) return user;
   const rows = await env.DB.prepare(
-    `SELECT c.id, c.name, c.kind, c.status, c.created_at, c.billing_plan, c.sms_addon_enabled, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_paid_through, c.billing_last_paid_at, c.billing_past_due_at, c.billing_event_at, c.billing_updated_at,
+    `SELECT c.id, c.name, c.kind, c.status, c.created_at, c.billing_plan, c.sms_addon_enabled, c.stripe_customer_id, c.stripe_subscription_id, c.stripe_livemode, c.billing_status, c.billing_paid_through, c.billing_last_paid_at, c.billing_past_due_at, c.billing_event_at, c.billing_updated_at,
             (SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id
               WHERE m.company_id = c.id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1) AS owner_email,
             (SELECT COUNT(*) FROM memberships m LEFT JOIN drivers d ON d.user_id = m.user_id AND d.company_id = m.company_id WHERE m.company_id = c.id AND m.role = 'driver' AND d.deleted_at IS NULL) AS driver_count,
@@ -2433,7 +2433,8 @@ async function platformAccounts(request, env) {
     billing: { ...billingJson(row, row.driver_count || 0), textsThisMonth: row.texts_month || 0, textingReady: !textingProblem(env), access: (({ state, locked, until, reason }) => ({ state, locked, until, reason }))(billingAccess(row, Date.now())), pastDueAt: row.billing_past_due_at || null }
   }));
   await writeAudit(env, user.userId, "accounts.list", "platform", "", { count: accounts.length });
-  return json({ ok: true, accounts });
+  const connection = billingConnection(env);
+  return json({ ok: true, accounts, stripeTestMode: connection.testMode, stripeMode: connection.mode });
 }
 __name(platformAccounts, "platformAccounts");
 async function platformInvite(request, env) {
@@ -2487,7 +2488,7 @@ async function platformUpdateCompany(request, env, id) {
   const existing = await env.DB.prepare("SELECT id, kind, billing_plan, sms_addon_enabled, stripe_subscription_id FROM companies WHERE id = ?").bind(id).first();
   if (!existing) return fail(404, "No company with that id.");
   if (smsOn(existing) && !smsAllowed(billingPlan)) return fail(409, "Turn texting off first. The texting add-on is for Small fleet and Fleet plans only.");
-  if (existing.stripe_subscription_id && planOf(existing) !== billingPlan) return fail(409, "This company has a Stripe test subscription. Plan changes on a subscription are not built yet; cancel it in the Stripe test dashboard first.");
+  if (existing.stripe_subscription_id && planOf(existing) !== billingPlan) return fail(409, "This company has a Stripe " + stripeModeWord(env) + " subscription. Plan changes on a subscription are not built yet; cancel it in the Stripe " + stripeModeWord(env) + " dashboard first.");
   await env.DB.prepare("UPDATE companies SET name = ?, kind = ?, billing_plan = ? WHERE id = ?").bind(name, accountKind, billingPlan, id).run();
   await writeAudit(env, user.userId, "company.update", "company", id, { name, plan: billingPlan });
   return json({ ok: true, id, name, plan: planLabel(accountKind), billingPlan });
@@ -2529,9 +2530,9 @@ async function platformAudit(request, env) {
 }
 __name(platformAudit, "platformAudit");
 
-// ---- Plan billing + SMS texting add-on (DRAFT, Stripe TEST MODE only) ----
-// Texting (sending SMS) is NOT built. These endpoints only store the choice and keep the
-// Stripe test subscription in step with it.
+// ---- Plan billing + SMS texting add-on ----
+// Stripe mode comes from STRIPE_SECRET_KEY. A live key runs only when STRIPE_MODE is live.
+// These endpoints store the texting choice and keep the Stripe subscription in step with it.
 async function peekInvite(request, env) {
   const body = await readJson(request);
   if (isResponse(body)) return body;
@@ -2558,12 +2559,16 @@ async function driverCountFor(env, companyId) {
 __name(driverCountFor, "driverCountFor");
 async function billingRow(env, id) {
   return env.DB.prepare(
-    `SELECT id, name, kind, billing_plan, sms_addon_enabled, sms_setup_billed_at, stripe_customer_id, stripe_subscription_id, billing_status, billing_paid_through, billing_last_paid_at FROM companies WHERE id = ?`
+    `SELECT id, name, kind, billing_plan, sms_addon_enabled, sms_setup_billed_at, stripe_customer_id, stripe_subscription_id, stripe_livemode, billing_status, billing_paid_through, billing_last_paid_at FROM companies WHERE id = ?`
   ).bind(id).first();
 }
 __name(billingRow, "billingRow");
-function stripeFail(error) {
-  if (error instanceof StripeError) return fail(error.status === 503 ? 503 : 502, "Stripe (test mode): " + error.message);
+function stripeModeWord(env) {
+  return stripeKeyMode(env) === "live" ? "live" : "test";
+}
+__name(stripeModeWord, "stripeModeWord");
+function stripeFail(env, error) {
+  if (error instanceof StripeError) return fail(error.status === 503 ? 503 : 502, "Stripe (" + stripeModeWord(env) + " mode): " + error.message);
   throw error;
 }
 __name(stripeFail, "stripeFail");
@@ -2575,10 +2580,10 @@ async function ownerBilling(request, env) {
   const row = await billingRow(env, user.companyId);
   if (!row) return fail(404, "Not found.");
   const b = billingJson(row, await driverCountFor(env, row.id));
-  return json({ ok: true, billing: { plan: b.plan, planLabel: b.planLabel, smsAddon: b.smsAddon, smsAllowed: b.smsAllowed, smsPriceText: b.smsPriceText, smsNote: b.smsNote, monthlyEstimate: b.monthlyEstimate, canManageBilling: !!row.stripe_customer_id } });
+  return json({ ok: true, billing: { plan: b.plan, planLabel: b.planLabel, smsAddon: b.smsAddon, smsAllowed: b.smsAllowed, smsPriceText: b.smsPriceText, smsNote: b.smsNote, monthlyEstimate: b.monthlyEstimate, canManageBilling: !!row.stripe_customer_id, livemode: b.livemode } });
 }
 __name(ownerBilling, "ownerBilling");
-// Stripe customer portal (TEST MODE): card update + invoice history only. Owner only; needs the company's Stripe customer.
+// Stripe customer portal: card update + invoice history only. Owner only; needs the company's Stripe customer.
 async function billingPortal(request, env) {
   const user = await authed(request, env, true);
   if (isResponse(user)) return user;
@@ -2596,7 +2601,7 @@ async function billingPortal(request, env) {
       configuration: env.STRIPE_PORTAL_CONFIGURATION || undefined
     });
     if (!session.url || !/^https:\/\/billing\.stripe\.com\//.test(session.url)) return fail(502, "Stripe did not return a billing page.");
-    await writeAudit(env, user.userId, "billing.portal", "company", row.id, { mode: "test" });
+    await writeAudit(env, user.userId, "billing.portal", "company", row.id, { mode: stripeModeWord(env) });
     return json({ ok: true, url: session.url });
   } catch (error) {
     if (error instanceof StripeError) return fail(502, "Could not open the billing page. Try again, or email nudgedispatch@gmail.com.");
@@ -2607,9 +2612,10 @@ __name(billingPortal, "billingPortal");
 // Authenticated self-check (signed with the webhook secret, so only Stripe's signer or we can call it). Reports classes only, never values.
 async function stripeSelfCheck(env) {
   const key = typeof env.STRIPE_SECRET_KEY === "string" ? env.STRIPE_SECRET_KEY : "";
-  const keyClass = !key ? "empty" : (["sk_test_", "rk_test_", "sk_live_", "rk_live_"].find((p) => key.startsWith(p)) || "other");
-  const out = { keyClass, keyLength: key.length > 90 ? "long" : key.length > 0 ? "short" : "none", stripe: "not-tried", portalConfig: env.STRIPE_PORTAL_CONFIGURATION ? "set" : "unset", portal: "not-tried" };
-  if (stripeKeyProblem(env)) return out;
+  const keyClass = stripeKeyClass(key);
+  const connection = billingConnection(env);
+  const out = { keyClass, keyLength: key.length > 90 ? "long" : key.length > 0 ? "short" : "none", mode: connection.mode, testMode: connection.testMode, problem: connection.problem, stripe: "not-tried", portalConfig: env.STRIPE_PORTAL_CONFIGURATION ? "set" : "unset", portal: "not-tried" };
+  if (connection.problem) return out;
   try { await stripe(env, "GET", "/v1/billing/meters", { limit: 1 }); out.stripe = "ok"; } catch (e) { out.stripe = "error " + (e && e.status); }
   if (env.STRIPE_PORTAL_CONFIGURATION) {
     try {
@@ -2625,8 +2631,8 @@ __name(stripeSelfCheck, "stripeSelfCheck");
 async function platformBillingStatus(request, env) {
   const user = await platformUser(request, env, false);
   if (isResponse(user)) return user;
-  const problem = stripeKeyProblem(env);
-  return json({ ok: true, stripeConnected: !problem, testMode: true, problem });
+  const connection = billingConnection(env);
+  return json({ ok: true, ...connection });
 }
 __name(platformBillingStatus, "platformBillingStatus");
 async function liveSubscription(env, subId) {
@@ -2653,11 +2659,11 @@ async function platformSmsChange(request, env, id) {
   if (row.stripe_subscription_id) {
     try {
       const sub = await liveSubscription(env, row.stripe_subscription_id);
-      if (sub && sub.status === "incomplete") return fail(409, "The first invoice on this Stripe test subscription is not paid yet, so Stripe won't allow line-item changes. Pay it (or let it expire) and try again.");
+      if (sub && sub.status === "incomplete") return fail(409, "The first invoice on this Stripe " + stripeModeWord(env) + " subscription is not paid yet, so Stripe won't allow line-item changes. Pay it (or let it expire) and try again.");
       if (sub) {
         const prices = await pricesByLookup(env, smsLookupKeys());
         const missing = smsLookupKeys().filter((k) => !prices[k]);
-        if (enabled && missing.length) return fail(409, "Stripe test catalog is missing texting prices: " + missing.join(", ") + ". Use \"Set up texting meter\" first.");
+        if (enabled && missing.length) return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing texting prices: " + missing.join(", ") + ". Use \"Set up texting meter\" first.");
         const smsPriceIds = [prices[LOOKUP.sms.monthly], prices[LOOKUP.sms.overage]].filter(Boolean);
         const items = (sub.items && sub.items.data) || [];
         const present = items.filter((it) => smsPriceIds.includes(it.price && it.price.id));
@@ -2673,18 +2679,18 @@ async function platformSmsChange(request, env, id) {
             await stripe(env, "POST", "/v1/invoiceitems", { customer: sub.customer, subscription: sub.id, pricing: { price: prices[LOOKUP.sms.setup] }, metadata: { app: "nudge-dispatch", company_id: row.id } }, `sms-setup-${row.id}`);
             setupBilledAt = now;
           }
-          stripeNote = "Texting items added to the Stripe test subscription.";
+          stripeNote = "Texting items added to the Stripe " + stripeModeWord(env) + " subscription.";
         } else {
           for (const it of present) {
             await stripe(env, "DELETE", "/v1/subscription_items/" + encodeURIComponent(it.id), { proration_behavior: "create_prorations" });
           }
-          stripeNote = "Texting items removed from the Stripe test subscription.";
+          stripeNote = "Texting items removed from the Stripe " + stripeModeWord(env) + " subscription.";
         }
       } else {
-        stripeNote = "The Stripe test subscription is canceled, so only the account setting changed.";
+        stripeNote = "The Stripe " + stripeModeWord(env) + " subscription is canceled, so only the account setting changed.";
       }
     } catch (error) {
-      return stripeFail(error);
+      return stripeFail(env, error);
     }
   }
   await env.DB.prepare("UPDATE companies SET sms_addon_enabled = ?, sms_addon_updated_at = ?, sms_setup_billed_at = ?, billing_updated_at = ? WHERE id = ?")
@@ -2708,18 +2714,18 @@ async function platformStartSubscription(request, env, id) {
   const sms = false;
   const beta = body.beta === true;
   try {
-    if (await liveSubscription(env, row.stripe_subscription_id)) return fail(409, "This company already has a Stripe test subscription.");
+    if (await liveSubscription(env, row.stripe_subscription_id)) return fail(409, "This company already has a Stripe " + stripeModeWord(env) + " subscription.");
     const L = LOOKUP[plan];
     const prices = await pricesByLookup(env, [L.base, L.extra, L.setup, ...(sms ? smsLookupKeys() : [])]);
     let promoId = "";
     if (beta) {
       const promos = await stripe(env, "GET", "/v1/promotion_codes", { code: BETA_PROMO_CODE, active: true, limit: 1 });
       promoId = (promos.data && promos.data[0] && promos.data[0].id) || "";
-      if (!promoId) return fail(409, "Promotion code " + BETA_PROMO_CODE + " was not found in Stripe test mode.");
+      if (!promoId) return fail(409, "Promotion code " + BETA_PROMO_CODE + " was not found in Stripe " + stripeModeWord(env) + " mode.");
     }
     const drivers = await driverCountFor(env, id);
     const built = subscriptionPlanItems(plan, drivers, sms, prices, beta, promoId);
-    if (built.missing.length) return fail(409, "Stripe test catalog is missing prices: " + built.missing.join(", ") + (sms ? ". If it is the texting overage, use \"Set up texting meter\" first." : "."));
+    if (built.missing.length) return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing prices: " + built.missing.join(", ") + (sms ? ". If it is the texting overage, use \"Set up texting meter\" first." : "."));
     let customerId = row.stripe_customer_id;
     if (!customerId) {
       const customer = await stripe(env, "POST", "/v1/customers", { name: row.name, metadata: { app: "nudge-dispatch", company_id: row.id } }, `nudge-customer-${row.id}`);
@@ -2736,18 +2742,19 @@ async function platformStartSubscription(request, env, id) {
       expand: ["latest_invoice"]
     }, `nudge-sub-${row.id}-${Date.now()}`);
     const now = Date.now();
-    await env.DB.prepare("UPDATE companies SET stripe_customer_id = ?, stripe_subscription_id = ?, stripe_livemode = 0, billing_updated_at = ?, sms_setup_billed_at = COALESCE(sms_setup_billed_at, ?), billing_status = ?, billing_past_due_at = NULL, sms_addon_enabled = 0 WHERE id = ?")
-      .bind(customerId, sub.id, now, sms ? now : null, subStatusToBilling(sub.status) || "incomplete", id).run();
-    await writeAudit(env, user.userId, "billing.subscribe", "company", id, { name: row.name, plan, sms: sms ? "on" : "off", beta: beta ? "yes" : "no", mode: "test" });
+    const liveFlag = stripeKeyMode(env) === "live" ? 1 : 0;
+    await env.DB.prepare("UPDATE companies SET stripe_customer_id = ?, stripe_subscription_id = ?, stripe_livemode = ?, billing_updated_at = ?, sms_setup_billed_at = COALESCE(sms_setup_billed_at, ?), billing_status = ?, billing_past_due_at = NULL, sms_addon_enabled = 0 WHERE id = ?")
+      .bind(customerId, sub.id, liveFlag, now, sms ? now : null, subStatusToBilling(sub.status) || "incomplete", id).run();
+    await writeAudit(env, user.userId, "billing.subscribe", "company", id, { name: row.name, plan, sms: sms ? "on" : "off", beta: beta ? "yes" : "no", mode: stripeModeWord(env) });
     const inv = sub.latest_invoice && typeof sub.latest_invoice === "object" ? sub.latest_invoice : null;
-    return json({ ok: true, id, subscriptionId: sub.id, status: sub.status, invoiceUrl: (inv && inv.hosted_invoice_url) || "", amountDue: inv ? inv.amount_due : null, testMode: true }, 201);
+    return json({ ok: true, id, subscriptionId: sub.id, status: sub.status, invoiceUrl: (inv && inv.hosted_invoice_url) || "", amountDue: inv ? inv.amount_due : null, testMode: liveFlag === 0 }, 201);
   } catch (error) {
-    return stripeFail(error);
+    return stripeFail(env, error);
   }
 }
 __name(platformStartSubscription, "platformStartSubscription");
 // One-time catalog step: Stripe meters can't be made from the connector, so the app makes the
-// texting meter + the $0.03/text-after-500 metered price itself (test key only). Idempotent.
+// texting meter + the $0.03/text-after-500 metered price itself. Idempotent. Lookup keys match live.
 async function platformSetupSmsMeter(request, env) {
   const user = await platformUser(request, env, true);
   if (isResponse(user)) return user;
@@ -2755,7 +2762,7 @@ async function platformSetupSmsMeter(request, env) {
   if (problem) return fail(503, problem.replace(" Texting was saved on the account only.", ""));
   try {
     const existing = await pricesByLookup(env, [LOOKUP.sms.overage]);
-    if (existing[LOOKUP.sms.overage]) return json({ ok: true, created: false, priceId: existing[LOOKUP.sms.overage] });
+    if (existing[LOOKUP.sms.overage]) return json({ ok: true, created: false, priceId: existing[LOOKUP.sms.overage], testMode: stripeModeWord(env) !== "live" });
     const meters = await stripe(env, "GET", "/v1/billing/meters", { status: "active", limit: 100 });
     let meter = (meters.data || []).find((m) => m.event_name === SMS_METER_EVENT);
     if (!meter) {
@@ -2769,7 +2776,7 @@ async function platformSetupSmsMeter(request, env) {
     }
     const products = await stripe(env, "GET", "/v1/products/search", { query: "metadata['tier']:'sms_overage' AND active:'true'" });
     const product = products.data && products.data[0];
-    if (!product) return fail(409, "Stripe test product for extra texts (metadata tier=sms_overage) was not found.");
+    if (!product) return fail(409, "Stripe " + stripeModeWord(env) + " product for extra texts (metadata tier=sms_overage) was not found.");
     const price = await stripe(env, "POST", "/v1/prices", {
       product: product.id,
       currency: "usd",
@@ -2781,10 +2788,10 @@ async function platformSetupSmsMeter(request, env) {
       tiers: [{ up_to: 500, unit_amount: 0 }, { up_to: "inf", unit_amount_decimal: "3" }],
       metadata: { app: "nudge-dispatch", tier: "sms_overage", included_texts: "500" }
     }, "nudge-sms-overage-price");
-    await writeAudit(env, user.userId, "billing.sms_meter", "platform", "", { meter: meter.id, price: price.id, mode: "test" });
-    return json({ ok: true, created: true, meterId: meter.id, priceId: price.id }, 201);
+    await writeAudit(env, user.userId, "billing.sms_meter", "platform", "", { meter: meter.id, price: price.id, mode: stripeModeWord(env) });
+    return json({ ok: true, created: true, meterId: meter.id, priceId: price.id, testMode: stripeModeWord(env) !== "live" }, 201);
   } catch (error) {
-    return stripeFail(error);
+    return stripeFail(env, error);
   }
 }
 __name(platformSetupSmsMeter, "platformSetupSmsMeter");
@@ -2848,7 +2855,7 @@ async function postRideText(request, env, id) {
     if (error instanceof Error && /UNIQUE/i.test(error.message)) return fail(409, "The On my way text was already sent for this ride.");
     throw error;
   }
-  // Count it on the Stripe test meter (500 included, then $0.03). Skipped (kept for later) if not subscribed.
+  // Count it on the Stripe meter (500 included, then $0.03). Skipped (kept for later) if not subscribed.
   let metered = false;
   if (company.stripe_customer_id && !stripeKeyProblem(env)) {
     try {
@@ -2863,7 +2870,8 @@ async function postRideText(request, env, id) {
 }
 __name(postRideText, "postRideText");
 
-// ---- Stripe webhook (DRAFT, test mode). Verifies Stripe-Signature, idempotent by event id. ----
+// ---- Stripe webhook. Verifies Stripe-Signature, idempotent by event id. ----
+// A test key ignores livemode events. A live key (STRIPE_MODE=live) ignores test-mode events.
 async function stripeWebhook(request, env) {
   const raw = await request.text();
   if (raw.length > 1e6) return fail(413, "Too large.");
@@ -2873,11 +2881,13 @@ async function stripeWebhook(request, env) {
   try { event = JSON.parse(raw); } catch { return fail(400, "Bad payload."); }
   if (!event || typeof event.id !== "string" || typeof event.type !== "string") return fail(400, "Bad payload.");
   if (event.type === "nudge.self_check") return json({ received: true, selfCheck: await stripeSelfCheck(env) });
+  const gate = stripeWebhookMode(env);
+  if (!gate.mode) return json({ received: true, ignored: gate.problem || "stripe key is not enabled for this mode" });
+  const decision = webhookLivemodeDecision(event, gate.mode);
+  if (!decision.process) return json({ received: true, ignored: decision.ignored });
   const now = Date.now();
-  // Test-mode build: never act on live-mode events.
-  if (event.livemode === true) return json({ received: true, ignored: "livemode event" });
   if (!HANDLED_EVENTS.includes(event.type)) return json({ received: true, ignored: "event type not handled" });
-  const claimed = await env.DB.prepare("INSERT OR IGNORE INTO stripe_events (id, type, livemode, received_at) VALUES (?, ?, 0, ?)").bind(event.id, event.type, now).run();
+  const claimed = await env.DB.prepare("INSERT OR IGNORE INTO stripe_events (id, type, livemode, received_at) VALUES (?, ?, ?, ?)").bind(event.id, event.type, decision.livemode, now).run();
   if (!claimed.meta.changes) return json({ received: true, duplicate: true });
   let result;
   try {
@@ -2902,6 +2912,8 @@ async function applyStripeEvent(env, event) {
   if (!company) return { result: "ignored: unknown customer" };
   // A different (older) subscription for the same customer must not change the current one's status.
   if (refs.subscription && company.stripe_subscription_id && refs.subscription !== company.stripe_subscription_id) return { companyId: company.id, result: "ignored: not the current subscription" };
+  const livemode = event.livemode === true ? 1 : 0;
+  await env.DB.prepare("UPDATE companies SET stripe_livemode = ? WHERE id = ?").bind(livemode, company.id).run();
   const createdMs = Number(event.created || 0) * 1000;
   const stale = company.billing_event_at && createdMs && createdMs < company.billing_event_at;
   const now = Date.now();
@@ -4049,8 +4061,8 @@ import { composeLogoIcon } from "./icon-compose.js";
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
 import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, BETA_SPOTS } from "./trial.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
-import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, StripeError, pricesByLookup, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
-import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs } from "./stripe_webhook.js";
+import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
+import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { meetingPointForArrived } from "./progress-nav.js";
 import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";

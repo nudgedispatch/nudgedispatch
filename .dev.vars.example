@@ -2,6 +2,8 @@
 # Comma-separated. Unset or empty means nobody is a platform admin.
 PLATFORM_ADMIN_EMAILS=
 SMS_MODE=off
+# Stripe. Leave unset for a test key. Live mode also needs STRIPE_MODE=live. Do not commit keys.
+# STRIPE_MODE=test
 # Optional. Off unless set. Do not commit keys.
 # PLACES_AUTOCOMPLETE=off
 # FLIGHT_DATA_PROVIDER=off
