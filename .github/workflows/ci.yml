@@ -21,8 +21,9 @@ jobs:
       - run: npm run build
 
   # Required before any booking deploy: phone and desktop client journeys (no submits).
+  # Playwright 1.59 has no Ubuntu 26.04 browser build, and ubuntu-latest is 26.04.
   booking-walkthrough:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
