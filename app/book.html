@@ -37,38 +37,64 @@
   </div>
   <h1 id="heading" class="hidden">Book a ride</h1>
   <form id="bf" class="hidden" novalidate>
-    <label>Your name<input name="name" autocomplete="name" required></label>
-    <label>Mobile phone<input name="phone" type="tel" autocomplete="tel" inputmode="tel" required></label>
-    <label>Email (optional)<input name="email" type="email" autocomplete="email" inputmode="email"></label>
-    <div class="two"><label>Date<input name="date" type="date" required></label><label>Pickup time<select name="time" required><option value="">Select time</option></select></label></div>
-    <label>Trip type<select name="tripType"><option value="one-way">One way</option><option value="round-trip">Round trip</option><option value="hourly">Hourly</option></select></label>
-    <label id="hoursWrap" class="hidden">How many hours?<select name="hours"><option value="">Select hours</option></select></label>
-    <label id="vehicleWrap" class="hidden">Vehicle<select name="vehicle"></select></label>
-    <label>Pickup address<input name="pickup" autocomplete="street-address" required></label>
-    <label><span id="dropLabel">Drop-off address</span><input name="dropoff" autocomplete="off" required></label>
-    <div id="places" class="chips hidden" aria-label="Flat-rate places"></div>
-    <label>Passengers<input name="passengers" type="number" min="1" max="14" inputmode="numeric" value="1"></label>
-    <div class="card quote hidden" id="quote" aria-live="polite">
-      <div class="sub" id="qKind">Instant estimate</div>
-      <div class="qprice" id="qPrice">&ndash;</div>
-      <div class="sub" id="qLabel">Enter pickup and drop-off to see an estimate.</div>
-      <table class="qlines hidden" id="qLines"></table>
-      <div class="sub" id="qNotes"></div>
-      <div class="fine qconfirm" id="qConfirm"></div>
-    </div>
-    <label>Flight number (optional)<input name="flight" placeholder="e.g. DAL1234" autocapitalize="characters"></label>
-    <label>Notes (optional)<textarea name="notes" placeholder="Child seat, gate code, anything the driver should know"></textarea></label>
-    <div class="hp" aria-hidden="true">
-      <label>Company website<input name="company_website" tabindex="-1" autocomplete="off"></label>
-    </div>
+    <section id="step1" data-step="trip">
+      <h2 class="steph">Your trip</h2>
+      <label>Trip type<select name="tripType"><option value="one-way">One way</option><option value="round-trip">Round trip</option><option value="hourly">Hourly</option></select></label>
+      <label id="hoursWrap" class="hidden">How many hours?<select name="hours"><option value="">Select hours</option></select></label>
+      <label id="airportWrap" class="hidden">Airport connection<select name="airportSide" id="airportSide"><option value="none">No airport connection</option></select></label>
+      <div class="field" data-field="pickup">
+        <label id="pickupSelectWrap" class="hidden"><span id="pickupSelectLabel">Pickup terminal</span><select name="pickupSpot" id="pickupSpot"></select></label>
+        <label id="pickupTextWrap" class="addr"><span>Pickup address</span><input name="pickup" id="pickup" autocomplete="street-address" required><span class="sugg hidden" id="pickupSugg" role="listbox"></span></label>
+      </div>
+      <label id="meetWrap" class="hidden">Where to meet your driver<select name="meet" id="meet"></select><span class="fixedval hidden" id="meetFixed" role="note"></span><span class="fine" id="meetNote"></span></label>
+      <div class="two" data-field="when"><label><span id="dateLabel">Pickup date</span><input name="date" type="date" required></label><label><span id="timeLabel">Pickup time</span><select name="time" required><option value="">Select time</option></select></label></div>
+      <p class="fine hidden" id="timeHint">Choose the time you want to be picked up. Your flight number is used only to watch for delays and early arrivals.</p>
+      <label id="flightWrap" data-field="flight">Flight number <span id="flightOpt">(optional)</span><input name="flight" id="flight" placeholder="e.g. DL1234" autocapitalize="characters"></label>
+      <div class="two" data-field="party"><label>Passengers<input name="passengers" type="number" min="1" max="14" inputmode="numeric" value="1"></label><label>Luggage<input name="luggage" type="number" min="0" max="30" inputmode="numeric" placeholder="0"></label></div>
+      <div class="field" data-field="dropoff">
+        <label id="dropoffSelectWrap" class="hidden"><span>Drop-off terminal</span><select name="dropoffSpot" id="dropoffSpot"></select></label>
+        <label id="dropoffTextWrap" class="addr"><span id="dropLabel">Drop-off address</span><input name="dropoff" id="dropoff" autocomplete="off" required><span class="sugg hidden" id="dropoffSugg" role="listbox"></span></label>
+      </div>
+      <label id="styleWrap" class="hidden">Drop-off at the terminal<select name="style" id="style"></select><span class="fine" id="styleNote"></span></label>
+      <div id="places" class="chips hidden" aria-label="Flat-rate places"></div>
+      <div class="card quote hidden" id="quote" aria-live="polite" data-field="quote">
+        <div class="sub" id="qKind">Instant estimate</div>
+        <div class="qprice" id="qPrice">&ndash;</div>
+        <div class="sub" id="qLabel">Enter pickup and drop-off to see an estimate.</div>
+        <table class="qlines hidden" id="qLines"></table>
+        <div class="sub" id="qNotes"></div>
+        <div class="fine qconfirm" id="qConfirm"></div>
+      </div>
+      <label id="vehicleWrap" class="hidden" data-field="vehicle">Vehicle<select name="vehicle" id="vehicle"></select><span class="fine" id="vehicleNote"></span></label>
+      <button class="btn" type="button" id="toContact">Continue</button>
+    </section>
+    <section id="step2" class="hidden" data-step="contact">
+      <h2 class="steph">How can we reach you?</h2>
+      <label>Your name<input name="name" autocomplete="name" required></label>
+      <label>Mobile phone<input name="phone" type="tel" autocomplete="tel" inputmode="tel" required></label>
+      <label>Email (optional)<input name="email" type="email" autocomplete="email" inputmode="email"></label>
+      <label>Notes (optional)<textarea name="notes" placeholder="Child seat, gate code, anything the driver should know"></textarea></label>
+      <div class="hp" aria-hidden="true">
+        <label>Company website<input name="company_website" tabindex="-1" autocomplete="off"></label>
+      </div>
+      <button class="btn" type="button" id="toReview">Review request</button>
+      <button class="btn ghost" type="button" id="back1">Back</button>
+    </section>
+    <section id="step3" class="hidden" data-step="review">
+      <h2 class="steph">Review your request</h2>
+      <table class="review" id="reviewTable"></table>
+      <p class="fine" id="reviewMeet"></p>
+      <button class="btn" type="submit" id="go">Request this ride</button>
+      <button class="btn ghost" type="button" id="back2">Back</button>
+    </section>
     <p id="err" class="err hidden" role="alert"></p>
-    <button class="btn" type="submit" id="go">Request this ride</button>
     <p class="muted fine" id="fineprint">Your request goes to the operator for approval. Nothing is emailed or texted.</p>
   </form>
   <div id="done" class="hidden">
     <div class="card okcard">
       <div class="title">Request sent</div>
       <div class="sub" id="doneTxt"></div>
+      <div class="sub" id="doneMeet"></div>
     </div>
     <button class="btn" type="button" id="again">Book another ride</button>
   </div>

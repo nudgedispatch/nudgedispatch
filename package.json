@@ -9,10 +9,13 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "node --test",
-    "check": "npm run lint && npm run typecheck && npm test && npm run build"
+    "check": "npm run lint && npm run typecheck && npm test && npm run build",
+    "e2e:booking": "bash scripts/predeploy-e2e.sh",
+    "deploy:prod": "bash scripts/deploy-prod.sh"
   },
   "devDependencies": {
     "eslint": "^9.39.1",
+    "playwright-core": "^1.59.1",
     "typescript": "^5.9.3",
     "wrangler": "^4.50.0"
   },
