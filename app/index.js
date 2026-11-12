@@ -1046,7 +1046,7 @@ function rideSchedule(ride) {
   const previous = index > 0 ? PROGRESS_STEPS[index - 1] : null;
   const plannedPickupAt = zonedWallToUnix(ride.pickupDate, ride.pickupTime);
   const navAddress = progress === "En route" ? ride.pickup : progress === "Picked up" || progress === "Completed" ? ride.dropoff : "";
-  const navLabel = progress === "En route" ? "Pickup in Maps" : navAddress ? "Drop-off in Maps" : "";
+  const navLabel = progress === "En route" ? "Navigate to pickup" : navAddress ? "Navigate to drop-off" : "";
   return {
     progress,
     now: ride.status === "requested" ? "Requested" : ride.status === "declined" ? "Declined" : STEP_NOW[progress],
