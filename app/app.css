@@ -262,3 +262,25 @@ label.check input { width: 22px; min-height: 22px; height: 22px; flex: 0 0 auto;
 .bookpage .install-hint { display: flex; align-items: flex-start; gap: 10px; background: #12211f; border: 1px solid #1f3d38; color: var(--teal-2); border-radius: 12px; padding: 10px 12px; font-size: 14px; }
 .bookpage .install-hint p { margin: 0; flex: 1; min-width: 0; line-height: 1.4; }
 .bookpage .install-dismiss { flex: 0 0 auto; background: none; border: 0; color: var(--muted); font-size: 13px; font-weight: 600; padding: 2px 0 2px 8px; min-height: 0; }
+
+/* Invoice send buttons, Pay with options, and payment methods in settings */
+a.btn { text-align: center; text-decoration: none; }
+.btn:disabled, button.btn:disabled { opacity: .4; cursor: not-allowed; }
+.send-note { font-size: 14px; margin: 8px 0 10px; }
+.paid-row { margin: 10px 0 0; }
+.paid-row .btn { flex: 0 0 auto; }
+.paid-yes { color: var(--green); font-weight: 700; }
+.sheet .paywith ul { list-style: none; padding: 0; margin: 0 0 12px; }
+.sheet .paywith li { padding: 8px 0; border-bottom: 1px solid #ece8e1; }
+.sheet .paywith .handle { font-weight: 600; }
+.sheet .paywith a.paylink { color: #0b6e63; font-weight: 700; }
+.sheet .paywith .btn.copy { min-height: 32px; padding: 4px 10px; font-size: 14px; margin-left: 6px; color: #0b6e63; border-color: #0b6e63; }
+fieldset.paymeth { border: 1px solid var(--line); border-radius: 12px; padding: 4px 12px 12px; margin: 12px 0 0; min-width: 0; }
+fieldset.paymeth legend { color: var(--muted); font-size: 14px; padding: 0 6px; }
+.paymeth-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 10px 0 0; }
+.paymeth-row label.check { margin: 0; flex: 0 0 120px; }
+.paymeth-row input:not([type=checkbox]) { flex: 1 1 180px; width: auto; }
+@media print {
+  .sheet .paywith a.paylink { color: #161616; }
+  .sheet .paywith a.paylink::after { content: " " attr(href); font-weight: 400; font-size: 12px; overflow-wrap: anywhere; }
+}

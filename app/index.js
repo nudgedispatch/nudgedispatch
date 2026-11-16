@@ -1322,6 +1322,7 @@ function settingsJson(row) {
     prefix: row.prefix,
     nextNumber: row.next_number,
     logoDataUrl: row.logo_data_url,
+    paymentMethods: parseStoredPaymentMethods(row.payment_methods_json),
     updatedAt: row.updated_at
   };
 }
@@ -3514,7 +3515,10 @@ function invoiceText(settings, ride, number, issuedOn) {
   if (clock.toPickupMinutes !== null) trip.push(`On my way to pickup: ${clock.toPickupMinutes} min`);
   if (clock.waitingMinutes !== null) trip.push(`Waiting: ${clock.waitingMinutes} min`);
   if (clock.tripMinutes !== null) trip.push(`Trip: ${clock.tripMinutes} min`);
-  const pay = settings.payment_instructions || "Pay the operator directly. This invoice is not sent for you.";
+  const payWith = payLines(payOptions(parseStoredPaymentMethods(settings.payment_methods_json), ride.fare_cents, number));
+  const howToPay = payWith.length
+    ? ["Pay with", ...payWith, ...(settings.payment_instructions ? ["", "Payment note", settings.payment_instructions] : [])]
+    : ["How to pay", settings.payment_instructions || "Pay the operator directly. This invoice is not sent for you."];
   return [
     "INVOICE",
     settings.business_name,
@@ -3533,8 +3537,7 @@ function invoiceText(settings, ride, number, issuedOn) {
     "",
     `1. Car service    ${money(ride.fare_cents)}`,
     "",
-    "How to pay",
-    pay,
+    ...howToPay,
     "",
     "Terms",
     settings.terms || "Due on receipt.",
@@ -3600,11 +3603,14 @@ async function getInvoice(request, env, id) {
   if (denied) return denied;
   const row = await env.DB.prepare(
     `SELECT i.id, i.ride_id, i.number, i.amount_cents, i.issued_on, i.snapshot_text, i.bill_name, i.bill_phone, i.bill_email, i.trip_json,
-            s.business_name, s.address, s.phone, s.email, s.website, s.payment_instructions, s.gratuity_note, s.terms, s.logo_data_url
+            s.business_name, s.address, s.phone, s.email, s.website, s.payment_instructions, s.gratuity_note, s.terms, s.logo_data_url,
+            s.payment_methods_json, r.payment AS ride_payment
      FROM invoices i JOIN invoice_settings s ON s.company_id = i.company_id
+     LEFT JOIN rides r ON r.company_id = i.company_id AND r.id = i.ride_id
      WHERE i.company_id = ? AND i.id = ?`
   ).bind(user.companyId, id).first();
   if (!row) return fail(404, "Invoice not found.");
+  const payWith = payOptions(parseStoredPaymentMethods(row.payment_methods_json), Number(row.amount_cents), row.number);
   return json({
     ok: true,
     invoice: {
@@ -3616,6 +3622,9 @@ async function getInvoice(request, env, id) {
       issuedOn: row.issued_on,
       snapshotText: row.snapshot_text,
       billTo: { name: row.bill_name, phone: row.bill_phone, email: row.bill_email },
+      payment: row.ride_payment || "",
+      payWith,
+      payLines: payLines(payWith),
       trip: JSON.parse(String(row.trip_json)),
       business: {
         name: row.business_name,
@@ -3884,11 +3893,17 @@ async function putSettings(request, env) {
       return fail(400, "The logo must be a PNG, JPG, or WebP image under about 120 KB.");
     } else logo = body.logoDataUrl;
   }
+  let paymentMethods = parseStoredPaymentMethods(existing.payment_methods_json);
+  if (body.paymentMethods !== void 0) {
+    const checked = validatePaymentMethods(body.paymentMethods);
+    if (checked.error) return fail(400, checked.error);
+    paymentMethods = checked.methods;
+  }
   const now = Date.now();
   await env.DB.prepare(
     `UPDATE invoice_settings SET business_name = ?, address = ?, phone = ?, email = ?, website = ?, payment_instructions = ?,
-      gratuity_note = ?, terms = ?, prefix = ?, next_number = ?, logo_data_url = ?, updated_at = ? WHERE company_id = ?`
-  ).bind(businessName, address, phone, email, website, paymentInstructions, gratuityNote, terms, prefix, nextNumber, logo, now, user.companyId).run();
+      gratuity_note = ?, terms = ?, prefix = ?, next_number = ?, logo_data_url = ?, payment_methods_json = ?, updated_at = ? WHERE company_id = ?`
+  ).bind(businessName, address, phone, email, website, paymentInstructions, gratuityNote, terms, prefix, nextNumber, logo, JSON.stringify(paymentMethods), now, user.companyId).run();
   const row = await loadSettings(env, user.companyId);
   const bookingSlug = await ensureBookingSlug(env, user.companyId);
   return json({ ok: true, settings: row ? { ...settingsJson(row), bookingSlug, bookingPath: bookingSlug ? "/book/" + bookingSlug + "/" : "" } : null });
@@ -4069,6 +4084,7 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
+import { validatePaymentMethods, parseStoredPaymentMethods, payOptions, payLines } from "./payment-methods.js";
 import { flightProvider, fetchFlightSnapshot, flightAlerts, flightRules, normalizeFlight, shouldWatch } from "./flight-alerts.js";
 var CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 var FILES = {

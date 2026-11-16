@@ -848,12 +848,21 @@ async function renderInvoice(id, gen) {
   const business = invoice.business;
   const trip = invoice.trip;
   const logo = business.logoDataUrl ? `<img class="logo" alt="" src="${esc(business.logoDataUrl)}">` : "";
+  const payWith = Array.isArray(invoice.payWith) ? invoice.payWith : [];
+  const send = invoiceSendLinks(invoice);
+  const paid = invoice.payment === "paid";
   box.innerHTML = `<p class="noprint"><a href="#/rides/${esc(invoice.rideId)}">Back to ride</a></p>
     <div class="actions noprint">
-      <button class="btn" id="print" type="button">Print</button>
+      ${send.mailto ? `<a class="btn" id="send-email" href="${esc(send.mailto)}">Email</a>` : `<button class="btn" id="send-email" type="button" disabled title="No email on file for this client">Email</button>`}
+      ${send.sms ? `<a class="btn" id="send-text" href="${esc(send.sms)}">Text</a>` : `<button class="btn" id="send-text" type="button" disabled title="No phone on file for this client">Text</button>`}
+    </div>
+    <p class="muted noprint send-note">${send.mailto || send.sms ? "Email and Text open your own mail or messages app with the invoice filled in. Nothing is sent until you press send there." : "Add an email or phone to this client to send from here."}${!send.mailto && send.sms ? " No email on file for this client." : ""}${send.mailto && !send.sms ? " No phone on file for this client." : ""}</p>
+    <div class="actions noprint">
+      <button class="btn ghost" id="print" type="button">Print</button>
       <button class="btn ghost" id="txt" type="button">Download text</button>
       <button class="btn ghost" id="html" type="button">Download page</button>
     </div>
+    ${invoice.payment ? `<div class="row paid-row noprint"><span id="paid-state" class="${paid ? "paid-yes" : "muted"}">${paid ? "Paid" : "Not paid yet"}</span><button class="btn ghost" id="mark-paid" type="button" data-paid="${paid ? "1" : "0"}">${paid ? "Mark not paid" : "Mark paid"}</button></div><p class="err noprint" id="paid-err"></p>` : ""}
     <article class="sheet" id="sheet">
       <div class="who">${logo}<div><h2>INVOICE</h2><strong>${esc(business.name)}</strong><div>${esc([business.address, business.phone, business.email, business.website].filter(Boolean).join(" · "))}</div></div></div>
       <p><strong>${esc(invoice.number)}</strong><br>Issued ${esc(longIssued(invoice.issuedOn))}<br>Due on receipt</p>
@@ -866,13 +875,67 @@ async function renderInvoice(id, gen) {
         <tr><td>Passengers</td><td>${esc(trip.passengers)}</td></tr>
         ${trip.flight ? `<tr><td>Flight</td><td>${esc(trip.flight)}</td></tr>` : ""}
       </table>
-      <p><strong>How to pay</strong><br>${esc(business.paymentInstructions || "Pay the operator directly.")}</p>
+      ${payWith.length ? `<div class="paywith"><p><strong>Pay with</strong></p><ul>${payWith.map((o) => payOptionHtml(o, invoice.fare)).join("")}</ul></div>${business.paymentInstructions ? `<p><strong>Payment note</strong><br>${esc(business.paymentInstructions)}</p>` : ""}` : `<p><strong>How to pay</strong><br>${esc(business.paymentInstructions || "Pay the operator directly.")}</p>`}
       <p>${esc(business.terms)} ${esc(business.gratuityNote)}</p>
       <p>Nothing was sent automatically.</p>
     </article>`;
   document.querySelector("#print").onclick = () => window.print();
+  box.querySelectorAll("[data-copy]").forEach((button) => {
+    button.onclick = async () => {
+      const value = button.getAttribute("data-copy") || "";
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(value);
+        button.textContent = "Copied";
+      } catch {
+        button.textContent = value;
+      }
+      setTimeout(() => { button.textContent = "Copy"; }, 2000);
+    };
+  });
+  const markPaid = document.querySelector("#mark-paid");
+  if (markPaid) markPaid.onclick = async () => {
+    const nowPaid = markPaid.getAttribute("data-paid") === "1";
+    markPaid.disabled = true;
+    const next = await api("/api/rides/" + invoice.rideId, { method: "PATCH", body: { payment: nowPaid ? "invoiced" : "paid" } });
+    if (gen !== renderGen) return;
+    markPaid.disabled = false;
+    const err = document.querySelector("#paid-err");
+    if (!next.data.ok) { if (err) err.textContent = next.data.error || "Could not update payment."; return; }
+    if (err) err.textContent = "";
+    const isPaid = next.data.ride && next.data.ride.payment === "paid";
+    markPaid.setAttribute("data-paid", isPaid ? "1" : "0");
+    markPaid.textContent = isPaid ? "Mark not paid" : "Mark paid";
+    const label = document.querySelector("#paid-state");
+    if (label) { label.textContent = isPaid ? "Paid" : "Not paid yet"; label.className = isPaid ? "paid-yes" : "muted"; }
+  };
   document.querySelector("#txt").onclick = () => download(`invoice-${invoice.number}.txt`, invoice.snapshotText, "text/plain");
   document.querySelector("#html").onclick = () => download(`invoice-${invoice.number}.html`, `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Invoice ${esc(invoice.number)}</title></head><body><pre>${esc(invoice.snapshotText)}</pre></body></html>`, "text/html");
+}
+
+function payOptionHtml(option, fare) {
+  if (option.kind === "cash") return `<li><strong>Cash</strong> · ${esc(option.display)}</li>`;
+  if (option.kind === "zelle") return `<li><strong>Zelle</strong> · <span class="handle">${esc(option.display)}</span> <button class="btn ghost copy noprint" type="button" data-copy="${esc(option.copy)}">Copy</button></li>`;
+  return `<li><strong>${esc(option.label)}</strong> · <span class="handle">${esc(option.display)}</span><br><a class="paylink" href="${esc(option.url)}" target="_blank" rel="noopener noreferrer">Pay ${esc(fare)} with ${esc(option.label)}</a></li>`;
+}
+
+// mailto:/sms: links that open the owner's own mail or messages app. Nothing is sent by the server.
+function invoiceSendLinks(invoice) {
+  const business = invoice.business || {};
+  const name = String(business.name || "").replace(/\.+$/, "");
+  const lines = Array.isArray(invoice.payLines) ? invoice.payLines : [];
+  const email = String((invoice.billTo && invoice.billTo.email) || "").trim();
+  const phone = String((invoice.billTo && invoice.billTo.phone) || "").replace(/[^\d+]/g, "");
+  let body = String(invoice.snapshotText || "").split("\n").filter((line) => !/^Nothing was sent automatically/.test(line)).join("\n").trim();
+  if (lines.length && !/(^|\n)Pay with\n/.test(body)) body += "\n\nPay with\n" + lines.join("\n");
+  const mailto = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    ? "mailto:" + encodeURIComponent(email).replace(/%40/g, "@") + "?subject=" + encodeURIComponent(`Invoice ${invoice.number} from ${name}`) + "&body=" + encodeURIComponent(body.replace(/\r?\n/g, "\r\n"))
+    : "";
+  const text = [`${name}: invoice ${invoice.number} for ${invoice.fare}.`];
+  if (lines.length) text.push("Pay with:", ...lines);
+  else if (business.paymentInstructions) text.push("How to pay: " + business.paymentInstructions);
+  text.push("Thank you!");
+  const sms = phone.replace(/\D/g, "").length >= 7 ? "sms:" + phone + "?&body=" + encodeURIComponent(text.join("\n")) : "";
+  return { mailto, sms };
 }
 
 function download(name, contents, type) {
@@ -1051,6 +1114,36 @@ async function refreshDrivers(flash) {
   return listed;
 }
 
+const PAY_FIELDS = [
+  { kind: "cash", label: "Cash", placeholder: "" },
+  { kind: "cashapp", label: "Cash App", what: "$cashtag", placeholder: "$cashtag" },
+  { kind: "zelle", label: "Zelle", what: "phone or email", placeholder: "Zelle phone or email" },
+  { kind: "venmo", label: "Venmo", what: "@username", placeholder: "@username" },
+  { kind: "paypal", label: "PayPal", what: "PayPal.Me name", placeholder: "paypal.me/name" },
+];
+
+function paymentMethodsFieldset(methods) {
+  const pm = methods || {};
+  const shown = (kind, handle) => !handle ? "" : kind === "cashapp" ? "$" + handle : kind === "venmo" ? "@" + handle : handle;
+  return `<fieldset class="full paymeth" id="paymeth"><legend>How clients can pay you</legend>
+    <p class="sub">Turn on each way you take payment. Invoices get a Pay with section, and Cash App, Venmo, and PayPal open with the amount filled in. Money goes straight to you, so mark the ride paid yourself.</p>
+    ${PAY_FIELDS.map((f) => {
+      const m = pm[f.kind] || {};
+      return `<div class="paymeth-row"><label class="check"><input type="checkbox" data-pay-on="${f.kind}"${m.on ? " checked" : ""}> ${esc(f.label)}</label>${f.placeholder ? `<input data-pay-handle="${f.kind}" aria-label="${esc(f.label + " " + f.what)}" placeholder="${esc(f.placeholder)}" value="${esc(shown(f.kind, m.handle))}" maxlength="120" autocomplete="off" autocapitalize="off" spellcheck="false">` : `<span class="muted">${"Pay your driver in cash"}</span>`}</div>`;
+    }).join("")}
+  </fieldset>`;
+}
+
+function readPaymentMethods() {
+  const out = {};
+  for (const f of PAY_FIELDS) {
+    const on = document.querySelector(`[data-pay-on="${f.kind}"]`);
+    const handle = document.querySelector(`[data-pay-handle="${f.kind}"]`);
+    out[f.kind] = { on: !!(on && on.checked), handle: handle ? handle.value : "" };
+  }
+  return out;
+}
+
 async function renderSettings(gen) {
   setTabs(true);
   shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card" id="drivers-card"><h2>Drivers</h2><p class="note">Add a driver by name. Type of vehicle and plate are optional. Then set that driver's sign-in passcode here. Drivers sign in with the company code, their name, and the passcode. Nothing is texted or emailed. Remove a driver to take them off the roster: they cannot sign in, upcoming rides become unassigned, and completed rides keep their name.</p><p class="sub" id="driver-code">Company code: loading…</p><form id="add-driver"><label>Name<input id="driver-name" maxlength="80" required autocomplete="off"></label><label>Type of vehicle<input id="driver-vehicle" maxlength="40" placeholder="SUV" autocomplete="off"></label><label>Plate number<input id="driver-plate" maxlength="12" placeholder="ABC1234" autocomplete="off" autocapitalize="characters"></label><p class="err" id="driver-err"></p><button class="btn full" type="submit">Add driver</button></form><div id="driver-list" class="muted">Loading drivers…</div></section>` : ""}<div id="box" class="muted">Loading…</div>`);
@@ -1093,7 +1186,8 @@ async function renderSettings(gen) {
       <label class="full">Website<input id="website" value="${esc(s.website)}"></label>
       <label>Invoice prefix<input id="prefix" maxlength="8" value="${esc(s.prefix)}"></label>
       <label>Next invoice number<input id="nextNumber" inputmode="numeric" value="${esc(s.nextNumber)}"></label>
-      <label class="full">How clients pay you<textarea id="pay">${esc(s.paymentInstructions)}</textarea></label>
+      ${paymentMethodsFieldset(s.paymentMethods)}
+      <label class="full">Payment note (optional)<textarea id="pay" placeholder="Anything else clients should know, like card in the car or tips appreciated.">${esc(s.paymentInstructions)}</textarea></label>
       <label class="full">Terms<textarea id="terms">${esc(s.terms)}</textarea></label>
       <label class="full">Gratuity line<input id="gratuity" value="${esc(s.gratuityNote)}"></label>
       <label class="full">Logo (optional PNG, JPG, or WebP)<input id="logo" type="file" accept="image/png,image/jpeg,image/webp"></label>
@@ -1101,7 +1195,7 @@ async function renderSettings(gen) {
       <p class="err full" id="err"></p>
       <button class="btn full" type="submit">Save business details</button>
     </form>
-    <p class="note">Invoices stay on this phone until you copy, print, or download them. The app never sends them.</p>
+    <p class="note">Invoices are never sent by the app. Email and Text on an invoice open your own mail or messages app so you send it yourself.</p>
     <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
     <button class="btn ghost full" id="out" type="button">Sign out</button>`;
   document.querySelector("#f").onsubmit = async (event) => {
@@ -1115,6 +1209,7 @@ async function renderSettings(gen) {
       prefix: document.querySelector("#prefix").value,
       nextNumber: Number(document.querySelector("#nextNumber").value),
       paymentInstructions: document.querySelector("#pay").value,
+      paymentMethods: readPaymentMethods(),
       terms: document.querySelector("#terms").value,
       gratuityNote: document.querySelector("#gratuity").value,
     };
