@@ -296,3 +296,20 @@ fieldset.paymeth legend { color: var(--muted); font-size: 14px; padding: 0 6px; 
 .stop-edit .stop-edit-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 .stop-edit .stop-edit-row input { flex: 1; min-width: 0; }
 .stop-edit .stop-edit-row button { flex: 0 0 auto; min-height: 50px; }
+/* Regular client schedules */
+.tabs button { position: relative; }
+.tab-badge { display: inline-block; min-width: 20px; height: 20px; line-height: 20px; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--teal); color: #111; font-size: 12px; font-weight: 800; vertical-align: 2px; }
+.count-pill { display: inline-block; min-width: 24px; padding: 0 8px; border-radius: 999px; background: var(--teal); color: #111; font-size: 14px; text-align: center; vertical-align: 2px; }
+.card.regular-trip { border-color: var(--teal-2); }
+.month-end { color: #e3c27a; }
+fieldset.days { border: 1px solid var(--line); border-radius: 12px; padding: 4px 12px 12px; margin: 12px 0 0; min-width: 0; }
+fieldset.days legend { color: var(--muted); font-size: 14px; padding: 0 6px; }
+.day-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
+.day-grid label.check.day { margin: 0; position: relative; }
+.day-grid label.check.day input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.day-grid label.check.day span { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 40px; border: 1px solid var(--line); border-radius: 10px; color: var(--text); font-size: 14px; }
+.day-grid label.check.day input:checked + span { background: var(--teal); border-color: var(--teal); color: #111; font-weight: 800; }
+.day-grid label.check.day input:focus-visible + span { outline: 2px solid var(--teal-2); outline-offset: 2px; }
+.day-grid label.check.day.last { grid-column: span 4; }
+.schedule-card { text-decoration: none; }
+label.check.s-active { align-self: end; margin-bottom: 8px; }

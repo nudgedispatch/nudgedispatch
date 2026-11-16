@@ -2216,6 +2216,17 @@ async function handleApi(request, env) {
     if (approveMatch && method === "POST") return decideBooking(request, env, approveMatch[1], "approve");
     const declineMatch = /^\/api\/rides\/([0-9a-f-]{36})\/decline$/.exec(path);
     if (declineMatch && method === "POST") return decideBooking(request, env, declineMatch[1], "decline");
+    if (path === "/api/schedules" && method === "GET") return listSchedules(request, env);
+    if (path === "/api/schedules" && method === "POST") return createSchedule(request, env);
+    if (path === "/api/schedules/upcoming" && method === "GET") return upcomingSchedules(request, env);
+    const scheduleOne = /^\/api\/schedules\/([0-9a-f-]{36})$/.exec(path);
+    if (scheduleOne && method === "GET") return getScheduleOne(request, env, scheduleOne[1]);
+    if (scheduleOne && method === "PATCH") return updateSchedule(request, env, scheduleOne[1]);
+    if (scheduleOne && method === "DELETE") return deleteSchedule(request, env, scheduleOne[1]);
+    const occurrenceOne = /^\/api\/schedules\/([0-9a-f-]{36})\/occurrences\/(\d{4}-\d{2}-\d{2})(?:\/(confirm|skip))?$/.exec(path);
+    if (occurrenceOne && occurrenceOne[3] === "confirm" && method === "POST") return confirmOccurrence(request, env, occurrenceOne[1], occurrenceOne[2]);
+    if (occurrenceOne && occurrenceOne[3] === "skip" && method === "POST") return skipOccurrence(request, env, occurrenceOne[1], occurrenceOne[2]);
+    if (occurrenceOne && !occurrenceOne[3] && method === "DELETE") return unskipOccurrence(request, env, occurrenceOne[1], occurrenceOne[2]);
     return fail(404, "Not found.");
   } catch (error) {
     console.log(JSON.stringify({ level: "error", msg: "api", path, name: error instanceof Error ? error.name : "Error" }));
@@ -3228,6 +3239,8 @@ async function deleteClient(request, env, id) {
   if (!existing) return fail(404, "Client not found.");
   const ride = await env.DB.prepare("SELECT id FROM rides WHERE company_id = ? AND client_id = ?").bind(user.companyId, id).first();
   if (ride) return fail(409, "This client has rides, so the record stays.");
+  const schedule = await env.DB.prepare("SELECT id FROM ride_schedules WHERE company_id = ? AND client_id = ?").bind(user.companyId, id).first();
+  if (schedule) return fail(409, "This client has a regular schedule. Delete the schedule first.");
   await env.DB.prepare("DELETE FROM clients WHERE company_id = ? AND id = ?").bind(user.companyId, id).run();
   return json({ ok: true });
 }
@@ -3301,6 +3314,325 @@ async function createRide(request, env) {
   return json({ ok: true, ride: row ? rideJson(row, user.role) : null }, 201);
 }
 __name(createRide, "createRide");
+// Regular client schedules (see app/schedules.js and migrations/0007_ride_schedules.sql).
+// Nothing here creates a ride or sends a message on its own: rides come only from the owner's Confirm.
+var SCHEDULE_SELECT = `SELECT s.*, c.name AS client_name, drv.name AS driver_name
+  FROM ride_schedules s JOIN clients c ON c.id = s.client_id AND c.company_id = s.company_id
+  LEFT JOIN drivers drv ON drv.user_id = s.driver_user_id AND drv.company_id = s.company_id AND drv.deleted_at IS NULL`;
+function scheduleShape(row) {
+  return {
+    monthDays: parseDayList(row.month_days, "month"),
+    weekDays: parseDayList(row.week_days, "week"),
+    startDate: row.start_date,
+    endDate: row.end_date || null,
+    lookaheadDays: row.lookahead_days,
+    active: row.active === 1
+  };
+}
+__name(scheduleShape, "scheduleShape");
+function occurrenceJson(row, hit) {
+  return {
+    scheduleId: row.id,
+    date: hit.date,
+    dateLabel: shortDate(hit.date),
+    time: row.pickup_time,
+    clientId: row.client_id,
+    clientName: row.client_name,
+    label: row.label || "",
+    pickup: row.pickup,
+    dropoff: row.dropoff,
+    stops: parseStoredStops(row.stops_json),
+    passengers: row.passengers,
+    flight: row.flight,
+    fareCents: row.fare_cents ?? null,
+    fare: row.fare_cents === null || row.fare_cents === void 0 ? "" : money(row.fare_cents),
+    driverName: row.driver_name || "",
+    lastDayFallback: hit.lastDayFallback,
+    note: hit.note
+  };
+}
+__name(occurrenceJson, "occurrenceJson");
+function scheduleJson(row, handled, today) {
+  const shape = scheduleShape(row);
+  const json2 = {
+    id: row.id,
+    clientId: row.client_id,
+    clientName: row.client_name,
+    label: row.label || "",
+    ...shape,
+    time: row.pickup_time,
+    pickup: row.pickup,
+    dropoff: row.dropoff,
+    stops: parseStoredStops(row.stops_json),
+    passengers: row.passengers,
+    flight: row.flight,
+    notes: row.notes,
+    fareCents: row.fare_cents ?? null,
+    fare: row.fare_cents === null || row.fare_cents === void 0 ? "" : money(row.fare_cents),
+    driverUserId: row.driver_user_id || null,
+    driverName: row.driver_name || "",
+    summary: describeSchedule(shape),
+    monthEndNote: monthEndNote(shape),
+    updatedAt: row.updated_at
+  };
+  if (handled && today) json2.upcoming = pendingOccurrences(shape, today, handled).map((hit) => occurrenceJson(row, hit));
+  return json2;
+}
+__name(scheduleJson, "scheduleJson");
+async function ownedSchedule(env, companyId, id) {
+  return env.DB.prepare(`${SCHEDULE_SELECT} WHERE s.company_id = ? AND s.id = ?`).bind(companyId, id).first();
+}
+__name(ownedSchedule, "ownedSchedule");
+async function handledDates(env, companyId, fromIso, toIso) {
+  const rows = await env.DB.prepare(
+    "SELECT schedule_id, occurs_on FROM ride_schedule_occurrences WHERE company_id = ? AND occurs_on >= ? AND occurs_on <= ?"
+  ).bind(companyId, fromIso, toIso).all();
+  const map = new Map();
+  for (const r of rows.results || []) {
+    if (!map.has(r.schedule_id)) map.set(r.schedule_id, new Set());
+    map.get(r.schedule_id).add(r.occurs_on);
+  }
+  return map;
+}
+__name(handledDates, "handledDates");
+async function scheduleOwner(request, env, mutate) {
+  const user = await authed(request, env, mutate);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  return user;
+}
+__name(scheduleOwner, "scheduleOwner");
+async function activeDriver(env, companyId, driverId) {
+  return env.DB.prepare(
+    `SELECT m.role FROM memberships m
+     LEFT JOIN drivers d ON d.user_id = m.user_id AND d.company_id = m.company_id
+     WHERE m.company_id = ? AND m.user_id = ? AND d.deleted_at IS NULL`
+  ).bind(companyId, driverId).first();
+}
+__name(activeDriver, "activeDriver");
+async function listSchedules(request, env) {
+  const user = await scheduleOwner(request, env, false);
+  if (isResponse(user)) return user;
+  const url = new URL(request.url);
+  const clientId = url.searchParams.get("clientId") || "";
+  if (clientId && !/^[0-9a-f-]{36}$/.test(clientId)) return fail(400, "Choose a client.");
+  const rows = clientId
+    ? await env.DB.prepare(`${SCHEDULE_SELECT} WHERE s.company_id = ? AND s.client_id = ? ORDER BY s.created_at`).bind(user.companyId, clientId).all()
+    : await env.DB.prepare(`${SCHEDULE_SELECT} WHERE s.company_id = ? ORDER BY c.name COLLATE NOCASE, s.created_at`).bind(user.companyId).all();
+  const today = todayInZone();
+  const handled = await handledDates(env, user.companyId, today, addDays(today, MAX_LOOKAHEAD_DAYS));
+  return json({ ok: true, today, schedules: (rows.results || []).map((row) => scheduleJson(row, handled.get(row.id) || /* @__PURE__ */ new Set(), today)) });
+}
+__name(listSchedules, "listSchedules");
+async function upcomingSchedules(request, env) {
+  const user = await scheduleOwner(request, env, false);
+  if (isResponse(user)) return user;
+  const rows = await env.DB.prepare(`${SCHEDULE_SELECT} WHERE s.company_id = ? AND s.active = 1`).bind(user.companyId).all();
+  const today = todayInZone();
+  const handled = await handledDates(env, user.companyId, today, addDays(today, MAX_LOOKAHEAD_DAYS));
+  const items = [];
+  for (const row of rows.results || []) {
+    for (const hit of pendingOccurrences(scheduleShape(row), today, handled.get(row.id) || /* @__PURE__ */ new Set())) items.push(occurrenceJson(row, hit));
+  }
+  items.sort((a, b) => (a.date + a.time + a.clientName).localeCompare(b.date + b.time + b.clientName));
+  return json({ ok: true, today, count: items.length, occurrences: items });
+}
+__name(upcomingSchedules, "upcomingSchedules");
+async function scheduleDriverFor(env, user, driverId) {
+  if (user.accountKind !== "fleet") return { driverId: null };
+  if (!driverId) return { driverId: null };
+  const member = await activeDriver(env, user.companyId, driverId);
+  if (!member) return { error: fail(404, "That driver is not in this company.") };
+  return { driverId };
+}
+__name(scheduleDriverFor, "scheduleDriverFor");
+async function getScheduleOne(request, env, id) {
+  const user = await scheduleOwner(request, env, false);
+  if (isResponse(user)) return user;
+  const row = await ownedSchedule(env, user.companyId, id);
+  if (!row) return fail(404, "Schedule not found.");
+  const today = todayInZone();
+  const handled = await handledDates(env, user.companyId, today, addDays(today, MAX_LOOKAHEAD_DAYS));
+  return json({ ok: true, today, schedule: scheduleJson(row, handled.get(row.id) || /* @__PURE__ */ new Set(), today) });
+}
+__name(getScheduleOne, "getScheduleOne");
+async function createSchedule(request, env) {
+  const user = await scheduleOwner(request, env, true);
+  if (isResponse(user)) return user;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const parsed = readSchedule(body);
+  if (!parsed.fields) return fail(400, parsed.error);
+  const f = parsed.fields;
+  if (!await ownedClient(env, user.companyId, f.client_id)) return fail(404, "Client not found.");
+  const driver = await scheduleDriverFor(env, user, f.driver_user_id);
+  if (driver.error) return driver.error;
+  const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM ride_schedules WHERE company_id = ?").bind(user.companyId).first();
+  if (count && count.n >= 200) return fail(409, "This account already has 200 regular schedules.");
+  const now = Date.now();
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO ride_schedules (id, company_id, client_id, label, month_days, week_days, pickup_time, pickup, dropoff, stops_json, passengers, flight, notes,
+      fare_cents, driver_user_id, start_date, end_date, lookahead_days, active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(id, user.companyId, f.client_id, f.label, f.month_days, f.week_days, f.pickup_time, f.pickup, f.dropoff, f.stops_json, f.passengers, f.flight, f.notes,
+    f.fare_cents, driver.driverId, f.start_date, f.end_date, f.lookahead_days, f.active, now, now).run();
+  const row = await ownedSchedule(env, user.companyId, id);
+  const today = todayInZone();
+  return json({ ok: true, schedule: row ? scheduleJson(row, /* @__PURE__ */ new Set(), today) : null }, 201);
+}
+__name(createSchedule, "createSchedule");
+async function updateSchedule(request, env, id) {
+  const user = await scheduleOwner(request, env, true);
+  if (isResponse(user)) return user;
+  const existing = await ownedSchedule(env, user.companyId, id);
+  if (!existing) return fail(404, "Schedule not found.");
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const parsed = readSchedule(body, scheduleJson(existing));
+  if (!parsed.fields) return fail(400, parsed.error);
+  const f = parsed.fields;
+  if (!await ownedClient(env, user.companyId, f.client_id)) return fail(404, "Client not found.");
+  let driverId = f.driver_user_id;
+  if (body.driverUserId !== void 0 || f.driver_user_id !== existing.driver_user_id) {
+    const driver = await scheduleDriverFor(env, user, f.driver_user_id);
+    if (driver.error) return driver.error;
+    driverId = driver.driverId;
+  }
+  const now = Date.now();
+  await env.DB.prepare(
+    `UPDATE ride_schedules SET client_id = ?, label = ?, month_days = ?, week_days = ?, pickup_time = ?, pickup = ?, dropoff = ?, stops_json = ?, passengers = ?,
+      flight = ?, notes = ?, fare_cents = ?, driver_user_id = ?, start_date = ?, end_date = ?, lookahead_days = ?, active = ?, updated_at = ?
+     WHERE company_id = ? AND id = ?`
+  ).bind(f.client_id, f.label, f.month_days, f.week_days, f.pickup_time, f.pickup, f.dropoff, f.stops_json, f.passengers, f.flight, f.notes, f.fare_cents,
+    driverId, f.start_date, f.end_date, f.lookahead_days, f.active, now, user.companyId, id).run();
+  const row = await ownedSchedule(env, user.companyId, id);
+  const today = todayInZone();
+  const handled = await handledDates(env, user.companyId, today, addDays(today, MAX_LOOKAHEAD_DAYS));
+  return json({ ok: true, schedule: row ? scheduleJson(row, handled.get(id) || /* @__PURE__ */ new Set(), today) : null });
+}
+__name(updateSchedule, "updateSchedule");
+async function deleteSchedule(request, env, id) {
+  const user = await scheduleOwner(request, env, true);
+  if (isResponse(user)) return user;
+  const existing = await ownedSchedule(env, user.companyId, id);
+  if (!existing) return fail(404, "Schedule not found.");
+  // Rides already confirmed from this schedule stay on the books; only the schedule and its date log go.
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM ride_schedule_occurrences WHERE company_id = ? AND schedule_id = ?").bind(user.companyId, id),
+    env.DB.prepare("DELETE FROM ride_schedules WHERE company_id = ? AND id = ?").bind(user.companyId, id)
+  ]);
+  return json({ ok: true });
+}
+__name(deleteSchedule, "deleteSchedule");
+// Shared checks for confirm / skip: the date must be a real occurrence of an active schedule, not long past.
+async function occurrenceTarget(env, user, id, occursOn) {
+  const row = await ownedSchedule(env, user.companyId, id);
+  if (!row) return { error: fail(404, "Schedule not found.") };
+  if (row.active !== 1) return { error: fail(409, "This schedule is paused. Resume it first.") };
+  const hit = matchDate(scheduleShape(row), occursOn);
+  if (!hit) return { error: fail(400, "That date is not on this schedule.") };
+  const today = todayInZone();
+  if (occursOn < addDays(today, -7)) return { error: fail(409, "That date has passed. Add the ride from + New if it happened.") };
+  if (occursOn > addDays(today, MAX_LOOKAHEAD_DAYS)) return { error: fail(409, `You can confirm dates up to ${MAX_LOOKAHEAD_DAYS} days ahead.`) };
+  const done = await env.DB.prepare("SELECT status, ride_id FROM ride_schedule_occurrences WHERE schedule_id = ? AND occurs_on = ?").bind(id, occursOn).first();
+  if (done) return { error: json({ ok: false, error: done.status === "skipped" ? "That date was skipped. Undo the skip first." : "That date is already confirmed.", status: done.status, rideId: done.ride_id || null }, 409) };
+  return { row, hit };
+}
+__name(occurrenceTarget, "occurrenceTarget");
+function isConstraintError(error) {
+  const text = error instanceof Error ? error.message + " " + String(error.cause || "") : String(error);
+  return /UNIQUE|PRIMARY KEY|constraint/i.test(text);
+}
+__name(isConstraintError, "isConstraintError");
+async function confirmOccurrence(request, env, id, occursOn) {
+  const user = await scheduleOwner(request, env, true);
+  if (isResponse(user)) return user;
+  const trial = await companyTrial(env, user.companyId);
+  if (trial && !trial.open) return trialBlocked();
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const target = await occurrenceTarget(env, user, id, occursOn);
+  if (target.error) return target.error;
+  const s = target.row;
+  const defaultFare = s.fare_cents === null || s.fare_cents === void 0 ? void 0 : (s.fare_cents / 100).toFixed(2);
+  if (body.fare === void 0 && defaultFare === void 0) return fail(400, "This schedule has no default fare. Use Edit to enter the fare.");
+  const parsed = rideFields({
+    clientId: s.client_id,
+    date: body.date ?? occursOn,
+    time: body.time ?? s.pickup_time,
+    pickup: body.pickup ?? s.pickup,
+    dropoff: body.dropoff ?? s.dropoff,
+    passengers: body.passengers ?? s.passengers,
+    flight: body.flight ?? s.flight,
+    fare: body.fare ?? defaultFare,
+    notes: body.notes ?? s.notes,
+    stops: body.stops === void 0 ? parseStoredStops(s.stops_json) : body.stops
+  });
+  if (!parsed.fields) return fail(400, parsed.error);
+  const f = parsed.fields;
+  if (!await ownedClient(env, user.companyId, f.client_id)) return fail(404, "Client not found.");
+  let driverId = null;
+  if (user.accountKind === "individual") driverId = user.userId;
+  else if (body.driverUserId !== void 0) {
+    const driver = await scheduleDriverFor(env, user, body.driverUserId === null || body.driverUserId === "" ? null : str(body.driverUserId, 36));
+    if (driver.error) return driver.error;
+    driverId = driver.driverId;
+  } else if (s.driver_user_id && await activeDriver(env, user.companyId, s.driver_user_id)) {
+    driverId = s.driver_user_id;
+  }
+  const now = Date.now();
+  const rideId = crypto.randomUUID();
+  try {
+    // One transaction: the occurrence row (primary key schedule_id + occurs_on) goes first, so a second
+    // Confirm for the same date fails the whole batch and no second ride is written.
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO ride_schedule_occurrences (schedule_id, company_id, occurs_on, status, ride_id, created_at, updated_at) VALUES (?, ?, ?, 'confirmed', ?, ?, ?)"
+      ).bind(id, user.companyId, occursOn, rideId, now, now),
+      env.DB.prepare(
+        `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, source, stops_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'unpaid', ?, ?, 'schedule', ?)`
+      ).bind(rideId, user.companyId, f.client_id, driverId, f.pickup_date, f.pickup_time, f.pickup, f.dropoff, f.passengers, f.flight, f.fare_cents, f.notes, now, now, f.stops_json)
+    ]);
+  } catch (error) {
+    if (isConstraintError(error)) return fail(409, "That date is already confirmed or skipped.");
+    throw error;
+  }
+  const ride = await ownedRide(env, user, rideId);
+  return json({ ok: true, occursOn, ride: ride ? rideJson(ride, user.role) : null }, 201);
+}
+__name(confirmOccurrence, "confirmOccurrence");
+async function skipOccurrence(request, env, id, occursOn) {
+  const user = await scheduleOwner(request, env, true);
+  if (isResponse(user)) return user;
+  const target = await occurrenceTarget(env, user, id, occursOn);
+  if (target.error) return target.error;
+  const now = Date.now();
+  try {
+    await env.DB.prepare(
+      "INSERT INTO ride_schedule_occurrences (schedule_id, company_id, occurs_on, status, ride_id, created_at, updated_at) VALUES (?, ?, ?, 'skipped', NULL, ?, ?)"
+    ).bind(id, user.companyId, occursOn, now, now).run();
+  } catch (error) {
+    if (isConstraintError(error)) return fail(409, "That date is already confirmed or skipped.");
+    throw error;
+  }
+  return json({ ok: true, occursOn, status: "skipped" });
+}
+__name(skipOccurrence, "skipOccurrence");
+async function unskipOccurrence(request, env, id, occursOn) {
+  const user = await scheduleOwner(request, env, true);
+  if (isResponse(user)) return user;
+  const row = await ownedSchedule(env, user.companyId, id);
+  if (!row) return fail(404, "Schedule not found.");
+  const done = await env.DB.prepare("SELECT status FROM ride_schedule_occurrences WHERE company_id = ? AND schedule_id = ? AND occurs_on = ?").bind(user.companyId, id, occursOn).first();
+  if (!done) return fail(404, "That date was not skipped.");
+  if (done.status !== "skipped") return fail(409, "A confirmed date stays. Cancel the ride instead.");
+  await env.DB.prepare("DELETE FROM ride_schedule_occurrences WHERE company_id = ? AND schedule_id = ? AND occurs_on = ? AND status = 'skipped'").bind(user.companyId, id, occursOn).run();
+  return json({ ok: true, occursOn });
+}
+__name(unskipOccurrence, "unskipOccurrence");
 async function getRide(request, env, id) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;
@@ -4098,6 +4430,7 @@ import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNo
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { meetingPointForArrived } from "./progress-nav.js";
+import { readSchedule, parseDayList, matchDate, pendingOccurrences, describeSchedule, monthEndNote, todayInZone, addDays, shortDate, MAX_LOOKAHEAD_DAYS } from "./schedules.js";
 import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
