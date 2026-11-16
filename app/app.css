@@ -284,3 +284,15 @@ fieldset.paymeth legend { color: var(--muted); font-size: 14px; padding: 0 6px; 
   .sheet .paywith a.paylink { color: #161616; }
   .sheet .paywith a.paylink::after { content: " " attr(href); font-weight: 400; font-size: 12px; overflow-wrap: anywhere; }
 }
+
+/* Booking page: stops between pickup and drop-off */
+.bookpage .stoprow { display: flex; gap: 8px; align-items: flex-end; }
+.bookpage .stoprow label { flex: 1; min-width: 0; }
+.bookpage .stoprow .stop-remove { flex: 0 0 auto; min-height: 50px; margin: 0; padding: 0 12px; border-radius: 12px; border: 1px solid var(--line); background: transparent; color: var(--muted); font-size: 14px; }
+.bookpage .stopsctl { margin: 10px 0 0; }
+.bookpage .stopsctl .btn.addstop { min-height: 44px; margin: 0; font-size: 15px; }
+.bookpage .stopsctl .fine { display: block; }
+.stop-list { margin: 4px 0; padding-left: 20px; }
+.stop-edit .stop-edit-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.stop-edit .stop-edit-row input { flex: 1; min-width: 0; }
+.stop-edit .stop-edit-row button { flex: 0 0 auto; min-height: 50px; }

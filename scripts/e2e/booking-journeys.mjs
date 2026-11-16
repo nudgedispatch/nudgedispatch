@@ -243,6 +243,55 @@ try {
     await page.selectOption("#dropoffSpot", "domestic-south");
     check(`${tag} quote after the chip and a terminal is the ATL flat fare`, (await quoteText()) === "$145", await page.locator("#quote").textContent());
     await shot("chip-to-atl-dropoff");
+
+    // 12. Multi-stop: add, remove, quote hidden while a stop is filled, review lists stops. No submit.
+    await open(suvOnly);
+    check(`${tag} stops: none by default, Add stop is offered`, (await page.locator("#stopsList .stoprow").count()) === 0 && (await vis("#addStop")) && !(await vis("#stopsNote")));
+    await page.fill("#pickup", "12 Oak Lane, Roswell");
+    await page.fill("#dropoff", "500 Peachtree St, Atlanta");
+    await page.waitForSelector("#quote[data-state='ok']", { timeout: 8000 }).catch(() => {});
+    check(`${tag} stops: instant quote with no stops`, /\$/.test(await quoteText()));
+    await page.click("#addStop");
+    check(`${tag} stops: Add stop opens Stop 1 between pickup and drop-off`, (await page.locator("#stopsList .stoprow").count()) === 1 && (await page.locator("#stopsList .stop-label").first().textContent()) === "Stop 1" && await page.evaluate(() => document.activeElement && document.activeElement.classList.contains("stop-input")));
+    const between = await page.evaluate(() => {
+      const y = (el) => el.getBoundingClientRect().top;
+      return y(document.querySelector("#pickup")) < y(document.querySelector(".stop-input")) && y(document.querySelector(".stop-input")) < y(document.querySelector("#dropoff"));
+    });
+    check(`${tag} stops: the stop row sits between pickup and drop-off`, between);
+    check(`${tag} stops: stop uses the address-suggestion box`, (await page.locator("#stopsList .stoprow .addr .sugg").count()) === 1);
+    check(`${tag} stops: an empty stop keeps the instant quote`, /\$/.test(await quoteText()));
+    await page.locator(".stop-input").first().fill("Lenox Square, Atlanta");
+    await page.waitForSelector("#quote[data-state='stops']", { timeout: 8000 }).catch(() => {});
+    const stopQuote = (await page.locator("#quote").textContent()) || "";
+    check(`${tag} stops: quote hidden, Price on request instead`, (await page.locator("#qPrice").textContent()) === "Price on request" && !/\$/.test(stopQuote) && /confirm your fare/i.test(stopQuote), stopQuote);
+    for (let i = 2; i <= 5; i++) {
+      await page.click("#addStop");
+      await page.locator(".stop-input").nth(i - 1).fill("Stop place " + i);
+    }
+    check(`${tag} stops: at most 5 (Add stop hidden at 5)`, (await page.locator("#stopsList .stoprow").count()) === 5 && !(await vis("#addStop")) && /most stops/.test(await page.locator("#stopsNote").textContent()));
+    await shot("stops-five");
+    await page.locator("#stopsList .stoprow").nth(1).locator(".stop-remove").click();
+    const labels = await page.locator("#stopsList .stop-label").allTextContents();
+    const values = await page.locator(".stop-input").evaluateAll((els) => els.map((e) => e.value));
+    check(`${tag} stops: remove renumbers and keeps order`, JSON.stringify(labels) === JSON.stringify(["Stop 1", "Stop 2", "Stop 3", "Stop 4"]) && JSON.stringify(values) === JSON.stringify(["Lenox Square, Atlanta", "Stop place 3", "Stop place 4", "Stop place 5"]) && (await vis("#addStop")), JSON.stringify({ labels, values }));
+    while (await page.locator("#stopsList .stop-remove").count()) await page.locator("#stopsList .stop-remove").first().click();
+    await page.waitForSelector("#quote[data-state='ok']", { timeout: 8000 }).catch(() => {});
+    check(`${tag} stops: removing every stop brings the instant quote back`, /\$/.test(await quoteText()) && (await page.locator("#stopsList .stoprow").count()) === 0);
+    await page.click("#addStop");
+    await page.locator(".stop-input").first().fill("Lenox Square, Atlanta");
+    await page.click("#addStop");
+    await page.locator(".stop-input").nth(1).fill("Phipps Plaza, Atlanta");
+    await page.waitForSelector("#quote[data-state='stops']", { timeout: 8000 }).catch(() => {});
+    await shot("stops-trip");
+    await page.selectOption("[name=time]", "10:00");
+    await page.click("#toContact");
+    await page.fill("[name=name]", "Pat Rider");
+    await page.fill("[name=phone]", "404-555-0123");
+    await page.click("#toReview");
+    const review3 = await page.locator("#reviewTable").textContent();
+    check(`${tag} stops: review lists the stops in order, before drop-off`, /PickupPickup12 Oak Lane|Pickup12 Oak Lane/.test(review3) && /Stop 1Lenox Square, Atlanta.*Stop 2Phipps Plaza, Atlanta.*Drop-off500 Peachtree/.test(review3), review3);
+    check(`${tag} stops: review shows Price on request, no estimate`, /Price on request/.test(review3) && !/Estimate/.test(review3) && !/\$/.test(review3), review3);
+    await shot("stops-review");
     await ctx.close();
   }
 
@@ -335,6 +384,11 @@ try {
   const fresh = pending.find((r) => !beforeIds.has(r.id) && r.pickup && r.pickup.includes("Virginia Pine") && /ATL|Domestic Terminal South/i.test(r.dropoff || ""));
   check("submitted booking appears in owner /api/rides as status requested", !!fresh, JSON.stringify((listed.data.rides || []).map((r) => ({ status: r.status, approval: r.approval, source: r.source, date: r.date }))));
 
+  // Multi-stop request through the same local worker.fetch path: no estimate stored, stops kept.
+  const stopBooked = await call(worker, "/api/public/book/" + suvOnly, { method: "POST", body: { ...bookBody, phone: "404-555-0177", airport: null, dropoff: "500 Peachtree St, Atlanta", stops: ["Lenox Square, Atlanta", "<b>Phipps</b> Plaza"] } });
+  check("multi-stop booking POST returns 201 with no estimate", stopBooked.status === 201 && stopBooked.data.estimate === null, JSON.stringify({ status: stopBooked.status, error: stopBooked.data.error, estimate: stopBooked.data.estimate }));
+  const withStops = ((await call(worker, "/api/rides", { session: ownerSession })).data.rides || []).find((r) => r.clientPhone === "404-555-0177");
+  check("multi-stop request is stored with its stops and no auto quote", !!withStops && withStops.quote === null && JSON.stringify(withStops.stops) === JSON.stringify(["Lenox Square, Atlanta", "<b>Phipps</b> Plaza"]), JSON.stringify(withStops || null));
   const dashCtx = await browser.newContext({ viewport: { width: 1024, height: 900 }, deviceScaleFactor: 1, serviceWorkers: "block" });
   const cookieHeader = ownerSession.cookie || "";
   const cookieVal = cookieHeader.includes("=") ? cookieHeader.slice(cookieHeader.indexOf("=") + 1) : cookieHeader;
@@ -344,6 +398,8 @@ try {
   await dash.waitForSelector("text=Needs your approval", { timeout: 20000 }).catch(() => {});
   const dashText = await dash.locator("#list").textContent().catch(() => "");
   check("owner dashboard shows Needs your approval for the submitted booking", /Needs your approval/i.test(dashText) && /Virginia Pine/i.test(dashText), String(dashText).slice(0, 400));
+  check("owner dashboard lists the request's stops, escaped", /Stops: 1\) Lenox Square, Atlanta · 2\) <b>Phipps<\/b> Plaza/.test(dashText) && (await dash.locator("#list b").count()) === 0, String(dashText).slice(0, 600));
+  check("owner dashboard: stop request says no estimate was shown", /this request has stops/i.test(dashText));
   await dash.screenshot({ path: join(shots, "nudge-desktop-1024-owner-dashboard-request.png"), fullPage: true });
   await dashCtx.close();
 

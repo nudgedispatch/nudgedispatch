@@ -469,12 +469,13 @@ function rideCardHtml(ride, pending) {
   const notes = pending && ride.notes ? `<div class="sub">${esc(ride.notes)}</div>` : "";
   const trip = (tripLine(ride) ? `<div class="sub">${esc(tripLine(ride))}</div>` : "") + airportHtml(ride, "div");
   const owner = !(state.me && state.me.role === "driver");
-  const quote = pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">No estimate was shown to the client.</div>`) : "";
+  const quote = pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">${rideStops(ride).length ? "No estimate: this request has stops, so the client saw Price on request." : "No estimate was shown to the client."}</div>`) : "";
   const actions = pending && owner ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, `data-fare="${esc(ride.id)}"`, `data-approve="${esc(ride.id)}"`)}<div class="pend-actions"><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : "";
   return `<div class="list-btn${pending ? " pending-request card" : ""}" data-id="${esc(ride.id)}">
       <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badge ${esc(ride.status)}">${esc(rideBadgeText(ride))}</span></div>
       <div class="sub when">${when}${fare}</div>
       <div class="sub">${esc(ride.pickup)} → ${esc(ride.dropoff)}</div>
+      ${stopsSummaryHtml(ride, "div")}
       ${ride.driverName ? `<div class="sub">Driver: ${esc(ride.driverName)}</div>` : ""}
       ${trip}${phone}${notes}${quote}${actions}
     </div>`;
@@ -578,7 +579,8 @@ async function renderRide(id, gen) {
   const links = loc.data.ok && Array.isArray(loc.data.links) ? loc.data.links.filter((link) => !link.revokedAt) : [];
   box.innerHTML = `<article class="card">
       <div class="row"><h2>${esc(ride.clientName)}</h2><span class="badge ${esc(ride.status)}">${esc(schedule.now || label(ride.status))}</span></div>
-      <p>${esc(ride.pickup)}<br>→ ${esc(ride.dropoff)}</p>
+      <p class="route">${esc(ride.pickup)}<br>${rideStops(ride).map((stop, i) => `→ <span class="stop-tag">Stop ${i + 1}:</span> ${esc(stop)}<br>`).join("")}→ ${esc(ride.dropoff)}</p>
+      ${rideStops(ride).length && ride.status === "requested" && !driverView && !ride.quote ? `<p class="sub">This request has stops. No estimate was shown; the client saw Price on request.</p>` : ""}
       ${tripLine(ride) ? `<p class="sub">${esc(tripLine(ride))}</p>` : ""}
       ${airportHtml(ride, "p")}
       ${ride.quote && !driverView ? quoteBoxHtml(ride.quote) : ""}
@@ -598,6 +600,7 @@ async function renderRide(id, gen) {
       ${ride.status === "scheduled" && !driverView ? `<button class="btn ghost" id="cancel" type="button">Cancel ride</button>` : ""}
       ${ride.status === "completed" && !driverView ? `<button class="btn" id="invoice" type="button">${invoice ? "Open invoice" : "Create invoice"}</button>` : ""}
     </div>
+    ${!driverView && ride.status === "scheduled" ? `<form id="stops-form" class="card noprint"><h2>Stops</h2>${stopEditorHtml(rideStops(ride), "ride-stops")}<button class="btn ghost full" type="submit" id="save-stops">Save stops</button><p class="err" id="stopserr"></p></form>` : ""}
     ${fleetOwner && ride.status !== "requested" && ride.status !== "declined" ? `<form id="assign" class="card noprint"><label>Assigned driver<select id="driver"><option value="">Unassigned</option>${formerDriver}${roster.map((member) => `<option value="${esc(member.id)}">${esc(driverOptionLabel(member))}</option>`).join("")}</select></label><p class="err" id="assignerr"></p></form>` : ""}
     <section class="card noprint${ride.status === "requested" || ride.status === "declined" ? " hidden" : ""}">
       <h2>Your location</h2>
@@ -622,6 +625,18 @@ async function renderRide(id, gen) {
       <p class="err" id="err"></p>
     </form>`;
   wireApproveBlock(box);
+  const stopsForm = document.querySelector("#stops-form");
+  if (stopsForm) {
+    wireStopEditor(document.querySelector("#ride-stops"));
+    stopsForm.onsubmit = async (event) => {
+      event.preventDefault();
+      const next = await api("/api/rides/" + id, { method: "PATCH", body: { stops: readStopEditor(document.querySelector("#ride-stops")) } });
+      if (gen !== renderGen) return;
+      const err = document.querySelector("#stopserr");
+      if (!next.data.ok) { if (err) err.textContent = next.data.error || "Could not save the stops."; return; }
+      route();
+    };
+  }
   document.querySelector("#payment").value = ride.payment || "unpaid";
   const assign = document.querySelector("#driver");
   if (assign) {
@@ -808,6 +823,7 @@ async function renderNewRide(gen) {
       <label>Date<input id="date" type="date" required></label>
       <label>Time<input id="time" type="time" required></label>
       <label class="full">Pickup<input id="pickup" required autocomplete="street-address"></label>
+      ${stopEditorHtml([], "new-stops")}
       <label class="full">Drop-off<input id="dropoff" required></label>
       <label>Passengers<input id="passengers" type="number" min="1" max="14" value="1" inputmode="numeric"></label>
       <label>Fare (USD)<input id="fare" inputmode="decimal" placeholder="125.00" required></label>
@@ -816,8 +832,10 @@ async function renderNewRide(gen) {
       <p class="err full" id="err"></p>
       <button class="btn full" type="submit">Save ride</button>
     </form>`);
+  wireStopEditor(document.querySelector("#new-stops"));
   document.querySelector("#f").onsubmit = async (event) => {
     event.preventDefault();
+    const stops = readStopEditor(document.querySelector("#new-stops"));
     const result = await api("/api/rides", {
       method: "POST",
       body: {
@@ -830,6 +848,7 @@ async function renderNewRide(gen) {
         fare: document.querySelector("#fare").value,
         flight: document.querySelector("#flight").value,
         notes: document.querySelector("#notes").value,
+        ...(stops.length ? { stops } : {}),
       },
     });
     if (!result.data.ok) return formError(result.data.error);
@@ -871,6 +890,7 @@ async function renderInvoice(id, gen) {
       <table>
         <tr><td>When</td><td>${esc(longIssued(trip.date))} ${esc(time12(trip.time))}</td></tr>
         <tr><td>Pickup</td><td>${esc(trip.pickup)}</td></tr>
+        ${rideStops(trip).map((stop, i) => `<tr class="stop-row"><td>Stop ${i + 1}</td><td>${esc(stop)}</td></tr>`).join("")}
         <tr><td>Drop-off</td><td>${esc(trip.dropoff)}</td></tr>
         <tr><td>Passengers</td><td>${esc(trip.passengers)}</td></tr>
         ${trip.flight ? `<tr><td>Flight</td><td>${esc(trip.flight)}</td></tr>` : ""}
@@ -1766,6 +1786,54 @@ function airportHtml(ride, tag) {
   if (ride.luggage != null) bits.push(`<${tag} class="sub">Luggage: ${esc(ride.luggage)}</${tag}>`);
   if (ride.flightAlert) bits.push(`<${tag} class="sub flight-alert ${esc(ride.flightAlert.kind)}">Flight alert: ${esc(ride.flightAlert.message)}</${tag}>`);
   return bits.join("");
+}
+
+// Stops between pickup and drop-off (up to 5). Every value is escaped on output.
+const MAX_STOPS = 5;
+function rideStops(ride) {
+  return Array.isArray(ride && ride.stops) ? ride.stops.filter((s) => typeof s === "string" && s.trim()) : [];
+}
+function stopsSummaryHtml(ride, tag) {
+  const stops = rideStops(ride);
+  if (!stops.length) return "";
+  return `<${tag} class="sub stops-line">Stops: ${stops.map((s, i) => esc((i + 1) + ") " + s)).join(" \u00b7 ")}</${tag}>`;
+}
+function stopEditRowHtml(value, i) {
+  return `<div class="stop-edit-row"><input class="stop-edit-input" maxlength="200" autocomplete="off" aria-label="Stop ${i + 1}" placeholder="Stop ${i + 1} address" value="${esc(value)}"><button class="btn ghost" type="button" data-remove-stop aria-label="Remove stop ${i + 1}">Remove</button></div>`;
+}
+function stopEditorHtml(stops, id) {
+  return `<div class="stop-edit full" id="${esc(id)}"><span class="sub">Stops between pickup and drop-off (optional, up to ${MAX_STOPS})</span><div class="stop-edit-rows">${(stops || []).map(stopEditRowHtml).join("")}</div><button class="btn ghost" type="button" data-add-stop>+ Add stop</button></div>`;
+}
+function syncStopEditor(root) {
+  const rows = [...root.querySelectorAll(".stop-edit-row")];
+  rows.forEach((row, i) => {
+    const input = row.querySelector("input");
+    input.setAttribute("aria-label", "Stop " + (i + 1));
+    input.setAttribute("placeholder", "Stop " + (i + 1) + " address");
+    row.querySelector("[data-remove-stop]").setAttribute("aria-label", "Remove stop " + (i + 1));
+  });
+  const add = root.querySelector("[data-add-stop]");
+  if (add) add.classList.toggle("hidden", rows.length >= MAX_STOPS);
+}
+function wireStopEditor(root) {
+  if (!root) return;
+  root.addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-remove-stop]");
+    if (remove) { remove.closest(".stop-edit-row").remove(); syncStopEditor(root); return; }
+    if (event.target.closest("[data-add-stop]")) {
+      const rows = root.querySelector(".stop-edit-rows");
+      const count = rows.querySelectorAll(".stop-edit-row").length;
+      if (count >= MAX_STOPS) return;
+      rows.insertAdjacentHTML("beforeend", stopEditRowHtml("", count));
+      syncStopEditor(root);
+      const inputs = rows.querySelectorAll("input");
+      inputs[inputs.length - 1].focus();
+    }
+  });
+  syncStopEditor(root);
+}
+function readStopEditor(root) {
+  return root ? [...root.querySelectorAll(".stop-edit-input")].map((input) => input.value.trim()).filter(Boolean) : [];
 }
 
 function tripLine(ride) {
