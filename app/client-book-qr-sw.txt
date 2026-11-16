@@ -1,0 +1,48 @@
+// Service worker for /book/<slug>/qr/ only (its own, narrower scope than the booking page's /book/<slug>/).
+// Network first, cache fallback, so the QR opens from the home screen with no signal.
+const CACHE = "nudge-book-qr-v1";
+
+function paths() {
+  const scope = new URL(self.registration.scope).pathname;
+  const qr = scope.endsWith("/") ? scope : scope + "/";
+  const base = qr.replace(/qr\/$/, "");
+  return { qr, base };
+}
+
+self.addEventListener("install", (event) => {
+  const { qr, base } = paths();
+  event.waitUntil(
+    caches.open(CACHE).then((cache) => cache.addAll([
+      qr,
+      qr + "manifest.webmanifest",
+      base + "qr.png",
+      base + "icon-192.png",
+      "/book-qr.js",
+      "/book-qr.css",
+    ])).catch(() => {}).then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith("nudge-book-qr-") && key !== CACHE).map((key) => caches.delete(key)))).then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== "GET" || url.origin !== location.origin) return;
+  const { qr, base } = paths();
+  const mine = url.pathname.startsWith(qr) || url.pathname === base + "qr.png" || url.pathname === base + "qr.svg"
+    || url.pathname === base + "icon-192.png" || url.pathname === "/book-qr.js" || url.pathname === "/book-qr.css";
+  if (!mine) return;
+  event.respondWith(
+    fetch(event.request).then((response) => {
+      if (response.ok) {
+        const copy = response.clone();
+        caches.open(CACHE).then((cache) => cache.put(event.request, copy));
+      }
+      return response;
+    }).catch(() => caches.match(event.request, { ignoreSearch: true }))
+  );
+});

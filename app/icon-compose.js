@@ -262,7 +262,7 @@ function sample(rgba, width, height, x, y) {
   return [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]];
 }
 
-function blitContain(src, sw, sh, dst, size, box) {
+export function blitContain(src, sw, sh, dst, size, box) {
   const scale = Math.min(box / sw, box / sh);
   const dw = Math.max(1, Math.round(sw * scale));
   const dh = Math.max(1, Math.round(sh * scale));

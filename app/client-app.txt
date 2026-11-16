@@ -1181,6 +1181,7 @@ async function renderSettings(gen) {
   if (!result.data.ok) { box.textContent = result.data.error || "Could not load settings."; return; }
   const s = result.data.settings;
   const bookingUrl = location.origin + (s.bookingPath || (s.bookingSlug ? "/book/" + s.bookingSlug : ""));
+  const qrUrl = s.bookingSlug ? location.origin + "/book/" + encodeURIComponent(s.bookingSlug) + "/qr/" : "";
   if (state.me.role === "owner") api("/api/billing").then((b) => {
     const card = document.querySelector("#plan-card");
     if (!card || !b.data.ok) return;
@@ -1193,6 +1194,8 @@ async function renderSettings(gen) {
       <p class="sub">Share this link so it sits on a client's phone or a hotel concierge screen. Requests wait in Rides until you approve them. Nothing is emailed or texted.</p>
       <p><input class="booking-link" id="booking-link" readonly value="${esc(bookingUrl)}"></p>
       <button class="btn full" id="copy-booking" type="button">Copy link</button>
+      ${qrUrl ? `<a class="btn ghost full" id="booking-qr" href="${esc(qrUrl)}" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none;margin-top:8px">QR code</a>
+      <p class="sub">The QR page has Share and Save image buttons. Open it on your phone and add it to your home screen for one-tap access.</p>` : ""}
       <p class="err" id="booking-copy"></p>
     </section>
     <section class="card" id="plan-card" hidden></section>
