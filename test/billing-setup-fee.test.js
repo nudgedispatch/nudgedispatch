@@ -81,6 +81,8 @@ test("card summary keeps brand, last 4, and expiry only", () => {
   assert.equal(cardSummary({ card: { brand: "visa", last4: "42x2" } }), null);
   assert.equal(cardSummary({ type: "us_bank_account" }), null);
   assert.equal(cardSummary(null), null);
+  assert.deepEqual(cardSummary({ type: "link", link: { email: "x@example.test" } }), { brand: "link", last4: null, expMonth: null, expYear: null });
+  assert.deepEqual(paymentMethodJson({ pm_brand: "link" }), { brand: "link", last4: null, expMonth: null, expYear: null });
   assert.deepEqual(paymentMethodJson({ pm_brand: "amex", pm_last4: "0005", pm_exp_month: 1, pm_exp_year: 2031 }), { brand: "amex", last4: "0005", expMonth: 1, expYear: 2031 });
   assert.equal(paymentMethodJson({}), null);
   const b = billingJson({ billing_plan: "small", setup_fee: "charge", pm_brand: "visa", pm_last4: "4242" }, 1);

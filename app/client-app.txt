@@ -154,6 +154,7 @@ document.addEventListener("click", (event) => {
 const CARD_BRANDS = { visa: "Visa", mastercard: "Mastercard", amex: "American Express", american_express: "American Express", discover: "Discover", diners: "Diners Club", jcb: "JCB", unionpay: "UnionPay", cartes_bancaires: "Cartes Bancaires" };
 function cardLine(pm) {
   if (!pm) return "";
+  if (pm.brand === "link" && !pm.last4) return "Stripe Link (card saved with Link)";
   const brand = CARD_BRANDS[pm.brand] || (pm.brand ? pm.brand.charAt(0).toUpperCase() + pm.brand.slice(1) : "Card");
   const exp = pm.expMonth && pm.expYear ? " · expires " + String(pm.expMonth).padStart(2, "0") + "/" + String(pm.expYear).slice(-2) : "";
   return brand + " ending in " + pm.last4 + exp;
@@ -169,7 +170,7 @@ function paymentCardHtml(r) {
     <p class="sub">${pm ? "This card pays your Nudge Dispatch plan automatically each month." : "Add a card so your Nudge Dispatch plan renews automatically."} Card details are entered on Stripe's secure page and kept by Stripe; Nudge only shows the last 4 digits.${r.livemode === false ? " (Stripe test mode.)" : ""}</p>
     <button class="btn ${pm ? "ghost " : ""}full" type="button" data-card-add>${pm ? "Update card" : "Add card"}</button>
     ${inv ? `<div class="pm-invoice" data-invoice="open"><p class="sub"><strong>Unpaid invoice: ${esc(centsText(inv.amountDue))}</strong></p>
-      ${pm ? `<button class="btn full" type="button" data-pay-invoice>Pay ${esc(centsText(inv.amountDue))} now with ${esc(cardLine({ ...pm, expMonth: null }))}</button>` : ""}
+      ${pm ? `<button class="btn full" type="button" data-pay-invoice>Pay ${esc(centsText(inv.amountDue))} now with ${esc(pm.last4 ? cardLine({ ...pm, expMonth: null }) : "your saved payment method")}</button>` : ""}
       ${inv.url ? `<a class="btn ghost full pm-hosted" href="${esc(inv.url)}" target="_blank" rel="noopener">${pm ? "Pay on Stripe's invoice page instead" : "Pay now on Stripe's secure page"}</a>` : ""}</div>` : ""}
     ${r.stale ? `<p class="sub">Showing the last saved card; Stripe could not be reached just now.</p>` : ""}
     <p class="err pm-msg"></p>`;

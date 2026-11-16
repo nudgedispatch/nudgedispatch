@@ -2644,6 +2644,7 @@ async function billingPortal(request, env) {
 __name(billingPortal, "billingPortal");
 // ---- Client payment method (Jesse, Nov 16, 2026). Card details are entered on Stripe-hosted pages and
 // stored only by Stripe. D1 keeps brand, last 4, and expiry for display. Owner only, company-scoped. ----
+const CARD_SETUP_EXCLUDED_TYPES = ["klarna", "cashapp", "amazon_pay", "affirm", "afterpay_clearpay", "us_bank_account", "zip", "alipay", "paypal", "revolut_pay", "crypto"];
 const BILLING_NOT_STARTED = "Billing not started yet. Your Nudge Dispatch contact starts it when your plan begins.";
 function openInvoiceJson(inv) {
   if (!inv || typeof inv !== "object" || inv.status !== "open") return null;
@@ -2734,7 +2735,9 @@ async function ownerCardSession(request, env) {
       mode: "setup",
       customer: row.stripe_customer_id,
       currency: "usd",
-      payment_method_types: ["card"],
+      // The pinned API version refuses payment_method_types on Checkout; methods come from the Dashboard.
+      // Exclude non-card methods so the client saves a card (Link, which can't be excluded, is shown as "Link").
+      excluded_payment_method_types: CARD_SETUP_EXCLUDED_TYPES,
       success_url: origin + "/?card_session={CHECKOUT_SESSION_ID}#/settings",
       cancel_url: origin + "/#/settings",
       metadata: { app: "nudge-dispatch", company_id: row.id, purpose: "card" },

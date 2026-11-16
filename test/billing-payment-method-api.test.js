@@ -196,6 +196,8 @@ test("setup fee choice and client card flow (mocked Stripe test mode)", { timeou
     const csPost = mock.hits.filter((h) => h.path === "/v1/checkout/sessions" && h.method === "POST").pop();
     assert.match(csPost.body, /(^|&)mode=setup(&|$)/);
     assert.match(csPost.body, /(^|&)customer=cus_pm(&|$)/);
+    assert.doesNotMatch(csPost.body, /(^|&)payment_method_types\[/, "the pinned API version refuses payment_method_types");
+    assert.match(csPost.body, /excluded_payment_method_types\[0\]=klarna/);
     assert.match(csPost.body, /success_url=http:\/\/127\.0\.0\.1\/\?card_session=\{CHECKOUT_SESSION_ID\}#\/settings/);
 
     // Return from Stripe: a session for another customer is refused; ours sets the default card.

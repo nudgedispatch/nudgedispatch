@@ -51,6 +51,7 @@ export function couponCoversProduct(coupon, productId) {
 
 // Card summary kept in D1: brand, last 4, expiry. Never the number, CVC, or anything else.
 export function cardSummary(pm) {
+  if (pm && typeof pm === "object" && pm.type === "link") return { brand: "link", last4: null, expMonth: null, expYear: null };
   const card = pm && typeof pm === "object" && pm.card && typeof pm.card === "object" ? pm.card : null;
   if (!card) return null;
   const last4 = /^\d{4}$/.test(String(card.last4 || "")) ? String(card.last4) : "";
@@ -61,8 +62,8 @@ export function cardSummary(pm) {
   return { brand, last4, expMonth, expYear };
 }
 export function paymentMethodJson(company) {
-  if (!company || !company.pm_last4) return null;
-  return { brand: company.pm_brand || "card", last4: company.pm_last4, expMonth: company.pm_exp_month || null, expYear: company.pm_exp_year || null };
+  if (!company || (!company.pm_last4 && company.pm_brand !== "link")) return null;
+  return { brand: company.pm_brand || "card", last4: company.pm_last4 || null, expMonth: company.pm_exp_month || null, expYear: company.pm_exp_year || null };
 }
 export const SMS_METER_EVENT = "nudge_sms_text";
 export const SMS_INCLUDED_TEXTS = 500;
