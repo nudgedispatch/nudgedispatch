@@ -306,7 +306,7 @@ try {
   const bookBody = {
     name: "Jesse Test",
     phone: "404-555-0199",
-    date: "2026-11-13",
+    date: new Date(Date.now() + 7 * 864e5).toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
     time: "15:30",
     pickup: "10300 Virginia Pine Ln, Alpharetta GA 30022",
     dropoff: "",
