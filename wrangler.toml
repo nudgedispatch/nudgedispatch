@@ -20,10 +20,11 @@ STRIPE_PORTAL_CONFIGURATION = ""
 
 # Shell scripts are .txt so Wrangler imports them as text. The Worker still
 # serves them at /app.js, /sw.js, /book.js, and /book/<slug>/sw.js.
+# invoice-image.js is also imported as text and served to the browser as a module.
 # fallthrough keeps Wrangler's built-in text rule for .html, .txt, and .sql.
 [[rules]]
 type = "Text"
-globs = ["**/*.css", "**/*.svg", "**/*.webmanifest"]
+globs = ["**/*.css", "**/*.svg", "**/*.webmanifest", "**/invoice-image.js"]
 fallthrough = true
 
 [[rules]]

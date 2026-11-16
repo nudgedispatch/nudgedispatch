@@ -4426,6 +4426,7 @@ import { composeLogoIcon } from "./icon-compose.js";
 import bookQrJs from "./client-book-qr.txt";
 import bookQrSwJs from "./client-book-qr-sw.txt";
 import bookQrCss from "./book-qr.css";
+import invoiceImageJs from "./invoice-image.js";
 import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml } from "./booking-qr.js";
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
 import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, BETA_SPOTS } from "./trial.js";
@@ -4461,7 +4462,8 @@ var FILES = {
   "/icons/icon-512-maskable.png": { body: icon512Maskable, type: "image/png", cache: "public, max-age=300" },
   "/book.js": { body: bookJs, type: "text/javascript; charset=utf-8", cache: "no-store" },
   "/book-qr.js": { body: bookQrJs, type: "text/javascript; charset=utf-8", cache: "no-cache" },
-  "/book-qr.css": { body: bookQrCss, type: "text/css; charset=utf-8", cache: "no-cache" }
+  "/book-qr.css": { body: bookQrCss, type: "text/css; charset=utf-8", cache: "no-cache" },
+  "/invoice-image.js": { body: invoiceImageJs, type: "text/javascript; charset=utf-8", cache: "no-cache" }
 };
 function assetTag(s) {
   let h = 0;

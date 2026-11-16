@@ -878,16 +878,27 @@ async function renderInvoice(id, gen) {
   const payWith = Array.isArray(invoice.payWith) ? invoice.payWith : [];
   const send = invoiceSendLinks(invoice);
   const paid = invoice.payment === "paid";
+  const canShareHint = typeof navigator !== "undefined" && typeof navigator.share === "function";
+  const emailOk = !!(send.mailto || canShareHint);
+  const textOk = !!(send.sms || canShareHint);
+  const emailTag = emailOk
+    ? (send.mailto ? `<a class="btn" id="send-email" href="${esc(send.mailto)}">Email</a>` : `<button class="btn" id="send-email" type="button">Email</button>`)
+    : `<button class="btn" id="send-email" type="button" disabled title="No email on file for this client">Email</button>`;
+  const textTag = textOk
+    ? (send.sms ? `<a class="btn" id="send-text" href="${esc(send.sms)}">Text</a>` : `<button class="btn" id="send-text" type="button">Text</button>`)
+    : `<button class="btn" id="send-text" type="button" disabled title="No phone on file for this client">Text</button>`;
   box.innerHTML = `<p class="noprint"><a href="#/rides/${esc(invoice.rideId)}">Back to ride</a></p>
     <div class="actions noprint">
-      ${send.mailto ? `<a class="btn" id="send-email" href="${esc(send.mailto)}">Email</a>` : `<button class="btn" id="send-email" type="button" disabled title="No email on file for this client">Email</button>`}
-      ${send.sms ? `<a class="btn" id="send-text" href="${esc(send.sms)}">Text</a>` : `<button class="btn" id="send-text" type="button" disabled title="No phone on file for this client">Text</button>`}
+      ${emailTag}
+      ${textTag}
     </div>
-    <p class="muted noprint send-note">${send.mailto || send.sms ? "Email and Text open your own mail or messages app with the invoice filled in. Nothing is sent until you press send there." : "Add an email or phone to this client to send from here."}${!send.mailto && send.sms ? " No email on file for this client." : ""}${send.mailto && !send.sms ? " No phone on file for this client." : ""}</p>
+    <p class="muted noprint send-note">${invoiceSendNote(send, canShareHint)}</p>
     <div class="actions noprint">
       <button class="btn ghost" id="print" type="button">Print</button>
       <button class="btn ghost" id="txt" type="button">Download text</button>
       <button class="btn ghost" id="html" type="button">Download page</button>
+      <button class="btn ghost" id="dl-png" type="button">Download PNG</button>
+      <button class="btn ghost" id="dl-pdf" type="button">Download PDF</button>
     </div>
     ${invoice.payment ? `<div class="row paid-row noprint"><span id="paid-state" class="${paid ? "paid-yes" : "muted"}">${paid ? "Paid" : "Not paid yet"}</span><button class="btn ghost" id="mark-paid" type="button" data-paid="${paid ? "1" : "0"}">${paid ? "Mark not paid" : "Mark paid"}</button></div><p class="err noprint" id="paid-err"></p>` : ""}
     <article class="sheet" id="sheet">
@@ -938,6 +949,7 @@ async function renderInvoice(id, gen) {
   };
   document.querySelector("#txt").onclick = () => download(`invoice-${invoice.number}.txt`, invoice.snapshotText, "text/plain");
   document.querySelector("#html").onclick = () => download(`invoice-${invoice.number}.html`, `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Invoice ${esc(invoice.number)}</title></head><body><pre>${esc(invoice.snapshotText)}</pre></body></html>`, "text/html");
+  wireInvoiceShare(box, invoice, send);
 }
 
 function payOptionHtml(option, fare) {
@@ -946,8 +958,94 @@ function payOptionHtml(option, fare) {
   return `<li><strong>${esc(option.label)}</strong> · <span class="handle">${esc(option.display)}</span><br><a class="paylink" href="${esc(option.url)}" target="_blank" rel="noopener noreferrer">Pay ${esc(fare)} with ${esc(option.label)}</a></li>`;
 }
 
+function invoiceSendNote(send, shareHint) {
+  const missing = (!send.mailto && send.sms ? " No email on file for this client." : "") + (send.mailto && !send.sms ? " No phone on file for this client." : "");
+  if (shareHint) {
+    return (send.mailto || send.sms
+      ? "Email and Text open your share sheet with the invoice attached as a PNG or PDF. Nothing is sent until you press send there."
+      : "Email and Text open your share sheet with the invoice attached as a PNG or PDF. Pick the recipient in Mail or Messages. Nothing is sent until you press send there.") + missing;
+  }
+  if (send.mailto || send.sms) {
+    return "Email and Text open your own mail or messages app with the invoice filled in. Use Download PNG or Download PDF to attach the invoice yourself. Nothing is sent until you press send there." + missing;
+  }
+  return "Add an email or phone to this client to send from here, or download the invoice as a PNG or PDF.";
+}
+
+function downloadInvoiceFile(file) {
+  if (!file) return;
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(file);
+  link.download = file.name || "invoice";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 30000);
+}
+
+// Prefetch the PNG and PDF as soon as the invoice is on screen so a later tap still counts
+// as a user gesture on iOS Safari (navigator.share must run in the click turn).
+function wireInvoiceShare(box, invoice, send) {
+  const api = window.NudgeInvoiceShare;
+  const emailBtn = box.querySelector("#send-email");
+  const textBtn = box.querySelector("#send-text");
+  const note = box.querySelector(".send-note");
+  const dlPng = box.querySelector("#dl-png");
+  const dlPdf = box.querySelector("#dl-pdf");
+  if (!api || typeof api.invoiceFiles !== "function") {
+    if (dlPng) dlPng.hidden = true;
+    if (dlPdf) dlPdf.hidden = true;
+    return;
+  }
+  let files = null;
+  const preparing = api.invoiceFiles(invoice).then((result) => {
+    files = result;
+    const shareOk = api.canShareFile(result.png) || api.canShareFile(result.pdf);
+    if (note) note.textContent = invoiceSendNote(send, shareOk);
+    if (shareOk) {
+      if (emailBtn && emailBtn.tagName === "BUTTON") emailBtn.disabled = false;
+      if (textBtn && textBtn.tagName === "BUTTON") textBtn.disabled = false;
+    }
+    return result;
+  }).catch(() => null);
+
+  async function shareOrFallback(kind, event) {
+    if (event) event.preventDefault();
+    const ready = files || (preparing ? await preparing : null);
+    const file = ready && api.preferredShareFile(kind, ready);
+    if (file && api.canShareFile(file)) {
+      const data = { title: api.invoiceShareTitle(invoice), text: api.invoiceShareText(invoice), files: [file] };
+      try {
+        await navigator.share(data);
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return;
+      }
+    }
+    const href = kind === "email" ? send.mailto : send.sms;
+    if (href) {
+      location.href = href;
+      return;
+    }
+    if (ready && (ready.png || ready.pdf)) downloadInvoiceFile(kind === "email" ? (ready.pdf || ready.png) : (ready.png || ready.pdf));
+  }
+
+  if (emailBtn && !emailBtn.disabled) emailBtn.addEventListener("click", (event) => { shareOrFallback("email", event); });
+  if (textBtn && !textBtn.disabled) textBtn.addEventListener("click", (event) => { shareOrFallback("text", event); });
+  if (dlPng) dlPng.addEventListener("click", async () => {
+    const ready = files || (preparing ? await preparing : null);
+    if (ready && ready.png) downloadInvoiceFile(ready.png);
+  });
+  if (dlPdf) dlPdf.addEventListener("click", async () => {
+    const ready = files || (preparing ? await preparing : null);
+    if (ready && ready.pdf) downloadInvoiceFile(ready.pdf);
+  });
+}
+
 // mailto:/sms: links that open the owner's own mail or messages app. Nothing is sent by the server.
 function invoiceSendLinks(invoice) {
+  if (window.NudgeInvoiceShare && typeof window.NudgeInvoiceShare.invoiceSendLinks === "function") {
+    return window.NudgeInvoiceShare.invoiceSendLinks(invoice);
+  }
   const business = invoice.business || {};
   const name = String(business.name || "").replace(/\.+$/, "");
   const lines = Array.isArray(invoice.payLines) ? invoice.payLines : [];
@@ -1226,7 +1324,7 @@ async function renderSettings(gen) {
       <p class="err full" id="err"></p>
       <button class="btn full" type="submit">Save business details</button>
     </form>
-    <p class="note">Invoices are never sent by the app. Email and Text on an invoice open your own mail or messages app so you send it yourself.</p>
+    <p class="note">Invoices are never sent by the app. Email and Text on an invoice open your share sheet with a PNG or PDF attached, or your own mail or messages app if sharing files is not available. Nothing is sent until you press send there.</p>
     <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
     <button class="btn ghost full" id="out" type="button">Sign out</button>`;
   document.querySelector("#f").onsubmit = async (event) => {
