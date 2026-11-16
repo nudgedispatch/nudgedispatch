@@ -1,5 +1,5 @@
-const CACHE = "nudge-app-shell-v19";
-const SHELL = ["/", "/app.css", "/app.js", "/manifest.webmanifest", "/brand/wordmark.svg", "/brand/wordmark-on-dark.svg", "/brand/mark.svg", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/icon-192-maskable.png", "/icons/icon-512-maskable.png", "/icons/apple-touch-icon.png"];
+const CACHE = "nudge-app-shell-v20";
+const SHELL = ["/", "/app.css", "/app.js", "/invoice-image.js", "/manifest.webmanifest", "/brand/wordmark.svg", "/brand/wordmark-on-dark.svg", "/brand/mark.svg", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/icon-192-maskable.png", "/icons/icon-512-maskable.png", "/icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
