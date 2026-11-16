@@ -127,6 +127,8 @@ Each fleet sets these in Rates (owner only), stored in `booking_settings`:
 
 Quote or website links can prefill the booking page: `/book/<slug>?airport=pickup&code=ATL&spot=domestic-south&dropoff=...` (`airport` also accepts `from_atl` / `to_atl`).
 
+Each booking page has a shareable QR page at `/book/<slug>/qr/` (Settings, Your booking page, QR code). It shows the logo, a QR for `/book/<slug>/` (error correction H, encoded in the Worker with the vendored MIT `app/vendor/qrcodegen.js`), Share (Web Share with the PNG where supported, else copy link) and Save image. Images: `/book/<slug>/qr.png` and `/book/<slug>/qr.svg`. It has its own manifest and service worker scoped to `/book/<slug>/qr/`, so Add to Home Screen opens straight to the QR. The PNG gets the logo overlay only for PNG logos. Local checks: `node scripts/e2e/qr-shots.mjs [logo.png] [logo.webp]`.
+
 ## Booking deploy gate
 
 `scripts/predeploy-e2e.sh` (CI job `booking-walkthrough`) runs real client journeys at 390px and 1024px on a local Worker with a throwaway D1: quote links with the airport prefilled, switching the airport connection both ways, the passenger and vehicle rules, through review. It blocks any real submit. `scripts/deploy-prod.sh` refuses to deploy unless `npm run check` and that walkthrough passed on the same clean commit, and `NUDGE_DEPLOY_CONFIRM=yes` is set. It never applies D1 migrations.

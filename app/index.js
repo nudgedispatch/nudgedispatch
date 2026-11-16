@@ -4423,6 +4423,10 @@ import bookHtml from "./book.html";
 import bookJs from "./client-book.txt";
 import bookSwJs from "./client-book-sw.txt";
 import { composeLogoIcon } from "./icon-compose.js";
+import bookQrJs from "./client-book-qr.txt";
+import bookQrSwJs from "./client-book-qr-sw.txt";
+import bookQrCss from "./book-qr.css";
+import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml } from "./booking-qr.js";
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
 import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, BETA_SPOTS } from "./trial.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
@@ -4455,7 +4459,9 @@ var FILES = {
   "/icons/icon-512.png": { body: icon512, type: "image/png", cache: "public, max-age=300" },
   "/icons/icon-192-maskable.png": { body: icon192Maskable, type: "image/png", cache: "public, max-age=300" },
   "/icons/icon-512-maskable.png": { body: icon512Maskable, type: "image/png", cache: "public, max-age=300" },
-  "/book.js": { body: bookJs, type: "text/javascript; charset=utf-8", cache: "no-store" }
+  "/book.js": { body: bookJs, type: "text/javascript; charset=utf-8", cache: "no-store" },
+  "/book-qr.js": { body: bookQrJs, type: "text/javascript; charset=utf-8", cache: "no-cache" },
+  "/book-qr.css": { body: bookQrCss, type: "text/css; charset=utf-8", cache: "no-cache" }
 };
 function assetTag(s) {
   let h = 0;
@@ -4519,6 +4525,38 @@ async function serveBookingIcon(env, slug, spec) {
   return new Response(body, { status: 200, headers: securityHeaders("image/png", "public, max-age=300") });
 }
 __name(serveBookingIcon, "serveBookingIcon");
+var BOOK_QR_TAG = assetTag(bookQrJs + bookQrCss);
+function qrNotFound() {
+  return new Response(qrUnavailableHtml(), { status: 404, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+}
+__name(qrNotFound, "qrNotFound");
+async function serveBookingQr(env, slug, rest, url) {
+  if (rest === "/qr") {
+    return new Response(null, { status: 308, headers: securityHeaders("text/plain; charset=utf-8", "no-store", { Location: "/book/" + slug + "/qr/" + url.search }) });
+  }
+  // Unknown and suspended companies get the same 404 (their booking page shows "not available").
+  const company = await publicBookingCompany(env, slug);
+  if (!company) return rest === "/qr/" ? qrNotFound() : new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
+  const companyName = publicCompanyName(company);
+  const bookingUrl = bookingUrlFor(url.origin, slug);
+  const logoDataUrl = company.logo_data_url || "";
+  if (rest === "/qr/") {
+    const html = qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl, assetTag: BOOK_QR_TAG });
+    return new Response(html, { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+  }
+  if (rest === "/qr.svg") {
+    return new Response(qrSvg(bookingUrl, { logoDataUrl, title: companyName + " booking link: " + bookingUrl }), { status: 200, headers: securityHeaders("image/svg+xml; charset=utf-8", "public, max-age=300") });
+  }
+  if (rest === "/qr.png") {
+    const png = await qrPng(bookingUrl, { logoDataUrl });
+    return new Response(png, { status: 200, headers: securityHeaders("image/png", "public, max-age=300") });
+  }
+  if (rest === "/qr/manifest.webmanifest") {
+    return new Response(JSON.stringify(qrManifest(slug, companyName)), { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
+  }
+  return new Response(bookQrSwJs, { status: 200, headers: securityHeaders("text/javascript; charset=utf-8", "no-store") });
+}
+__name(serveBookingQr, "serveBookingQr");
 async function serveBookingAsset(request, env, slug, rest, url) {
   const method = request.method;
   if (method !== "GET" && method !== "HEAD") {
@@ -4534,6 +4572,9 @@ async function serveBookingAsset(request, env, slug, rest, url) {
     return new Response(bookPageHtml(companyName), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/manifest.webmanifest") return serveBookingManifest(env, slug);
+  if (rest === "/qr" || rest === "/qr/" || rest === "/qr.png" || rest === "/qr.svg" || rest === "/qr/manifest.webmanifest" || rest === "/qr/sw.js") {
+    return serveBookingQr(env, slug, rest, url);
+  }
   if (rest === "/sw.js") {
     const company = await publicBookingCompany(env, slug);
     if (!company) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });

@@ -1,0 +1,93 @@
+// /book/<slug>/qr/ page: Share (with the QR PNG where the browser can share files), Save image, copy fallback.
+(function () {
+  "use strict";
+  var body = document.body;
+  var url = body.getAttribute("data-url") || location.href;
+  var name = body.getAttribute("data-name") || "";
+  var fileName = body.getAttribute("data-file") || "booking-qr.png";
+  var pngUrl = body.getAttribute("data-png") || "";
+  var swUrl = body.getAttribute("data-sw") || "";
+  var note = document.getElementById("qrNote");
+  var shareBtn = document.getElementById("qrShare");
+  var pngFile = null;
+
+  function say(text) {
+    if (note) note.textContent = text;
+  }
+
+  // Fetch the PNG up front: iOS Safari only allows navigator.share() right after the tap,
+  // so there is no time to download the image inside the click handler.
+  if (pngUrl && typeof File === "function" && window.fetch) {
+    fetch(pngUrl).then(function (r) {
+      if (!r.ok) throw new Error("png");
+      return r.blob();
+    }).then(function (blob) {
+      try {
+        pngFile = new File([blob], fileName, { type: "image/png" });
+      } catch (e) {
+        pngFile = null;
+      }
+    }).catch(function () {});
+  }
+
+  function copyLink() {
+    function fallback() {
+      var input = document.createElement("textarea");
+      input.value = url;
+      input.setAttribute("readonly", "");
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.appendChild(input);
+      input.select();
+      var ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch (e) {
+        ok = false;
+      }
+      document.body.removeChild(input);
+      say(ok ? "Link copied." : "Copy this link: " + url);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () { say("Link copied."); }, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  var text = "Book a ride with " + name + ": " + url;
+  if (shareBtn) {
+    if (!navigator.share) shareBtn.textContent = "Copy link";
+    shareBtn.addEventListener("click", function () {
+      say("");
+      if (!navigator.share) return copyLink();
+      var data = { title: name, text: text, url: url };
+      if (pngFile && navigator.canShare) {
+        // With a file, put the link in the text only: several share targets drop the image when url is also set.
+        var withFile = { title: name, text: text, files: [pngFile] };
+        var canFiles = false;
+        try {
+          canFiles = navigator.canShare(withFile);
+        } catch (e) {
+          canFiles = false;
+        }
+        if (canFiles) data = withFile;
+      }
+      navigator.share(data).catch(function (err) {
+        if (err && err.name === "AbortError") return;
+        if (data.files) {
+          navigator.share({ title: name, text: text, url: url }).catch(function (e2) {
+            if (e2 && e2.name === "AbortError") return;
+            copyLink();
+          });
+          return;
+        }
+        copyLink();
+      });
+    });
+  }
+
+  if (swUrl && "serviceWorker" in navigator && location.protocol === "https:") {
+    navigator.serviceWorker.register(swUrl).catch(function () {});
+  }
+})();

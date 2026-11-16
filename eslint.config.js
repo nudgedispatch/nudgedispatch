@@ -14,6 +14,7 @@ export default [
       "app/drivers.js",
       "app/progress-nav.js",
       "app/booking-shell.js",
+      "app/booking-qr.js",
       "app/stops.js",
       "app/schedules.js",
       "test/**/*.js",
@@ -31,6 +32,7 @@ export default [
         URL: "readonly",
         TextEncoder: "readonly",
         setTimeout: "readonly",
+        atob: "readonly",
       },
     },
     rules: {
