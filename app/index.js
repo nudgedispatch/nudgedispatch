@@ -1229,7 +1229,9 @@ function accessJson(user) {
 }
 __name(accessJson, "accessJson");
 // While billing has paused a company, these still work so the app can show the locked page and the owner can take their data.
-var LOCKED_ALLOWED = new Set(["/api/trial", "/api/billing", "/api/export/rides.csv", "/api/export/clients.csv"]);
+var LOCKED_ALLOWED = new Set(["/api/trial", "/api/billing", "/api/billing/payment-method", "/api/export/rides.csv", "/api/export/clients.csv"]);
+// A paused owner can still fix billing: open the portal, add/update a card, and pay the open invoice.
+var LOCKED_POST_ALLOWED = new Set(["/api/billing/portal", "/api/billing/payment-method/session", "/api/billing/payment-method/confirm", "/api/billing/pay-invoice"]);
 function billingLockedResponse(user) {
   return json({ ok: false, error: lockedMessage(user.access, user.role), billingLocked: true, lockedView: lockedView(user.access, user.role) }, 403);
 }
@@ -2145,6 +2147,8 @@ async function handleApi(request, env) {
     if (platformSms && method === "POST") return platformSmsChange(request, env, platformSms[1]);
     const platformSub = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/subscription$/.exec(path);
     if (platformSub && method === "POST") return platformStartSubscription(request, env, platformSub[1]);
+    const platformSetupFee = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/setup-fee$/.exec(path);
+    if (platformSetupFee && method === "POST") return platformSetupFeeChange(request, env, platformSetupFee[1]);
     if (path === "/api/platform/billing" && method === "GET") return platformBillingStatus(request, env);
     if (path === "/api/platform/billing/sms-meter" && method === "POST") return platformSetupSmsMeter(request, env);
     if (path === "/api/invites/peek" && method === "POST") return peekInvite(request, env);
@@ -2153,6 +2157,10 @@ async function handleApi(request, env) {
     if (rideText && method === "POST") return postRideText(request, env, rideText[1]);
     if (path === "/api/billing" && method === "GET") return ownerBilling(request, env);
     if (path === "/api/billing/portal" && method === "POST") return billingPortal(request, env);
+    if (path === "/api/billing/payment-method" && method === "GET") return ownerPaymentMethod(request, env);
+    if (path === "/api/billing/payment-method/session" && method === "POST") return ownerCardSession(request, env);
+    if (path === "/api/billing/payment-method/confirm" && method === "POST") return ownerCardConfirm(request, env);
+    if (path === "/api/billing/pay-invoice" && method === "POST") return ownerPayInvoice(request, env);
     if (path === "/api/invites/accept" && method === "POST") return acceptInvite(request, env);
     if (path === "/api/login" && method === "POST") return login(request, env);
     if (path === "/api/logout" && method === "POST") return logout(request, env);
@@ -2437,7 +2445,7 @@ async function platformAccounts(request, env) {
   const user = await platformUser(request, env, false);
   if (isResponse(user)) return user;
   const rows = await env.DB.prepare(
-    `SELECT c.id, c.name, c.kind, c.status, c.created_at, c.billing_plan, c.sms_addon_enabled, c.stripe_customer_id, c.stripe_subscription_id, c.stripe_livemode, c.billing_status, c.billing_paid_through, c.billing_last_paid_at, c.billing_past_due_at, c.billing_event_at, c.billing_updated_at,
+    `SELECT c.id, c.name, c.kind, c.status, c.created_at, c.billing_plan, c.sms_addon_enabled, c.stripe_customer_id, c.stripe_subscription_id, c.stripe_livemode, c.billing_status, c.billing_paid_through, c.billing_last_paid_at, c.billing_past_due_at, c.billing_event_at, c.billing_updated_at, c.setup_fee, c.pm_brand, c.pm_last4, c.pm_exp_month, c.pm_exp_year,
             (SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id
               WHERE m.company_id = c.id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1) AS owner_email,
             (SELECT COUNT(*) FROM memberships m LEFT JOIN drivers d ON d.user_id = m.user_id AND d.company_id = m.company_id WHERE m.company_id = c.id AND m.role = 'driver' AND d.deleted_at IS NULL) AS driver_count,
@@ -2584,7 +2592,7 @@ async function driverCountFor(env, companyId) {
 __name(driverCountFor, "driverCountFor");
 async function billingRow(env, id) {
   return env.DB.prepare(
-    `SELECT id, name, kind, billing_plan, sms_addon_enabled, sms_setup_billed_at, stripe_customer_id, stripe_subscription_id, stripe_livemode, billing_status, billing_paid_through, billing_last_paid_at FROM companies WHERE id = ?`
+    `SELECT id, name, kind, billing_plan, sms_addon_enabled, sms_setup_billed_at, stripe_customer_id, stripe_subscription_id, stripe_livemode, billing_status, billing_paid_through, billing_last_paid_at, setup_fee, pm_brand, pm_last4, pm_exp_month, pm_exp_year FROM companies WHERE id = ?`
   ).bind(id).first();
 }
 __name(billingRow, "billingRow");
@@ -2634,6 +2642,161 @@ async function billingPortal(request, env) {
   }
 }
 __name(billingPortal, "billingPortal");
+// ---- Client payment method (Jesse, Nov 16, 2026). Card details are entered on Stripe-hosted pages and
+// stored only by Stripe. D1 keeps brand, last 4, and expiry for display. Owner only, company-scoped. ----
+const BILLING_NOT_STARTED = "Billing not started yet. Your Nudge Dispatch contact starts it when your plan begins.";
+function openInvoiceJson(inv) {
+  if (!inv || typeof inv !== "object" || inv.status !== "open") return null;
+  const url = typeof inv.hosted_invoice_url === "string" && /^https:\/\/invoice\.stripe\.com\//.test(inv.hosted_invoice_url) ? inv.hosted_invoice_url : "";
+  return { id: inv.id, amountDue: Number(inv.amount_due) || 0, currency: inv.currency || "usd", url };
+}
+__name(openInvoiceJson, "openInvoiceJson");
+async function saveCardSummary(env, companyId, summary) {
+  await env.DB.prepare("UPDATE companies SET pm_brand = ?, pm_last4 = ?, pm_exp_month = ?, pm_exp_year = ?, pm_updated_at = ? WHERE id = ?")
+    .bind(summary ? summary.brand : null, summary ? summary.last4 : null, summary ? summary.expMonth : null, summary ? summary.expYear : null, Date.now(), companyId).run();
+}
+__name(saveCardSummary, "saveCardSummary");
+// Reads the default card and the open invoice from Stripe, refreshes the D1 summary.
+async function syncCompanyCard(env, row) {
+  const customer = await stripe(env, "GET", "/v1/customers/" + encodeURIComponent(row.stripe_customer_id), { expand: ["invoice_settings.default_payment_method"] });
+  let pm = customer && !customer.deleted && customer.invoice_settings ? customer.invoice_settings.default_payment_method : null;
+  let sub = null;
+  if (row.stripe_subscription_id) {
+    sub = await stripe(env, "GET", "/v1/subscriptions/" + encodeURIComponent(row.stripe_subscription_id), { expand: ["default_payment_method", "latest_invoice"] });
+    if ((!pm || typeof pm !== "object") && sub && sub.default_payment_method && typeof sub.default_payment_method === "object") pm = sub.default_payment_method;
+  }
+  const summary = cardSummary(pm && typeof pm === "object" ? pm : null);
+  await saveCardSummary(env, row.id, summary);
+  const live = sub && !["canceled", "incomplete_expired"].includes(sub.status);
+  return { paymentMethod: summary, openInvoice: live ? openInvoiceJson(sub.latest_invoice) : null, subscriptionStatus: (sub && sub.status) || "" };
+}
+__name(syncCompanyCard, "syncCompanyCard");
+// Make a SetupIntent's card the default for the customer's invoices and the current subscription.
+async function useCardForCompany(env, row, pm) {
+  const pmId = typeof pm === "string" ? pm : pm && pm.id;
+  if (!pmId || !/^pm_[A-Za-z0-9]+$/.test(pmId)) throw new StripeError(502, "Stripe did not return a card.");
+  await stripe(env, "POST", "/v1/customers/" + encodeURIComponent(row.stripe_customer_id), { invoice_settings: { default_payment_method: pmId } }, `nudge-card-cus-${row.id}-${pmId}`);
+  if (row.stripe_subscription_id) {
+    const sub = await liveSubscription(env, row.stripe_subscription_id);
+    if (sub) await stripe(env, "POST", "/v1/subscriptions/" + encodeURIComponent(sub.id), { default_payment_method: pmId }, `nudge-card-sub-${row.id}-${pmId}`);
+  }
+  const full = pm && typeof pm === "object" && pm.card ? pm : await stripe(env, "GET", "/v1/payment_methods/" + encodeURIComponent(pmId));
+  const summary = cardSummary(full);
+  await saveCardSummary(env, row.id, summary);
+  return summary;
+}
+__name(useCardForCompany, "useCardForCompany");
+// "" when the Checkout Session is a finished card setup for this company's Stripe customer.
+function setupSessionProblem(session, row) {
+  if (!session || session.object !== "checkout.session") return "Stripe did not return the card setup.";
+  const customer = typeof session.customer === "string" ? session.customer : session.customer && session.customer.id;
+  if (!customer || customer !== row.stripe_customer_id) return "That card setup belongs to a different billing account.";
+  if (session.mode !== "setup") return "That Stripe page was not a card setup.";
+  if (session.status !== "complete") return "The card was not saved. Try again.";
+  const si = session.setup_intent;
+  if (!si || typeof si !== "object" || si.status !== "succeeded") return "Stripe has not confirmed the card yet. Try again in a moment.";
+  return "";
+}
+__name(setupSessionProblem, "setupSessionProblem");
+async function ownerBillingCompany(request, env, mutate) {
+  const user = await authed(request, env, mutate);
+  if (isResponse(user)) return { response: user };
+  const denied = ownerOnly(user);
+  if (denied) return { response: denied };
+  const row = await billingRow(env, user.companyId);
+  if (!row) return { response: fail(404, "Not found.") };
+  return { user, row };
+}
+__name(ownerBillingCompany, "ownerBillingCompany");
+async function ownerPaymentMethod(request, env) {
+  const { response, row } = await ownerBillingCompany(request, env, false);
+  if (response) return response;
+  if (!row.stripe_customer_id) return json({ ok: true, started: false, message: BILLING_NOT_STARTED, paymentMethod: null, openInvoice: null });
+  const base = { ok: true, started: true, livemode: Number(row.stripe_livemode) === 1, billingStatus: row.billing_status || "" };
+  if (stripeKeyProblem(env)) return json({ ...base, paymentMethod: paymentMethodJson(row), openInvoice: null, stale: true });
+  try {
+    const synced = await syncCompanyCard(env, row);
+    return json({ ...base, ...synced });
+  } catch (error) {
+    if (error instanceof StripeError) return json({ ...base, paymentMethod: paymentMethodJson(row), openInvoice: null, stale: true });
+    throw error;
+  }
+}
+__name(ownerPaymentMethod, "ownerPaymentMethod");
+async function ownerCardSession(request, env) {
+  const { response, user, row } = await ownerBillingCompany(request, env, true);
+  if (response) return response;
+  if (!row.stripe_customer_id) return fail(409, BILLING_NOT_STARTED);
+  if (stripeKeyProblem(env)) return fail(503, "Billing is not available right now. Email nudgedispatch@gmail.com.");
+  const origin = new URL(request.url).origin;
+  try {
+    const session = await stripe(env, "POST", "/v1/checkout/sessions", {
+      mode: "setup",
+      customer: row.stripe_customer_id,
+      currency: "usd",
+      payment_method_types: ["card"],
+      success_url: origin + "/?card_session={CHECKOUT_SESSION_ID}#/settings",
+      cancel_url: origin + "/#/settings",
+      metadata: { app: "nudge-dispatch", company_id: row.id, purpose: "card" },
+      setup_intent_data: { metadata: { app: "nudge-dispatch", company_id: row.id } }
+    });
+    if (!session.url || !/^https:\/\/checkout\.stripe\.com\//.test(session.url)) return fail(502, "Stripe did not return a card page.");
+    await writeAudit(env, user.userId, "billing.card_session", "company", row.id, { mode: stripeModeWord(env) });
+    return json({ ok: true, url: session.url });
+  } catch (error) {
+    if (error instanceof StripeError) return fail(502, "Could not open the secure card page. Try again, or email nudgedispatch@gmail.com.");
+    throw error;
+  }
+}
+__name(ownerCardSession, "ownerCardSession");
+async function ownerCardConfirm(request, env) {
+  const { response, user, row } = await ownerBillingCompany(request, env, true);
+  if (response) return response;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+  if (!/^cs_(test|live)_[A-Za-z0-9]{10,200}$/.test(sessionId)) return fail(400, "That card setup link is not valid.");
+  if (!row.stripe_customer_id) return fail(409, BILLING_NOT_STARTED);
+  if (stripeKeyProblem(env)) return fail(503, "Billing is not available right now. Email nudgedispatch@gmail.com.");
+  try {
+    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(sessionId), { expand: ["setup_intent.payment_method"] });
+    const problem = setupSessionProblem(session, row);
+    if (problem) return fail(409, problem);
+    const summary = await useCardForCompany(env, row, session.setup_intent.payment_method);
+    await writeAudit(env, user.userId, "billing.card_saved", "company", row.id, { brand: summary ? summary.brand : "", last4: summary ? summary.last4 : "", mode: stripeModeWord(env) });
+    const synced = await syncCompanyCard(env, await billingRow(env, row.id));
+    return json({ ok: true, started: true, ...synced, paymentMethod: synced.paymentMethod || summary });
+  } catch (error) {
+    if (error instanceof StripeError) return fail(502, "Stripe could not save the card. Try again, or email nudgedispatch@gmail.com.");
+    throw error;
+  }
+}
+__name(ownerCardConfirm, "ownerCardConfirm");
+// Owner pays the open invoice (e.g. the first one) with the card on file. Explicit tap only.
+async function ownerPayInvoice(request, env) {
+  const { response, user, row } = await ownerBillingCompany(request, env, true);
+  if (response) return response;
+  if (!row.stripe_customer_id || !row.stripe_subscription_id) return fail(409, BILLING_NOT_STARTED);
+  if (stripeKeyProblem(env)) return fail(503, "Billing is not available right now. Email nudgedispatch@gmail.com.");
+  try {
+    const synced = await syncCompanyCard(env, row);
+    if (!synced.openInvoice) return fail(409, "There is no unpaid invoice right now.");
+    if (!synced.paymentMethod) return fail(409, "Add a card first.");
+    const inv = synced.openInvoice;
+    const paid = await stripe(env, "POST", "/v1/invoices/" + encodeURIComponent(inv.id) + "/pay", {}, `nudge-pay-${inv.id}-${Math.floor(Date.now() / 60000)}`);
+    await writeAudit(env, user.userId, "billing.pay_invoice", "company", row.id, { invoice: inv.id, amount: inv.amountDue, status: paid.status || "", mode: stripeModeWord(env) });
+    if (paid.status !== "paid") return fail(402, "The payment did not go through. Try another card, or use the secure Stripe invoice page.");
+    return json({ ok: true, paid: true, amountPaid: Number(paid.amount_paid) || inv.amountDue, paymentMethod: synced.paymentMethod });
+  } catch (error) {
+    if (error instanceof StripeError) {
+      await writeAudit(env, user.userId, "billing.pay_invoice", "company", row.id, { status: "failed", http: error.status, mode: stripeModeWord(env) });
+      // Card errors (402) carry Stripe's customer-safe decline message.
+      return fail(error.status === 402 ? 402 : 502, error.status === 402 ? error.message : "Stripe could not take the payment. Try again, or email nudgedispatch@gmail.com.");
+    }
+    throw error;
+  }
+}
+__name(ownerPayInvoice, "ownerPayInvoice");
 // Authenticated self-check (signed with the webhook secret, so only Stripe's signer or we can call it). Reports classes only, never values.
 async function stripeSelfCheck(env) {
   const key = typeof env.STRIPE_SECRET_KEY === "string" ? env.STRIPE_SECRET_KEY : "";
@@ -2675,6 +2838,7 @@ async function platformSmsChange(request, env, id) {
   const row = await billingRow(env, id);
   if (!row) return fail(404, "No company with that id.");
   const plan = planOf(row);
+  const setupFee = setupFeeOf(row);
   const enabled = body.enabled;
   if (enabled && !smsAllowed(plan)) return fail(400, "The texting add-on is for Small fleet and Fleet plans only.");
   if (enabled && !payingNow(row)) return fail(409, SMS_NOT_PAYING_NOTE);
@@ -2686,9 +2850,19 @@ async function platformSmsChange(request, env, id) {
       const sub = await liveSubscription(env, row.stripe_subscription_id);
       if (sub && sub.status === "incomplete") return fail(409, "The first invoice on this Stripe " + stripeModeWord(env) + " subscription is not paid yet, so Stripe won't allow line-item changes. Pay it (or let it expire) and try again.");
       if (sub) {
-        const prices = await pricesByLookup(env, smsLookupKeys());
+        const catalog = await pricesWithProducts(env, smsLookupKeys());
+        const prices = catalog.ids;
         const missing = smsLookupKeys().filter((k) => !prices[k]);
         if (enabled && missing.length) return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing texting prices: " + missing.join(", ") + ". Use \"Set up texting meter\" first.");
+        // Texting setup fee follows the company's setup-fee choice. Checked before any Stripe change.
+        let smsSetupPromoId = "";
+        if (enabled && !setupBilledAt && setupPromoCode(setupFee)) {
+          const code = setupPromoCode(setupFee);
+          const promo = await findPromotion(env, code);
+          if (!promo) return fail(409, "Promotion code " + code + " was not found in Stripe " + stripeModeWord(env) + " mode, so texting was not turned on. Fix it in Stripe or change this company's setup fee.");
+          if (!couponCoversProduct(promo.coupon, catalog.products[LOOKUP.sms.setup])) return fail(409, "Promotion code " + code + " in Stripe " + stripeModeWord(env) + " mode does not cover the texting setup fee, so texting was not turned on. Change this company's setup fee or the coupon in Stripe.");
+          smsSetupPromoId = promo.id;
+        }
         const smsPriceIds = [prices[LOOKUP.sms.monthly], prices[LOOKUP.sms.overage]].filter(Boolean);
         const items = (sub.items && sub.items.data) || [];
         const present = items.filter((it) => smsPriceIds.includes(it.price && it.price.id));
@@ -2701,7 +2875,7 @@ async function platformSmsChange(request, env, id) {
           }
           if (!setupBilledAt) {
             // $75 one-time: pending invoice item on the same subscription, so it lands on the next invoice.
-            await stripe(env, "POST", "/v1/invoiceitems", { customer: sub.customer, subscription: sub.id, pricing: { price: prices[LOOKUP.sms.setup] }, metadata: { app: "nudge-dispatch", company_id: row.id } }, `sms-setup-${row.id}`);
+            await stripe(env, "POST", "/v1/invoiceitems", smsSetupInvoiceItem(sub.customer, sub.id, prices[LOOKUP.sms.setup], row.id, smsSetupPromoId), `sms-setup-${row.id}`);
             setupBilledAt = now;
           }
           stripeNote = "Texting items added to the Stripe " + stripeModeWord(env) + " subscription.";
@@ -2720,7 +2894,7 @@ async function platformSmsChange(request, env, id) {
   }
   await env.DB.prepare("UPDATE companies SET sms_addon_enabled = ?, sms_addon_updated_at = ?, sms_setup_billed_at = ?, billing_updated_at = ? WHERE id = ?")
     .bind(enabled ? 1 : 0, now, setupBilledAt, now, id).run();
-  await writeAudit(env, user.userId, enabled ? "sms.on" : "sms.off", "company", id, { name: row.name, plan, stripe: row.stripe_subscription_id ? "synced" : "none" });
+  await writeAudit(env, user.userId, enabled ? "sms.on" : "sms.off", "company", id, { name: row.name, plan, setup_fee: setupFee, stripe: row.stripe_subscription_id ? "synced" : "none" });
   const fresh = await billingRow(env, id);
   return json({ ok: true, id, billing: billingJson(fresh, await driverCountFor(env, id)), note: stripeNote });
 }
@@ -2737,19 +2911,23 @@ async function platformStartSubscription(request, env, id) {
   const plan = planOf(row);
   // Texting is added only after the customer is paying, so a new subscription never includes it.
   const sms = false;
-  const beta = body.beta === true;
+  const setupFee = setupFeeFromBody(body, row);
+  if (!setupFee) return fail(400, "Setup fee must be free, charge, or beta.");
   try {
     if (await liveSubscription(env, row.stripe_subscription_id)) return fail(409, "This company already has a Stripe " + stripeModeWord(env) + " subscription.");
     const L = LOOKUP[plan];
-    const prices = await pricesByLookup(env, [L.base, L.extra, L.setup, ...(sms ? smsLookupKeys() : [])]);
+    const catalog = await pricesWithProducts(env, [L.base, L.extra, L.setup, ...(sms ? smsLookupKeys() : [])]);
+    const prices = catalog.ids;
     let promoId = "";
-    if (beta) {
-      const promos = await stripe(env, "GET", "/v1/promotion_codes", { code: BETA_PROMO_CODE, active: true, limit: 1 });
-      promoId = (promos.data && promos.data[0] && promos.data[0].id) || "";
-      if (!promoId) return fail(409, "Promotion code " + BETA_PROMO_CODE + " was not found in Stripe " + stripeModeWord(env) + " mode.");
+    const code = setupPromoCode(setupFee);
+    if (code) {
+      const promo = await findPromotion(env, code);
+      if (!promo) return fail(409, "Promotion code " + code + " was not found in Stripe " + stripeModeWord(env) + " mode.");
+      if (prices[L.setup] && !couponCoversProduct(promo.coupon, catalog.products[L.setup])) return fail(409, "Promotion code " + code + " in Stripe " + stripeModeWord(env) + " mode does not cover the " + PLAN_LABELS[plan] + " setup fee.");
+      promoId = promo.id;
     }
     const drivers = await driverCountFor(env, id);
-    const built = subscriptionPlanItems(plan, drivers, sms, prices, beta, promoId);
+    const built = subscriptionPlanItems(plan, drivers, sms, prices, setupFee, promoId);
     if (built.missing.length) return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing prices: " + built.missing.join(", ") + (sms ? ". If it is the texting overage, use \"Set up texting meter\" first." : "."));
     let customerId = row.stripe_customer_id;
     if (!customerId) {
@@ -2763,21 +2941,39 @@ async function platformStartSubscription(request, env, id) {
       collection_method: "charge_automatically",
       payment_behavior: "default_incomplete",
       payment_settings: { save_default_payment_method: "on_subscription" },
-      metadata: { app: "nudge-dispatch", company_id: row.id, plan, sms: sms ? "on" : "off" },
+      metadata: { app: "nudge-dispatch", company_id: row.id, plan, sms: sms ? "on" : "off", setup_fee: setupFee },
       expand: ["latest_invoice"]
     }, `nudge-sub-${row.id}-${Date.now()}`);
     const now = Date.now();
     const liveFlag = stripeKeyMode(env) === "live" ? 1 : 0;
-    await env.DB.prepare("UPDATE companies SET stripe_customer_id = ?, stripe_subscription_id = ?, stripe_livemode = ?, billing_updated_at = ?, sms_setup_billed_at = COALESCE(sms_setup_billed_at, ?), billing_status = ?, billing_past_due_at = NULL, sms_addon_enabled = 0 WHERE id = ?")
-      .bind(customerId, sub.id, liveFlag, now, sms ? now : null, subStatusToBilling(sub.status) || "incomplete", id).run();
-    await writeAudit(env, user.userId, "billing.subscribe", "company", id, { name: row.name, plan, sms: sms ? "on" : "off", beta: beta ? "yes" : "no", mode: stripeModeWord(env) });
+    await env.DB.prepare("UPDATE companies SET stripe_customer_id = ?, stripe_subscription_id = ?, stripe_livemode = ?, billing_updated_at = ?, sms_setup_billed_at = COALESCE(sms_setup_billed_at, ?), billing_status = ?, billing_past_due_at = NULL, sms_addon_enabled = 0, setup_fee = ? WHERE id = ?")
+      .bind(customerId, sub.id, liveFlag, now, sms ? now : null, subStatusToBilling(sub.status) || "incomplete", setupFee, id).run();
+    await writeAudit(env, user.userId, "billing.subscribe", "company", id, { name: row.name, plan, sms: sms ? "on" : "off", setup_fee: setupFee, mode: stripeModeWord(env) });
     const inv = sub.latest_invoice && typeof sub.latest_invoice === "object" ? sub.latest_invoice : null;
-    return json({ ok: true, id, subscriptionId: sub.id, status: sub.status, invoiceUrl: (inv && inv.hosted_invoice_url) || "", amountDue: inv ? inv.amount_due : null, testMode: liveFlag === 0 }, 201);
+    return json({ ok: true, id, setupFee, subscriptionId: sub.id, status: sub.status, invoiceUrl: (inv && inv.hosted_invoice_url) || "", amountDue: inv ? inv.amount_due : null, testMode: liveFlag === 0 }, 201);
   } catch (error) {
     return stripeFail(env, error);
   }
 }
 __name(platformStartSubscription, "platformStartSubscription");
+// Change a company's setup-fee choice. Only affects setup fees billed after the change
+// (the plan setup at subscription start, and the texting setup fee when texting is first turned on).
+async function platformSetupFeeChange(request, env, id) {
+  const user = await platformUser(request, env, true);
+  if (isResponse(user)) return user;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const setupFee = normSetupFee(body.setupFee);
+  if (!setupFee) return fail(400, "Setup fee must be free, charge, or beta.");
+  const row = await billingRow(env, id);
+  if (!row) return fail(404, "No company with that id.");
+  const before = setupFeeOf(row);
+  await env.DB.prepare("UPDATE companies SET setup_fee = ?, billing_updated_at = ? WHERE id = ?").bind(setupFee, Date.now(), id).run();
+  await writeAudit(env, user.userId, "billing.setup_fee", "company", id, { name: row.name, setup_fee: setupFee, before });
+  const fresh = await billingRow(env, id);
+  return json({ ok: true, id, billing: billingJson(fresh, await driverCountFor(env, id)) });
+}
+__name(platformSetupFeeChange, "platformSetupFeeChange");
 // One-time catalog step: Stripe meters can't be made from the connector, so the app makes the
 // texting meter + the $0.03/text-after-500 metered price itself. Idempotent. Lookup keys match live.
 async function platformSetupSmsMeter(request, env) {
@@ -2939,6 +3135,16 @@ async function applyStripeEvent(env, event) {
   if (refs.subscription && company.stripe_subscription_id && refs.subscription !== company.stripe_subscription_id) return { companyId: company.id, result: "ignored: not the current subscription" };
   const livemode = event.livemode === true ? 1 : 0;
   await env.DB.prepare("UPDATE companies SET stripe_livemode = ? WHERE id = ?").bind(livemode, company.id).run();
+  if (event.type === "checkout.session.completed") {
+    // Card added on Stripe Checkout (setup mode). The return page usually saves it first; this covers a closed tab.
+    if (!obj || obj.mode !== "setup") return { companyId: company.id, result: "ignored: not a card setup" };
+    const row = await billingRow(env, company.id);
+    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(obj.id), { expand: ["setup_intent.payment_method"] });
+    const problem = setupSessionProblem(session, row);
+    if (problem) return { companyId: company.id, result: "ignored: " + problem };
+    const summary = await useCardForCompany(env, row, session.setup_intent.payment_method);
+    return { companyId: company.id, result: summary ? "card saved" : "card saved (no card details)" };
+  }
   const createdMs = Number(event.created || 0) * 1000;
   const stale = company.billing_event_at && createdMs && createdMs < company.billing_event_at;
   const now = Date.now();
@@ -3148,7 +3354,7 @@ async function authed(request, env, mutate) {
   if (user.platformAdmin) return fail(404, "Not found.");
   if (user.access && user.access.locked) {
     const path = new URL(request.url).pathname;
-    const allowed = (request.method === "GET" && LOCKED_ALLOWED.has(path)) || (request.method === "POST" && path === "/api/billing/portal");
+    const allowed = (request.method === "GET" && LOCKED_ALLOWED.has(path)) || (request.method === "POST" && LOCKED_POST_ALLOWED.has(path));
     if (!allowed) return billingLockedResponse(user);
   }
   if (mutate) {
@@ -4430,7 +4636,7 @@ import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml 
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
 import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, BETA_SPOTS } from "./trial.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
-import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
+import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { meetingPointForArrived } from "./progress-nav.js";

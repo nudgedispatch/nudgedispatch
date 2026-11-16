@@ -68,6 +68,7 @@ test("live keys are accepted only with STRIPE_MODE=live, and mismatches are refu
     "invoice.payment_failed",
     "customer.subscription.updated",
     "customer.subscription.deleted",
+    "checkout.session.completed",
   ]);
   assert.equal(SMS_METER_EVENT, "nudge_sms_text");
   assert.equal(LOOKUP.sms.monthly, "nudge_sms_monthly");

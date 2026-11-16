@@ -2,7 +2,7 @@
 // Pure functions + Web Crypto; no Stripe SDK. Tolerance 5 minutes.
 
 export const WEBHOOK_TOLERANCE_SEC = 300;
-export const HANDLED_EVENTS = ["invoice.paid", "invoice.payment_succeeded", "invoice.payment_failed", "customer.subscription.updated", "customer.subscription.deleted"];
+export const HANDLED_EVENTS = ["invoice.paid", "invoice.payment_succeeded", "invoice.payment_failed", "customer.subscription.updated", "customer.subscription.deleted", "checkout.session.completed"];
 
 export function parseSigHeader(header) {
   const out = { t: null, v1: [] };

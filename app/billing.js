@@ -15,6 +15,55 @@ export const LOOKUP = {
   sms: { monthly: "nudge_sms_monthly", overage: "nudge_sms_overage_metered", setup: "nudge_sms_setup" }
 };
 export const BETA_PROMO_CODE = "BETA50";
+export const FREE_SETUP_PROMO_CODE = "FREESETUP";
+
+// Setup-fee choice per company (Jesse, Nov 16, 2026): only clients flagged as paying are charged setup.
+// free = FREESETUP (100% off setup, default), charge = full setup fee, beta = BETA50 (50% off setup).
+// Applies to the plan setup fee and, later, the texting setup fee. Monthly prices are never discounted.
+export const SETUP_FEE_CHOICES = ["free", "charge", "beta"];
+export const SETUP_FEE_LABELS = { free: "Free setup (FREESETUP)", charge: "Charge setup fee", beta: "Beta tester, 50% off setup (BETA50)" };
+export const SETUP_FEE_PROMO = { free: FREE_SETUP_PROMO_CODE, charge: "", beta: BETA_PROMO_CODE };
+
+// "" when the value is not a valid choice. Legacy start-subscription bodies sent beta: true.
+export function normSetupFee(value) {
+  const v = String(value == null ? "" : value).toLowerCase().trim();
+  return SETUP_FEE_CHOICES.includes(v) ? v : "";
+}
+export function setupFeeOf(company) {
+  return normSetupFee(company && company.setup_fee) || "free";
+}
+// Body choice wins, then legacy beta === true, then the company's saved choice (default free).
+export function setupFeeFromBody(body, company) {
+  if (body && body.setupFee !== undefined) return normSetupFee(body.setupFee);
+  if (body && body.beta === true) return "beta";
+  return setupFeeOf(company);
+}
+export function setupPromoCode(choice) {
+  return SETUP_FEE_PROMO[normSetupFee(choice)] || "";
+}
+// Does a coupon (with applies_to expanded) cover this product? No restriction = covers everything.
+export function couponCoversProduct(coupon, productId) {
+  if (!coupon || typeof coupon !== "object") return false;
+  const products = coupon.applies_to && Array.isArray(coupon.applies_to.products) ? coupon.applies_to.products : null;
+  if (!products || !products.length) return true;
+  return !!productId && products.includes(productId);
+}
+
+// Card summary kept in D1: brand, last 4, expiry. Never the number, CVC, or anything else.
+export function cardSummary(pm) {
+  const card = pm && typeof pm === "object" && pm.card && typeof pm.card === "object" ? pm.card : null;
+  if (!card) return null;
+  const last4 = /^\d{4}$/.test(String(card.last4 || "")) ? String(card.last4) : "";
+  if (!last4) return null;
+  const brand = String(card.display_brand || card.brand || "card").toLowerCase().replace(/[^a-z0-9_ -]/g, "").slice(0, 24) || "card";
+  const expMonth = Number.isInteger(card.exp_month) && card.exp_month >= 1 && card.exp_month <= 12 ? card.exp_month : null;
+  const expYear = Number.isInteger(card.exp_year) && card.exp_year >= 2000 && card.exp_year <= 2200 ? card.exp_year : null;
+  return { brand, last4, expMonth, expYear };
+}
+export function paymentMethodJson(company) {
+  if (!company || !company.pm_last4) return null;
+  return { brand: company.pm_brand || "card", last4: company.pm_last4, expMonth: company.pm_exp_month || null, expYear: company.pm_exp_year || null };
+}
 export const SMS_METER_EVENT = "nudge_sms_text";
 export const SMS_INCLUDED_TEXTS = 500;
 export const SMS_OVERAGE_CENTS = 3;
@@ -103,7 +152,10 @@ export function billingJson(company, driverCount) {
     billingStatus: (company && company.billing_status) || "",
     paidThrough: (company && company.billing_paid_through) || null,
     lastPaidAt: (company && company.billing_last_paid_at) || null,
-    extraDrivers: extraDrivers(plan, driverCount)
+    extraDrivers: extraDrivers(plan, driverCount),
+    setupFee: setupFeeOf(company),
+    setupFeeLabel: SETUP_FEE_LABELS[setupFeeOf(company)],
+    paymentMethod: paymentMethodJson(company)
   };
 }
 
@@ -251,20 +303,58 @@ export async function pricesByLookup(env, keys) {
   return map;
 }
 
+// Like pricesByLookup, plus each price's product id (for checking a coupon's applies_to).
+export async function pricesWithProducts(env, keys) {
+  const wanted = keys.filter(Boolean);
+  const res = await stripe(env, "GET", "/v1/prices", { "lookup_keys": wanted, active: true, limit: 100 });
+  const ids = {};
+  const products = {};
+  for (const p of res.data || []) {
+    ids[p.lookup_key] = p.id;
+    products[p.lookup_key] = typeof p.product === "string" ? p.product : (p.product && p.product.id) || "";
+  }
+  return { ids, products };
+}
+
+// Active promotion code by its customer-facing code, with its coupon (applies_to expanded). null if missing.
+export async function findPromotion(env, code) {
+  if (!code) return null;
+  const promos = await stripe(env, "GET", "/v1/promotion_codes", { code, active: true, limit: 1 });
+  const promo = promos.data && promos.data[0];
+  if (!promo || !promo.id) return null;
+  const ref = (promo.promotion && promo.promotion.coupon) || promo.coupon;
+  const couponId = typeof ref === "string" ? ref : ref && ref.id;
+  const coupon = couponId ? await stripe(env, "GET", "/v1/coupons/" + encodeURIComponent(couponId), { expand: ["applies_to"] }) : null;
+  return { id: promo.id, code, coupon };
+}
+
+// Pending invoice item for the one-time texting setup fee, discounted per the company's setup-fee choice.
+export function smsSetupInvoiceItem(customer, subscription, priceId, companyId, promoId) {
+  const params = { customer, subscription, pricing: { price: priceId }, metadata: { app: "nudge-dispatch", company_id: companyId } };
+  if (promoId) params.discounts = [{ promotion_code: promoId }];
+  return params;
+}
+
 // Subscription items for a new subscription. Returns { items, addInvoiceItems, missing }.
-export function subscriptionPlanItems(plan, driverCount, sms, prices, beta, promoId) {
+// setupFee: "free" | "charge" | "beta" (legacy: true = beta, false = charge). promoId discounts the setup
+// invoice items only (plan setup, and texting setup when sms is on); monthly items are never discounted.
+export function subscriptionPlanItems(plan, driverCount, sms, prices, setupFee, promoId) {
+  const choice = setupFee === true ? "beta" : setupFee === false ? "charge" : normSetupFee(setupFee) || "free";
+  const discount = choice !== "charge" && promoId ? [{ promotion_code: promoId }] : null;
   const L = LOOKUP[plan];
   const items = [{ price: prices[L.base], quantity: 1 }];
   const extras = extraDrivers(plan, driverCount);
   if (L.extra && extras > 0) items.push({ price: prices[L.extra], quantity: extras });
   const setup = { price: prices[L.setup], quantity: 1 };
-  if (beta && promoId) setup.discounts = [{ promotion_code: promoId }];
+  if (discount) setup.discounts = discount;
   const addInvoiceItems = [setup];
   const withSms = sms && smsAllowed(plan);
   if (withSms) {
     items.push({ price: prices[LOOKUP.sms.monthly], quantity: 1 });
     items.push({ price: prices[LOOKUP.sms.overage] }); // metered: no quantity
-    addInvoiceItems.push({ price: prices[LOOKUP.sms.setup], quantity: 1 });
+    const smsSetup = { price: prices[LOOKUP.sms.setup], quantity: 1 };
+    if (discount) smsSetup.discounts = discount;
+    addInvoiceItems.push(smsSetup);
   }
   const need = [L.base, L.setup, extras > 0 ? L.extra : null, withSms ? LOOKUP.sms.monthly : null, withSms ? LOOKUP.sms.overage : null, withSms ? LOOKUP.sms.setup : null].filter(Boolean);
   const missing = need.filter((k) => !prices[k]);

@@ -150,6 +150,68 @@ document.addEventListener("click", (event) => {
   const button = event.target.closest && event.target.closest("[data-portal]");
   if (button) { event.preventDefault(); openPortal(button); }
 });
+// ---- Client payment method (Nov 16, 2026): card entered on Stripe's page; Nudge keeps brand + last 4 only ----
+const CARD_BRANDS = { visa: "Visa", mastercard: "Mastercard", amex: "American Express", american_express: "American Express", discover: "Discover", diners: "Diners Club", jcb: "JCB", unionpay: "UnionPay", cartes_bancaires: "Cartes Bancaires" };
+function cardLine(pm) {
+  if (!pm) return "";
+  const brand = CARD_BRANDS[pm.brand] || (pm.brand ? pm.brand.charAt(0).toUpperCase() + pm.brand.slice(1) : "Card");
+  const exp = pm.expMonth && pm.expYear ? " · expires " + String(pm.expMonth).padStart(2, "0") + "/" + String(pm.expYear).slice(-2) : "";
+  return brand + " ending in " + pm.last4 + exp;
+}
+function centsText(cents) { return "$" + (cents / 100).toFixed(cents % 100 ? 2 : 0); }
+function paymentCardHtml(r) {
+  if (!r || !r.ok) return `<h2>Payment method</h2><p class="err">${esc((r && r.error) || "Could not load billing.")}</p>`;
+  if (!r.started) return `<h2>Payment method</h2><p class="sub pm-none" data-pm="not-started"><strong>Billing not started yet.</strong></p><p class="sub">${esc(r.message || "")}</p>`;
+  const pm = r.paymentMethod;
+  const inv = r.openInvoice;
+  return `<h2>Payment method</h2>
+    <p class="pm-line" data-pm="${pm ? "card" : "none"}">${pm ? `<span class="pm-brand">${esc(cardLine(pm))}</span>` : `<strong>No card on file.</strong>`}</p>
+    <p class="sub">${pm ? "This card pays your Nudge Dispatch plan automatically each month." : "Add a card so your Nudge Dispatch plan renews automatically."} Card details are entered on Stripe's secure page and kept by Stripe; Nudge only shows the last 4 digits.${r.livemode === false ? " (Stripe test mode.)" : ""}</p>
+    <button class="btn ${pm ? "ghost " : ""}full" type="button" data-card-add>${pm ? "Update card" : "Add card"}</button>
+    ${inv ? `<div class="pm-invoice" data-invoice="open"><p class="sub"><strong>Unpaid invoice: ${esc(centsText(inv.amountDue))}</strong></p>
+      ${pm ? `<button class="btn full" type="button" data-pay-invoice>Pay ${esc(centsText(inv.amountDue))} now with ${esc(cardLine({ ...pm, expMonth: null }))}</button>` : ""}
+      ${inv.url ? `<a class="btn ghost full pm-hosted" href="${esc(inv.url)}" target="_blank" rel="noopener">${pm ? "Pay on Stripe's invoice page instead" : "Pay now on Stripe's secure page"}</a>` : ""}</div>` : ""}
+    ${r.stale ? `<p class="sub">Showing the last saved card; Stripe could not be reached just now.</p>` : ""}
+    <p class="err pm-msg"></p>`;
+}
+async function loadPaymentCard(gen, note) {
+  const card = document.querySelector("#card-card");
+  if (!card) return;
+  const params = new URLSearchParams(location.search);
+  const sessionId = params.get("card_session");
+  let r;
+  if (sessionId) {
+    history.replaceState(null, "", location.pathname + location.hash);
+    r = (await api("/api/billing/payment-method/confirm", { method: "POST", body: { sessionId } })).data;
+    if (r.ok) note = "Card saved.";
+    else { note = r.error || "Could not save the card."; r = null; }
+  }
+  if (!r) r = (await api("/api/billing/payment-method")).data;
+  if (gen !== undefined && gen !== renderGen) return;
+  card.innerHTML = paymentCardHtml(r);
+  if (note) setMsg(card.querySelector(".pm-msg") || card, note, /saved|paid/i.test(note));
+}
+document.addEventListener("click", async (event) => {
+  const add = event.target.closest && event.target.closest("[data-card-add]");
+  const pay = event.target.closest && event.target.closest("[data-pay-invoice]");
+  if (!add && !pay) return;
+  event.preventDefault();
+  const button = add || pay;
+  const msg = document.querySelector("#card-card .pm-msg");
+  button.disabled = true;
+  if (add) {
+    if (msg) { msg.style.color = ""; msg.textContent = "Opening Stripe's secure card page…"; }
+    const r = await api("/api/billing/payment-method/session", { method: "POST", body: {} });
+    if (r.data.ok && r.data.url) { location.href = r.data.url; return; }
+    if (msg) msg.textContent = r.data.error || "Could not open the card page.";
+    button.disabled = false;
+    return;
+  }
+  if (msg) { msg.style.color = ""; msg.textContent = "Paying…"; }
+  const r = await api("/api/billing/pay-invoice", { method: "POST", body: {} });
+  if (!r.data.ok) { if (msg) msg.textContent = r.data.error || "The payment did not go through."; button.disabled = false; return; }
+  await loadPaymentCard(undefined, "Paid " + centsText(r.data.amountPaid) + ". Thank you!");
+});
 function billingBannerHtml() {
   const b = state.me && state.me.access && state.me.access.banner;
   if (!b) return "";
@@ -1186,7 +1248,7 @@ async function renderSettings(gen) {
     const card = document.querySelector("#plan-card");
     if (!card || !b.data.ok) return;
     const x = b.data.billing;
-    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">Update your card or see past invoices on Stripe's secure billing page (${x.livemode ? "live" : "test"} mode).</p>${portalButtonHtml(true)}` : ""}`;
+    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">See past invoices on Stripe's secure billing page (${x.livemode ? "live" : "test"} mode).</p>${portalButtonHtml(true)}` : ""}`;
     card.hidden = false;
   }).catch(() => {});
   box.innerHTML = `<section class="card" id="booking-card">
@@ -1199,6 +1261,7 @@ async function renderSettings(gen) {
       <p class="err" id="booking-copy"></p>
     </section>
     <section class="card" id="plan-card" hidden></section>
+    ${state.me.role === "owner" ? `<section class="card" id="card-card"><h2>Payment method</h2><p class="sub">Loading…</p></section>` : ""}
     <section class="card" id="export-card">
       <h2>Export</h2>
       <p class="sub">Download your rides and clients as spreadsheet files (CSV). This works any time, including after a trial ends.</p>
@@ -1229,6 +1292,7 @@ async function renderSettings(gen) {
     <p class="note">Invoices are never sent by the app. Email and Text on an invoice open your own mail or messages app so you send it yourself.</p>
     <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
     <button class="btn ghost full" id="out" type="button">Sign out</button>`;
+  if (state.me.role === "owner") loadPaymentCard(gen);
   document.querySelector("#f").onsubmit = async (event) => {
     event.preventDefault();
     const body = {
@@ -1344,6 +1408,7 @@ function adminTrialHtml(c) {
     </div>`;
 }
 
+const SETUP_FEE_OPTIONS = [["free", "Free setup (FREESETUP, 100% off)"], ["charge", "Charge setup fee (paying client)"], ["beta", "Beta tester (BETA50, 50% off)"]];
 const BILLING_STATUS_LABEL = { active: "paying (active)", past_due: "payment failed (past due)", canceled: "subscription canceled", incomplete: "first invoice not paid yet" };
 function etDay(ms) { return new Date(ms).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric" }); }
 function accessLine(a) {
@@ -1364,8 +1429,10 @@ function adminBillingHtml(b, workerTestMode = true) {
       <label class="check"><input type="checkbox" data-sms-toggle ${b.smsAddon ? "checked" : ""} ${b.smsCanEnable || b.smsAddon ? "" : "disabled"}> Texting add-on</label>
       ${!b.smsAddon && b.smsEnableNote ? `<p class="sub sms-enable-note"><strong>${esc(b.smsEnableNote)}</strong></p>` : ""}
       <p class="sub">${b.smsAllowed ? esc(b.smsPriceText) + "." : "Texting is for Small fleet and Fleet plans."} ${b.textingReady ? "Texting is connected." : "Texting is not sending yet (provider setup pending)."} Texts sent this month: ${esc(b.textsThisMonth || 0)} of 500 included.</p>
-      ${b.subscribed ? "" : `<label class="check"><input type="checkbox" name="beta"> Beta tester (BETA50: 50% off the plan setup fee)</label>
-      <button class="btn ghost full" type="button" data-act="billing-start">Start ${word} subscription (Stripe ${word} mode)</button>`}
+      <label class="setup-fee-label">Setup fee<select name="setupFee" data-setup-fee>${SETUP_FEE_OPTIONS.map(([v, t]) => `<option value="${v}" ${(b.setupFee || "free") === v ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+      <p class="sub">Applies to the plan setup fee when the subscription starts and to the texting setup fee when texting is first turned on. Monthly prices are never discounted.</p>
+      ${b.subscribed ? `<p class="sub pm-admin">Card on file: ${b.paymentMethod ? esc(cardLine(b.paymentMethod)) : "none yet"}</p>` : ""}
+      ${b.subscribed ? "" : `<button class="btn ghost full" type="button" data-act="billing-start">Start ${word} subscription (Stripe ${word} mode)</button>`}
       <p class="err billing-msg"></p>
     </div>`;
 }
@@ -1485,6 +1552,20 @@ async function renderAdmin(gen) {
     } catch (e) { setMsg(err, SOMETHING_WRONG(e), false); } });
   };
   accounts.onchange = async (event) => {
+    const fee = event.target.closest("[data-setup-fee]");
+    if (fee) {
+      const card = fee.closest("[data-company]");
+      const msg = card.querySelector(".billing-msg");
+      fee.disabled = true;
+      let result;
+      try { result = await api("/api/platform/companies/" + card.dataset.company + "/setup-fee", { method: "POST", body: { setupFee: fee.value } }); }
+      catch (e) { result = { data: { ok: false, error: SOMETHING_WRONG(e) } }; }
+      fee.disabled = false;
+      if (!result.data.ok) { setMsg(msg, result.data.error || "Could not change the setup fee.", false); return; }
+      fee.value = result.data.billing.setupFee;
+      setMsg(msg, "Setup fee saved: " + result.data.billing.setupFeeLabel + ".", true);
+      return;
+    }
     const box = event.target.closest("[data-sms-toggle]");
     if (!box) return;
     const card = box.closest("[data-company]");
@@ -1514,8 +1595,8 @@ async function renderAdmin(gen) {
     if (button.dataset.act === "billing-start") {
       const box = card.querySelector(".billing-admin");
       const msg = box.querySelector(".billing-msg");
-      const beta = box.querySelector("[name=beta]").checked;
-      const result = await api("/api/platform/companies/" + id + "/subscription", { method: "POST", body: { beta } });
+      const setupFee = box.querySelector("[name=setupFee]").value;
+      const result = await api("/api/platform/companies/" + id + "/subscription", { method: "POST", body: { setupFee } });
       if (!result.data.ok) { setMsg(msg, result.data.error || (result.data.testMode === false ? "Could not start the live subscription." : "Could not start the test subscription."), false); return; }
       const testInvoice = result.data.testMode !== false;
       const word = testInvoice ? "Test" : "Live";
