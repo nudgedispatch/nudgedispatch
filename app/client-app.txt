@@ -4,6 +4,185 @@ const tabs = document.querySelector("#tabs");
 const state = { me: null, inviteToken: "" };
 let renderGen = 0;
 
+/* a2hs-logic-start */
+var NudgeA2hs = (function () {
+  "use strict";
+  var STORAGE_KEY = "nudge-a2hs-dismissed-at";
+  var REOFFER_MS = 14 * 24 * 60 * 60 * 1000;
+  var IOS_OTHER = /CriOS|FxiOS|EdgiOS|OPiOS|OPT\/|DuckDuckGo|YaBrowser|GSA\/|FBAN|FBAV|FB_IAB|Instagram|Line\/|Twitter|Snapchat|LinkedInApp|musical_ly|ByteDance|TikTok|WebView/;
+
+  function isIos(ua, platform, maxTouchPoints) {
+    ua = String(ua || "");
+    platform = String(platform || "");
+    if (/iPad|iPhone|iPod/.test(ua)) return true;
+    if (platform === "MacIntel" && Number(maxTouchPoints) > 1) return true;
+    return false;
+  }
+  function isIosSafari(ua, platform, maxTouchPoints) {
+    if (!isIos(ua, platform, maxTouchPoints)) return false;
+    ua = String(ua || "");
+    if (IOS_OTHER.test(ua)) return false;
+    return /Safari/.test(ua);
+  }
+  function isDesktop(ua, platform, maxTouchPoints) {
+    if (isIos(ua, platform, maxTouchPoints)) return false;
+    if (/Android/i.test(String(ua || ""))) return false;
+    return true;
+  }
+  function isStandalone(matchesStandalone, navigatorStandalone) {
+    return !!(matchesStandalone || navigatorStandalone === true);
+  }
+  function readDismissedAt(storage) {
+    try {
+      var raw = storage && storage.getItem(STORAGE_KEY);
+      var n = Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (err) {
+      return 0;
+    }
+  }
+  function writeDismissedAt(storage, now) {
+    try { if (storage) storage.setItem(STORAGE_KEY, String(now)); } catch (err) { /* quota / private mode */ }
+  }
+  function shouldShow(opts) {
+    opts = opts || {};
+    var now = Number(opts.now) || 0;
+    if (opts.standalone) return { show: false, variant: "", reason: "standalone" };
+    if (opts.desktop) return { show: false, variant: "", reason: "desktop" };
+    var dismissedAt = Number(opts.dismissedAt) || 0;
+    if (dismissedAt && (now - dismissedAt) < REOFFER_MS) return { show: false, variant: "", reason: "dismissed" };
+    if (opts.ios) {
+      return opts.iosSafari
+        ? { show: true, variant: "ios-safari", reason: "" }
+        : { show: true, variant: "ios-other", reason: "" };
+    }
+    if (opts.hasNativePrompt) return { show: true, variant: "android", reason: "" };
+    return { show: false, variant: "", reason: "no-prompt" };
+  }
+  return { STORAGE_KEY: STORAGE_KEY, REOFFER_MS: REOFFER_MS, isIos: isIos, isIosSafari: isIosSafari, isDesktop: isDesktop, isStandalone: isStandalone, readDismissedAt: readDismissedAt, writeDismissedAt: writeDismissedAt, shouldShow: shouldShow };
+})();
+/* a2hs-logic-end */
+
+let deferredInstallPrompt = null;
+let a2hsCaptureWired = false;
+
+function wireA2hsCapture() {
+  if (a2hsCaptureWired) return;
+  a2hsCaptureWired = true;
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+  });
+  window.addEventListener("appinstalled", () => {
+    deferredInstallPrompt = null;
+    NudgeA2hs.writeDismissedAt(window.localStorage, Date.now());
+    hideA2hsPrompt();
+  });
+}
+
+function a2hsEnv() {
+  const ua = navigator.userAgent || "";
+  const platform = navigator.platform || "";
+  const maxTouchPoints = navigator.maxTouchPoints || 0;
+  const standaloneMatch = window.matchMedia && window.matchMedia("(display-mode: standalone)").matches;
+  return {
+    standalone: NudgeA2hs.isStandalone(standaloneMatch, window.navigator.standalone === true),
+    desktop: NudgeA2hs.isDesktop(ua, platform, maxTouchPoints),
+    dismissedAt: NudgeA2hs.readDismissedAt(window.localStorage),
+    now: Date.now(),
+    ios: NudgeA2hs.isIos(ua, platform, maxTouchPoints),
+    iosSafari: NudgeA2hs.isIosSafari(ua, platform, maxTouchPoints),
+    hasNativePrompt: !!(deferredInstallPrompt && typeof deferredInstallPrompt.prompt === "function"),
+  };
+}
+
+function hideA2hsPrompt() {
+  const el = document.getElementById("a2hs");
+  if (el) el.remove();
+}
+
+function dismissA2hsPrompt() {
+  NudgeA2hs.writeDismissedAt(window.localStorage, Date.now());
+  hideA2hsPrompt();
+}
+
+function a2hsShareIcon() {
+  return `<svg class="a2hs-share-icon" viewBox="0 0 24 24" width="28" height="28" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M8 9H6.5A1.5 1.5 0 0 0 5 10.5v8A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5v-8A1.5 1.5 0 0 0 17.5 9H16"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 4v10M12 4l-3.2 3.2M12 4l3.2 3.2"/></svg>`;
+}
+
+function a2hsCardHtml(variant) {
+  const mark = `<img src="/brand/mark.svg" alt="" class="a2hs-mark">`;
+  const title = `<h2 id="a2hs-title">Add Nudge to your home screen</h2>`;
+  const later = `<button type="button" class="btn ghost full" id="a2hs-later">Not now</button>`;
+  let body = "";
+  if (variant === "ios-safari") {
+    body = `<ol class="a2hs-steps">
+      <li><span class="a2hs-step-num">1</span><span class="a2hs-step-text">Tap the Share button</span>${a2hsShareIcon()}</li>
+      <li><span class="a2hs-step-num">2</span><span class="a2hs-step-text">Tap <strong>Add to Home Screen</strong></span></li>
+      <li><span class="a2hs-step-num">3</span><span class="a2hs-step-text">Tap <strong>Add</strong></span></li>
+    </ol>${later}`;
+  } else if (variant === "ios-other") {
+    body = `<p>Open this page in Safari to add it to your home screen.</p>${later}`;
+  } else {
+    body = `<p>Install Nudge so you can open it from your home screen.</p>
+      <button type="button" class="btn full" id="a2hs-install">Install Nudge</button>${later}`;
+  }
+  return `<div class="a2hs-backdrop"></div><div class="a2hs-card">${mark}${title}${body}</div>`;
+}
+
+function showA2hsPromptIfNeeded() {
+  hideA2hsPrompt();
+  if (!state.me || state.me.platformAdmin) return;
+  const decision = NudgeA2hs.shouldShow(a2hsEnv());
+  if (!decision.show) return;
+  const overlay = document.createElement("div");
+  overlay.id = "a2hs";
+  overlay.className = "a2hs-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-labelledby", "a2hs-title");
+  overlay.setAttribute("data-variant", decision.variant);
+  overlay.innerHTML = a2hsCardHtml(decision.variant);
+  document.body.appendChild(overlay);
+  const later = overlay.querySelector("#a2hs-later");
+  if (later) {
+    later.addEventListener("click", dismissA2hsPrompt);
+    later.focus();
+  }
+  const install = overlay.querySelector("#a2hs-install");
+  if (install) {
+    install.addEventListener("click", async () => {
+      if (!deferredInstallPrompt || typeof deferredInstallPrompt.prompt !== "function") return;
+      deferredInstallPrompt.prompt();
+      let outcome = "";
+      try {
+        const choice = await deferredInstallPrompt.userChoice;
+        outcome = (choice && choice.outcome) || "";
+      } catch { /* prompt may be dismissed without a choice */ }
+      deferredInstallPrompt = null;
+      if (outcome === "accepted") {
+        NudgeA2hs.writeDismissedAt(window.localStorage, Date.now());
+        hideA2hsPrompt();
+      }
+    });
+    install.focus();
+  }
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      dismissA2hsPrompt();
+    }
+  });
+}
+
+function offerA2hsAfterLogin() {
+  if (!state.me || state.me.platformAdmin) return;
+  queueMicrotask(() => showA2hsPromptIfNeeded());
+}
+
+wireA2hsCapture();
+
+
 const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const money = (cents) => "$" + (Number(cents || 0) / 100).toFixed(2);
 const label = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
@@ -111,6 +290,7 @@ function setTag() {
 }
 
 async function signOut() {
+  hideA2hsPrompt();
   await api("/api/logout", { method: "POST", body: {} });
   state.me = null;
   location.hash = "#/login";
@@ -369,6 +549,7 @@ function renderLogin() {
     if (!result.data.ok) return formError(result.data.error || "Could not sign in.");
     state.me = result.data;
     setTag();
+    offerA2hsAfterLogin();
     location.hash = result.data.platformAdmin ? "#/admin" : "#/rides";
   };
   document.querySelector("#driver-login").onsubmit = async (event) => {
@@ -389,6 +570,7 @@ function renderLogin() {
     }
     state.me = result.data;
     setTag();
+    offerA2hsAfterLogin();
     location.hash = "#/rides";
   };
   const email = document.querySelector("#email");
@@ -474,6 +656,7 @@ function renderStart() {
       if (!result.data.ok) return formError(startAcceptError(result.data));
       clearInviteToken();
       state.me = result.data;
+      offerA2hsAfterLogin();
       location.hash = "#/rides";
     } catch {
       formError("Could not save the password. Check your connection and try again.");

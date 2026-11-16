@@ -318,3 +318,71 @@ fieldset.days legend { color: var(--muted); font-size: 14px; padding: 0 6px; }
 .day-grid label.check.day.last { grid-column: span 4; }
 .schedule-card { text-decoration: none; }
 label.check.s-active { align-self: end; margin-bottom: 8px; }
+
+/* Post-login "Add Nudge to your home screen" prompt */
+.a2hs-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
+}
+@media (min-width: 720px) {
+  .a2hs-overlay { align-items: center; }
+}
+.a2hs-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, .72);
+}
+.a2hs-card {
+  position: relative;
+  width: min(400px, 100%);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 22px 18px 16px;
+  text-align: center;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, .45);
+}
+.a2hs-mark { width: 56px; height: 56px; border-radius: 14px; margin: 0 auto 10px; display: block; }
+.a2hs-card h2 { margin: 0 0 12px; color: var(--text); font-size: 20px; line-height: 1.25; text-transform: none; letter-spacing: 0; font-weight: 700; }
+.a2hs-card p { margin: 0 0 16px; color: var(--muted); }
+.a2hs-steps {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.a2hs-steps li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #101010;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 15px;
+  line-height: 1.35;
+}
+.a2hs-step-num {
+  flex: 0 0 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: #12211f;
+  border: 1px solid #1f3d38;
+  color: var(--teal-2);
+  font-weight: 800;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.a2hs-step-text { flex: 1; min-width: 0; }
+.a2hs-share-icon { flex: 0 0 auto; color: var(--teal-2); display: block; }
+.a2hs-card .btn.full { margin: 8px 0 0; }
