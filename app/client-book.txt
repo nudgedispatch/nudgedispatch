@@ -5,6 +5,8 @@
 // -> drop-off (typed address or terminal, plus topside/curbside at Delta) -> date and time
 // -> flight number (tracking only) -> passengers and luggage -> quote
 // (only once both ends are filled) -> vehicle (by passenger count) -> contact -> review -> submit.
+// Optional stops (up to 5) sit between pickup and drop-off. A trip with any filled-in stop never
+// shows an instant estimate: it shows "Price on request" and the operator confirms the fare.
 // Drop-off sits with pickup so the address box stays on a phone first screen when Pickup at ATL is on.
 // The airport side always follows "Airport connection". A prefill or a place chip never writes the
 // airport into the other side.
@@ -178,6 +180,76 @@
   let lastFocus = "dropoff";
   let vehicleChosen = false;
   let step = 1;
+  const MAX_STOPS = 5;
+  const STOP_MAX_LENGTH = 200;
+  const STOPS_PRICE_MESSAGE = "Trips with stops are priced by the operator. We'll confirm your fare when they approve the request.";
+
+  // ---- stops between pickup and drop-off ----
+  function stopInputs() {
+    return [...document.querySelectorAll("#stopsList .stop-input")];
+  }
+  function stopValues() {
+    return stopInputs().map((input) => input.value.replace(/\s+/g, " ").trim()).filter(Boolean);
+  }
+  function syncStops() {
+    const rows = [...document.querySelectorAll("#stopsList .stoprow")];
+    rows.forEach((row, i) => {
+      const n = i + 1;
+      row.dataset.stop = String(n);
+      row.querySelector(".stop-label").textContent = "Stop " + n;
+      row.querySelector(".stop-remove").setAttribute("aria-label", "Remove stop " + n);
+    });
+    const add = $("#addStop");
+    const full = rows.length >= MAX_STOPS;
+    add.classList.toggle("hidden", full);
+    add.textContent = rows.length ? "+ Add another stop" : "+ Add stop";
+    const note = $("#stopsNote");
+    note.textContent = full ? "That is the most stops for one request (" + MAX_STOPS + "). Add more in the notes." : rows.length ? "Up to " + MAX_STOPS + " stops. Trips with stops are priced by the operator." : "";
+    note.classList.toggle("hidden", !rows.length);
+  }
+  function addStop(value, focus) {
+    const list = $("#stopsList");
+    if (list.querySelectorAll(".stoprow").length >= MAX_STOPS) return null;
+    const row = document.createElement("div");
+    row.className = "stoprow field";
+    const label = document.createElement("label");
+    label.className = "addr";
+    const span = document.createElement("span");
+    span.className = "stop-label";
+    const input = document.createElement("input");
+    input.className = "stop-input";
+    input.name = "stop";
+    input.maxLength = STOP_MAX_LENGTH;
+    input.setAttribute("autocomplete", "off");
+    input.value = value || "";
+    const box = document.createElement("span");
+    box.className = "sugg hidden";
+    box.setAttribute("role", "listbox");
+    label.append(span, input, box);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "stop-remove";
+    remove.textContent = "Remove";
+    remove.onclick = () => {
+      row.remove();
+      syncStops();
+      scheduleQuote(0);
+      const add = $("#addStop");
+      if (add && !add.classList.contains("hidden")) add.focus();
+    };
+    row.append(label, remove);
+    list.appendChild(row);
+    input.addEventListener("input", () => scheduleQuote());
+    input.addEventListener("change", () => scheduleQuote(0));
+    attachPlaces(input, box);
+    syncStops();
+    if (focus) input.focus();
+    return input;
+  }
+  function clearStops() {
+    $("#stopsList").innerHTML = "";
+    syncStops();
+  }
 
   // ---- airport connection ----
   function sideState() {
@@ -437,6 +509,7 @@
       dropoff: form.dropoff.value,
       passengers: passengers(),
       airport: airportBody(),
+      ...(stopValues().length ? { stops: stopValues() } : {}),
     };
   }
 
@@ -465,6 +538,7 @@
       return;
     }
     if (!q.available) {
+      if (q.stops) { $("#quote").dataset.state = "stops"; $("#qKind").textContent = "Trip with stops"; }
       price.textContent = "Price on request";
       labelEl.textContent = q.message || "Send the request and the operator will confirm the price.";
       return;
@@ -498,6 +572,13 @@
   }
   async function requestQuote() {
     if (!quoteInfo) return;
+    if (stopValues().length) {
+      // Stops: never an instant estimate. The operator prices the trip.
+      quoteSeq++;
+      lastQuote = null;
+      renderQuote({ available: false, stops: true, message: STOPS_PRICE_MESSAGE });
+      return;
+    }
     if (!addressesReady() || !form.vehicle.value) {
       lastQuote = null;
       renderQuote(null);
@@ -533,8 +614,9 @@
   // ---- address suggestions (same-origin proxy; off unless the operator turned it on) ----
   const sessionToken = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random())).replace(/-/g, "");
   function setupPlaces(name) {
-    const input = form[name];
-    const box = $("#" + name + "Sugg");
+    attachPlaces(form[name], $("#" + name + "Sugg"));
+  }
+  function attachPlaces(input, box) {
     let timer = 0;
     let seq = 0;
     input.addEventListener("input", () => {
@@ -666,6 +748,8 @@
     if (st.side === "dropoff" && !spotValue) return "Choose the " + st.airport.code + " terminal for drop-off.";
     if (st.side !== "dropoff" && form.tripType.value !== "hourly" && sideText("dropoff").length < 3) return "Enter the drop-off address.";
     if (!$("#meetWrap").classList.contains("hidden") && !form.meet.value) return "Choose where to meet your driver.";
+    if (stopValues().length > MAX_STOPS) return "Add up to " + MAX_STOPS + " stops.";
+    if (stopValues().some((v) => v.length > STOP_MAX_LENGTH)) return "Each stop can be up to " + STOP_MAX_LENGTH + " characters.";
     const v = selectedVehicle();
     if (v && !fits(v, n) && $("#vehicleNote").textContent.indexOf("No vehicle") !== 0) return v.name + " seats up to " + v.seats + ". Choose a larger vehicle.";
     return "";
@@ -683,9 +767,12 @@
     if (form.flight.value.trim()) rows.push(["Flight", form.flight.value.trim().toUpperCase()]);
     rows.push(["Passengers", String(passengers())]);
     if (form.luggage.value) rows.push(["Luggage", form.luggage.value]);
+    const stops = stopValues();
+    stops.forEach((stop, i) => rows.push(["Stop " + (i + 1), stop]));
     rows.push(["Drop-off", sideText("dropoff") || (form.tripType.value === "hourly" ? "As directed" : "")]);
     if (st.side === "dropoff" && !$("#styleWrap").classList.contains("hidden")) rows.push(["Drop-off at terminal", form.style.options[form.style.selectedIndex] ? form.style.options[form.style.selectedIndex].textContent : ""]);
-    if (lastQuote && lastQuote.available) rows.push(["Estimate", (lastQuote.estimate ? "About " : "") + lastQuote.total]);
+    if (lastQuote && lastQuote.available && !stops.length) rows.push(["Estimate", (lastQuote.estimate ? "About " : "") + lastQuote.total]);
+    if (stops.length && quoteInfo) rows.push(["Price", "Price on request. We'll confirm your fare."]);
     const v = selectedVehicle();
     if (v) rows.push(["Vehicle", v.name]);
     rows.push(["Name", form.name.value.trim()]);
@@ -729,6 +816,7 @@
     vehicleChosen = false;
     form.meet.dataset.chosen = "";
     form.style.dataset.chosen = "";
+    clearStops();
     syncVehicles();
     syncTripFields();
     renderQuote(null);
@@ -781,6 +869,8 @@
     renderReview();
     showStep(3);
   };
+  $("#addStop").onclick = () => { addStop("", true); };
+  syncStops();
   $("#back1").onclick = () => showStep(1);
   $("#back2").onclick = () => showStep(2);
 
@@ -807,6 +897,7 @@
         flight: form.flight.value,
         notes: form.notes.value,
         airport: airportBody(),
+        ...(stopValues().length ? { stops: stopValues() } : {}),
         hp_extra: form.hp_extra ? form.hp_extra.value : "",
       };
       const result = await api("/api/public/book/" + encodeURIComponent(slug), { method: "POST", body });

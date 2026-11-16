@@ -14,6 +14,7 @@ export default [
       "app/drivers.js",
       "app/progress-nav.js",
       "app/booking-shell.js",
+      "app/stops.js",
       "test/**/*.js",
       "scripts/**/*.js",
     ],

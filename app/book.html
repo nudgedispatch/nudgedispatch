@@ -57,11 +57,13 @@
         <label id="pickupTextWrap" class="addr"><span>Pickup address</span><input name="pickup" id="pickup" autocomplete="section-nudge-pickup street-address" required><span class="sugg hidden" id="pickupSugg" role="listbox"></span></label>
       </div>
       <label id="meetWrap" class="hidden">Where to meet your driver<select name="meet" id="meet"></select><span class="fixedval hidden" id="meetFixed" role="note"></span><span class="fine" id="meetNote"></span></label>
+      <div id="stopsList" class="stops" data-field="stops" aria-label="Stops on the way"></div>
       <div class="field" data-field="dropoff">
         <label id="dropoffSelectWrap" class="hidden"><span>Drop-off terminal</span><select name="dropoffSpot" id="dropoffSpot"></select></label>
         <label id="dropoffTextWrap" class="addr"><span id="dropLabel">Drop-off address</span><input name="dropoff" id="dropoff" autocomplete="section-nudge-dropoff street-address" required><span class="sugg hidden" id="dropoffSugg" role="listbox"></span></label>
       </div>
       <label id="styleWrap" class="hidden">Drop-off at the terminal<select name="style" id="style"></select><span class="fine" id="styleNote"></span></label>
+      <div id="stopsCtl" class="stopsctl"><button class="btn ghost addstop" type="button" id="addStop">+ Add stop</button><span class="fine hidden" id="stopsNote"></span></div>
       <div id="places" class="chips hidden" aria-label="Flat-rate places"></div>
       <div class="two" data-field="when"><label><span id="dateLabel">Pickup date</span><input name="date" type="date" required></label><label><span id="timeLabel">Pickup time</span><select name="time" required><option value="">Select time</option></select></label></div>
       <p class="fine hidden" id="timeHint">Choose the time you want to be picked up. Your flight number is used only to watch for delays and early arrivals.</p>
