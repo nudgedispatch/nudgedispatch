@@ -170,6 +170,11 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     const missing = await call(worker, "/api/signup", { method: "POST", body: { ...signupBody, slugPermanentConfirmed: false } });
     assert.equal(missing.status, 400);
     assert.match(missing.data.error, /can't be changed/);
+    for (const termsAccepted of [false]) {
+      const noTerms = await call(worker, "/api/signup", { method: "POST", body: { ...signupBody, termsAccepted } });
+      assert.equal(noTerms.status, 400);
+      assert.equal(noTerms.data.error, "Please agree to the Terms of Service and Privacy Policy.");
+    }
     const sms = await call(worker, "/api/signup", { method: "POST", body: { ...signupBody, smsAddon: true } });
     assert.equal(sms.status, 400);
     assert.match(sms.data.error, /Small fleet and up/);

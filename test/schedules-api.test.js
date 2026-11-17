@@ -44,7 +44,7 @@ function etDay(offset) {
 async function owner(worker, email, companyName, accountKind = "fleet") {
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName, accountKind } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
-  const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass" } });
+  const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass", termsAccepted: true } });
   return { cookie: accepted.cookie, csrf: accepted.data.csrf || "" };
 }
 

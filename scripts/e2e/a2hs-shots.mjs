@@ -73,7 +73,7 @@ try {
   });
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email: EMAIL, companyName: "Sample Car Service", accountKind: "individual" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
-  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: PASSWORD } });
+  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: PASSWORD, termsAccepted: true } });
   assert.equal(acc.data.ok, true, JSON.stringify(acc.data));
   const logout = await call(worker, "/api/logout", { method: "POST", body: {}, session: { cookie: acc.cookie, csrf: acc.data.csrf } });
   assert.ok(logout.status === 200 || logout.data.ok, JSON.stringify(logout.data));

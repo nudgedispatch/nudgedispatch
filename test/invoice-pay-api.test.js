@@ -50,7 +50,7 @@ async function applyMigrations(persistTo) {
 async function openOwner(worker, email, companyName) {
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName, accountKind: "individual" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
-  const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass" } });
+  const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass", termsAccepted: true } });
   assert.equal(accepted.status, 201, JSON.stringify(accepted.data));
   return { cookie: accepted.cookie, csrf: accepted.data.csrf || "" };
 }
