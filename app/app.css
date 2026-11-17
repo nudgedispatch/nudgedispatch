@@ -118,7 +118,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--t
 }
 
 /* Public booking page (/book/<slug>), look aligned with the demo booking page */
-body.bookpage { min-height: 100dvh; padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
+body.bookpage { min-height: 100dvh; padding-bottom: calc(24px + env(safe-area-inset-bottom)); overflow-x: hidden; }
 body.bookpage .top {
   position: sticky; top: 0; z-index: 5;
   display: flex; align-items: center; justify-content: flex-start; gap: 10px;
@@ -147,7 +147,7 @@ body.bookpage .brand small { display: block; color: var(--muted); font-weight: 4
 .pend-actions .btn { flex: 1; margin: 0; }
 .btn.approve { background: var(--green); color: #0b0b0b; }
 .card.pending-request { border-color: var(--teal); }
-.booking-link { width: 100%; min-height: 48px; padding: 12px; border-radius: 12px; border: 1px solid #3a3a3a; background: #101010; color: var(--text); font: inherit; font-size: 14px; overflow-x: auto; }
+.booking-link { width: 100%; min-height: 48px; padding: 12px; border-radius: 12px; border: 1px solid #3a3a3a; background: #101010; color: var(--text); font: inherit; font-size: 16px; overflow-x: auto; }
 .driver-row { border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin: 12px 0 0; }
 .driver-row h3 { margin: 0; font-size: 18px; }
 .driver-row .passcode-state { color: var(--teal-2); }
@@ -282,9 +282,9 @@ a.btn { text-align: center; text-decoration: none; }
 .sheet .paywith .btn.copy { min-height: 32px; padding: 4px 10px; font-size: 14px; margin-left: 6px; color: #0b6e63; border-color: #0b6e63; }
 fieldset.paymeth { border: 1px solid var(--line); border-radius: 12px; padding: 4px 12px 12px; margin: 12px 0 0; min-width: 0; }
 fieldset.paymeth legend { color: var(--muted); font-size: 14px; padding: 0 6px; }
-.paymeth-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 10px 0 0; }
-.paymeth-row label.check { margin: 0; flex: 0 0 120px; }
-.paymeth-row input:not([type=checkbox]) { flex: 1 1 180px; width: auto; }
+.paymeth-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 10px 0 0; }
+.paymeth-row label.check { margin: 0; flex: 0 0 auto; min-width: 120px; min-height: 44px; }
+.paymeth-row input:not([type=checkbox]) { flex: 1 1 180px; width: auto; min-height: 44px; }
 @media print {
   .sheet .paywith a.paylink { color: #161616; }
   .sheet .paywith a.paylink::after { content: " " attr(href); font-weight: 400; font-size: 12px; overflow-wrap: anywhere; }
@@ -319,6 +319,145 @@ fieldset.days legend { color: var(--muted); font-size: 14px; padding: 0 6px; }
 .schedule-card { text-decoration: none; }
 label.check.s-active { align-self: end; margin-bottom: 8px; }
 
+/* Post-login "Add Nudge to your home screen" prompt */
+.a2hs-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
+}
+@media (min-width: 720px) {
+  .a2hs-overlay { align-items: center; }
+}
+.a2hs-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, .72);
+}
+.a2hs-card {
+  position: relative;
+  width: min(400px, 100%);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 22px 18px 16px;
+  text-align: center;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, .45);
+}
+.a2hs-mark { width: 56px; height: 56px; border-radius: 14px; margin: 0 auto 10px; display: block; }
+.a2hs-card h2 { margin: 0 0 12px; color: var(--text); font-size: 20px; line-height: 1.25; text-transform: none; letter-spacing: 0; font-weight: 700; }
+.a2hs-card p { margin: 0 0 16px; color: var(--muted); }
+.a2hs-steps {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.a2hs-steps li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #101010;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 15px;
+  line-height: 1.35;
+}
+.a2hs-step-num {
+  flex: 0 0 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: #12211f;
+  border: 1px solid #1f3d38;
+  color: var(--teal-2);
+  font-weight: 800;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.a2hs-step-text { flex: 1; min-width: 0; }
+.a2hs-share-icon { flex: 0 0 auto; color: var(--teal-2); display: block; }
+.a2hs-card .btn.full { margin: 8px 0 0; }
+
+/* Self-serve signup — phone-first */
+body.signup-page { padding-bottom: 0; overflow-x: hidden; }
+.signup-page .top { position: static; padding-left: max(16px, env(safe-area-inset-left)); padding-right: max(16px, env(safe-area-inset-right)); }
+.signup-wrap {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 16px max(16px, env(safe-area-inset-right)) 24px max(16px, env(safe-area-inset-left));
+  overflow-wrap: anywhere;
+}
+.signup-card { overflow: visible; }
+.signup-card h1 { margin: 0 0 10px; font-size: 24px; }
+.signup-card .fields { margin-top: 16px; }
+.signup-card input, .signup-card select, .signup-card textarea { font-size: 16px; min-height: 48px; }
+.signup-page input[type="file"] { min-height: 48px; font-size: 16px; }
+.signup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 4px 0 calc(4px + env(safe-area-inset-bottom));
+}
+.signup-actions .btn.full { margin: 0; min-height: 48px; }
+.signup-foot { margin: 14px 0 0; }
+.signup-signin { display: inline-flex; align-items: center; min-height: 44px; padding: 10px 2px; vertical-align: middle; }
+
+.signup-card .plan-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 8px 0 14px;
+}
+.signup-card .plan-card legend { font-weight: 700; padding: 0 4px; }
+.signup-card .plan-name { margin: 0 0 6px; font-size: 18px; font-weight: 700; }
+.signup-card .terms-check { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; margin: 12px 0; color: var(--text); font-size: 16px; min-height: 44px; }
+.signup-card .terms-check input {
+  width: 22px; height: 22px; min-width: 22px; min-height: 22px; margin-top: 11px; padding: 0;
+  flex: 0 0 auto; accent-color: var(--teal);
+}
+.signup-card .terms-check span { flex: 1; min-width: 0; padding: 10px 0; }
+.signup-card .slug-status { margin: -8px 0 12px; }
+.signup-card .slug-status.ok { color: var(--green); }
+.signup-card .slug-status.err { color: var(--red); }
+.welcome-links { display: flex; flex-direction: column; gap: 8px; margin: 16px 0 28px; }
+
+body.bookpage .top { background: var(--book-theme, rgba(11, 11, 11, .96)); }
+body.bookpage .brand { color: var(--book-theme-text, var(--teal)); }
+body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
+
+.theme-presets { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+.theme-swatch {
+  width: 44px; height: 44px; min-width: 44px; min-height: 44px;
+  border-radius: 999px; border: 2px solid var(--line);
+  padding: 0; cursor: pointer;
+}
+.theme-swatch-default { box-shadow: inset 0 0 0 2px #7fc7bf; }
+.brand-preview {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 0 0 14px;
+}
+.brand-preview .top {
+  position: static;
+  background: rgba(11, 11, 11, .96);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+}
+.brand-preview .logo { width: 34px; height: 34px; border-radius: 8px; object-fit: contain; background: #111; }
+.brand-preview .brand { color: var(--teal); font-weight: 700; font-size: 17px; }
+.brand-preview .brand small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+.signup-step { margin-top: 8px; }
 /* Airport settings save feedback */
 .air-msg { min-height: 1.4em; margin: 8px 0 0; }
 .air-msg.ok { color: var(--green); }

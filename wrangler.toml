@@ -19,6 +19,8 @@ BLAND_FROM_NUMBER = ""
 STRIPE_PORTAL_CONFIGURATION = ""
 # Stripe payment method configuration that enables only cards (pmc_...). Empty locally.
 STRIPE_CARD_PAYMENT_CONFIGURATION = ""
+# Signup Turnstile. Empty locally so tests skip the widget and verification.
+TURNSTILE_SITE_KEY = ""
 
 # Shell scripts are .txt so Wrangler imports them as text. The Worker still
 # serves them at /app.js, /sw.js, /book.js, and /book/<slug>/sw.js.
