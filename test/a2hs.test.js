@@ -136,7 +136,9 @@ test("the main app already has 192, 512, maskable, and apple-touch icons", () =>
 
 test("login success paths offer the prompt, and CSP is not loosened in the client", () => {
   const offers = client.split("offerA2hsAfterLogin()").length - 1;
-  assert.equal(offers, 4);
+  // Definition plus login, invite, boot-on-welcome, and the welcome screen itself.
+  assert.equal(offers, 6);
+  assert.match(client, /location\.hash === "#\/welcome"\) offerA2hsAfterLogin\(\)/);
   assert.match(client, /wireA2hsCapture\(\);/);
   assert.match(client, /addEventListener\("beforeinstallprompt"/);
   assert.match(client, /event\.preventDefault\(\)/);

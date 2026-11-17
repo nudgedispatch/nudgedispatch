@@ -386,3 +386,54 @@ label.check.s-active { align-self: end; margin-bottom: 8px; }
 .a2hs-step-text { flex: 1; min-width: 0; }
 .a2hs-share-icon { flex: 0 0 auto; color: var(--teal-2); display: block; }
 .a2hs-card .btn.full { margin: 8px 0 0; }
+
+/* Self-serve signup */
+.signup-page .top { position: static; }
+.signup-wrap { max-width: 560px; margin: 0 auto; padding: 20px 16px 48px; }
+.signup-card h1 { margin: 0 0 10px; font-size: 24px; }
+.signup-card .fields { margin-top: 16px; }
+.signup-card .plan-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 8px 0 14px;
+}
+.signup-card .plan-card legend { font-weight: 700; padding: 0 4px; }
+.signup-card .plan-name { margin: 0 0 6px; font-size: 18px; font-weight: 700; }
+.signup-card .terms-check { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; margin: 12px 0; color: var(--text); font-size: 15px; }
+.signup-card .terms-check input {
+  width: 22px; height: 22px; min-height: 22px; margin-top: 3px; padding: 0;
+  flex: 0 0 auto; accent-color: var(--teal);
+}
+.signup-card .terms-check span { flex: 1; min-width: 0; }
+.signup-card .slug-status { margin: -8px 0 12px; }
+.signup-card .slug-status.ok { color: var(--green); }
+.signup-card .slug-status.err { color: var(--red); }
+.welcome-links { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; }
+
+body.bookpage .top { background: var(--book-theme, rgba(11, 11, 11, .96)); }
+body.bookpage .brand { color: var(--book-theme-text, var(--teal)); }
+body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
+
+.theme-presets { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+.theme-swatch {
+  width: 32px; height: 32px; border-radius: 999px; border: 2px solid var(--line);
+  padding: 0; min-height: 0; cursor: pointer;
+}
+.theme-swatch-default { box-shadow: inset 0 0 0 2px #7fc7bf; }
+.brand-preview {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 0 0 14px;
+}
+.brand-preview .top {
+  position: static;
+  background: rgba(11, 11, 11, .96);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+}
+.brand-preview .logo { width: 34px; height: 34px; border-radius: 8px; object-fit: contain; background: #111; }
+.brand-preview .brand { color: var(--teal); font-weight: 700; font-size: 17px; }
+.brand-preview .brand small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+.signup-step { margin-top: 8px; }

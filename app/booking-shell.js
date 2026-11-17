@@ -18,9 +18,13 @@ export function bookingShortName(name) {
   return text.slice(0, 12).trim();
 }
 
-export function applyBookingPageHtml(template, { jsSrc, companyName } = {}) {
+export function applyBookingPageHtml(template, { jsSrc, companyName, themeColor } = {}) {
   let html = String(template);
   if (jsSrc) html = html.replace('src="/book.js"', 'src="' + jsSrc + '"');
+  const theme = String(themeColor || "").trim();
+  if (theme && /^#[0-9a-f]{6}$/i.test(theme)) {
+    html = html.replace('content="#0b0b0b"', 'content="' + escapeHtml(theme) + '"');
+  }
   const name = String(companyName || "").trim();
   if (!name) return html;
   const title = escapeHtml(name);

@@ -495,6 +495,7 @@ async function boot() {
     if (location.hash === "" || location.hash === "#/login" || location.hash === "#/start") {
       location.hash = me.data.platformAdmin ? "#/admin" : "#/rides";
     }
+    if (location.hash === "#/welcome") offerA2hsAfterLogin();
     await route();
     return;
   }
@@ -509,7 +510,7 @@ function renderLogin() {
   shell(`<section class="card login">
     <img src="/brand/mark.svg" alt="" class="login-mark">
     <h1>Sign in</h1>
-    <p class="note">Private to your company. There is no public signup.</p>
+    <p class="note">Private to your company. New to Nudge Dispatch? <a href="/signup">Create an account</a>.</p>
     <p class="muted" id="login-note">The same sign-in is used for the platform admin console. There is no separate admin login.</p>
     <form id="f">
       <label>Email<input id="email" type="email" autocomplete="username" required></label>
@@ -1417,6 +1418,71 @@ function readPaymentMethods() {
   return out;
 }
 
+
+const LOGO_MAX_EDGE = 384;
+const LOGO_MAX_DATA_URL = 180000;
+function imageFromUrl(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("decode"));
+    img.src = url;
+  });
+}
+async function loadImageFromFile(file) {
+  if (typeof createImageBitmap === "function") {
+    try { return await createImageBitmap(file); } catch { /* fall through */ }
+  }
+  let url = "";
+  try {
+    url = URL.createObjectURL(file);
+    const img = await imageFromUrl(url);
+    URL.revokeObjectURL(url);
+    return img;
+  } catch {
+    if (url) try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+  }
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("decode"));
+    reader.readAsDataURL(file);
+  });
+  return imageFromUrl(dataUrl);
+}
+async function compressLogoFile(file) {
+  if (file.size > 15 * 1024 * 1024) throw new Error("too-large");
+  const img = await loadImageFromFile(file);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("canvas");
+  let edge = LOGO_MAX_EDGE;
+  let dataUrl = "";
+  for (let i = 0; i < 6; i++) {
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    const scale = Math.min(1, edge / Math.max(w, h, 1));
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    dataUrl = canvas.toDataURL("image/png");
+    if (dataUrl.length <= LOGO_MAX_DATA_URL) {
+      if (img && typeof img.close === "function") try { img.close(); } catch { /* ignore */ }
+      return dataUrl;
+    }
+    edge = Math.floor(edge * 0.75);
+  }
+  if (img && typeof img.close === "function") try { img.close(); } catch { /* ignore */ }
+  throw new Error("too-large");
+}
+function contrastText(bg) {
+  const n = parseInt(String(bg).replace("#", ""), 16);
+  const ch = (c) => { const s = c / 255; return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); };
+  const L = Number.isFinite(n) ? 0.2126 * ch((n >> 16) & 255) + 0.7152 * ch((n >> 8) & 255) + 0.0722 * ch(n & 255) : 0;
+  return (1.05 / (L + 0.05)) >= ((L + 0.05) / 0.05) ? "#f5f5f5" : "#111111";
+}
+
 async function renderSettings(gen) {
   setTabs(true);
   shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card" id="drivers-card"><h2>Drivers</h2><p class="note">Add a driver by name. Type of vehicle and plate are optional. Then set that driver's sign-in passcode here. Drivers sign in with the company code, their name, and the passcode. Nothing is texted or emailed. Remove a driver to take them off the roster: they cannot sign in, upcoming rides become unassigned, and completed rides keep their name.</p><p class="sub" id="driver-code">Company code: loading…</p><form id="add-driver"><label>Name<input id="driver-name" maxlength="80" required autocomplete="off"></label><label>Type of vehicle<input id="driver-vehicle" maxlength="40" placeholder="SUV" autocomplete="off"></label><label>Plate number<input id="driver-plate" maxlength="12" placeholder="ABC1234" autocomplete="off" autocapitalize="characters"></label><p class="err" id="driver-err"></p><button class="btn full" type="submit">Add driver</button></form><div id="driver-list" class="muted">Loading drivers…</div></section>` : ""}<div id="box" class="muted">Loading…</div>`);
@@ -1467,8 +1533,22 @@ async function renderSettings(gen) {
       <label class="full">Payment note (optional)<textarea id="pay" placeholder="Anything else clients should know, like card in the car or tips appreciated.">${esc(s.paymentInstructions)}</textarea></label>
       <label class="full">Terms<textarea id="terms">${esc(s.terms)}</textarea></label>
       <label class="full">Gratuity line<input id="gratuity" value="${esc(s.gratuityNote)}"></label>
-      <label class="full">Logo (optional PNG, JPG, or WebP)<input id="logo" type="file" accept="image/png,image/jpeg,image/webp"></label>
+      <label class="full">Logo (optional)<input id="logo" type="file" accept="image/*,.heic,.heif,image/heic,image/heif">
+        <span class="sub">PNG, JPG, WebP, or HEIC. We'll resize it to 384px and save a PNG under 120 KB.</span>
+      </label>
       ${s.logoDataUrl ? `<p class="full"><img alt="Current logo" src="${esc(s.logoDataUrl)}" style="width:72px;height:72px;object-fit:contain;background:#fff;border-radius:8px"></p>` : ""}
+      <fieldset class="full plan-card" id="theme-field">
+        <legend>Booking page color</legend>
+        <p class="sub">Optional header color for your booking page and QR code. You can change this any time. Company code cannot be changed.</p>
+        <div class="theme-presets" id="theme-presets"></div>
+        <label>Custom hex<input id="themeColor" value="${esc(s.themeColor || "")}" placeholder="#0b0b0b" maxlength="7" autocapitalize="none" spellcheck="false"></label>
+        <div class="brand-preview" id="settings-brand-preview">
+          <header class="top">
+            <img class="logo" id="settings-preview-logo" src="${esc(s.logoDataUrl || "/icons/icon-192.png")}" alt="">
+            <div class="brand"><span class="coname">${esc(s.businessName || state.me.companyName || "Your company")}</span><small>Request a ride</small></div>
+          </header>
+        </div>
+      </fieldset>
       <p class="err full" id="err"></p>
       <button class="btn full" type="submit">Save business details</button>
     </form>
@@ -1476,6 +1556,36 @@ async function renderSettings(gen) {
     <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
     <button class="btn ghost full" id="out" type="button">Sign out</button>`;
   if (state.me.role === "owner") loadPaymentCard(gen);
+  const presets = document.querySelector("#theme-presets");
+  const themeInput = document.querySelector("#themeColor");
+  const paintSettingsTheme = () => {
+    const preview = document.querySelector("#settings-brand-preview");
+    if (!preview || !themeInput) return;
+    const raw = themeInput.value.trim();
+    const m = /^#?([0-9a-f]{6})$/i.exec(raw) || /^#?([0-9a-f]{3})$/i.exec(raw);
+    const hex = !raw ? "" : (m && m[0].length <= 4 ? "#" + m[1].toLowerCase().split("").map((c) => c + c).join("") : (m ? "#" + m[1].toLowerCase() : ""));
+    const top = preview.querySelector(".top");
+    const brand = preview.querySelector(".brand");
+    const small = preview.querySelector("small");
+    if (!hex) { top.style.background = ""; brand.style.color = ""; small.style.color = ""; return; }
+    const text = contrastText(hex);
+    top.style.background = hex;
+    brand.style.color = text;
+    small.style.color = text === "#f5f5f5" ? "rgba(245,245,245,.72)" : "rgba(17,17,17,.72)";
+  };
+  if (presets && themeInput) {
+    [["Nudge dark", ""], ["Navy", "#0f1c2e"], ["Forest", "#14302a"], ["Burgundy", "#3b1218"], ["Gold", "#c4a35a"], ["Ivory", "#f4efe6"]].forEach(([name, hex]) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "theme-swatch" + (hex ? "" : " theme-swatch-default");
+      btn.title = name;
+      btn.style.background = hex || "#0b0b0b";
+      btn.addEventListener("click", () => { themeInput.value = hex; paintSettingsTheme(); });
+      presets.appendChild(btn);
+    });
+    themeInput.addEventListener("input", paintSettingsTheme);
+    paintSettingsTheme();
+  }
   document.querySelector("#f").onsubmit = async (event) => {
     event.preventDefault();
     const body = {
@@ -1491,10 +1601,11 @@ async function renderSettings(gen) {
       terms: document.querySelector("#terms").value,
       gratuityNote: document.querySelector("#gratuity").value,
     };
+    if (document.querySelector("#themeColor")) body.themeColor = document.querySelector("#themeColor").value.trim();
     const file = document.querySelector("#logo").files[0];
     if (file) {
-      if (file.size > 120000) return formError("Use a logo under about 120 KB.");
-      body.logoDataUrl = await blobToDataUrl(file);
+      try { body.logoDataUrl = await compressLogoFile(file); }
+      catch { return formError("We couldn't use that image. Try a PNG, JPG, or WebP (HEIC works on Safari)."); }
     }
     const saved = await api("/api/settings", { method: "PUT", body });
     if (!saved.data.ok) return formError(saved.data.error);
@@ -2502,6 +2613,50 @@ async function renderOccurrenceEdit(scheduleId, date, gen) {
   };
 }
 
+async function renderWelcome(gen) {
+  if (!state.me || state.me.role !== "owner") {
+    location.hash = state.me ? "#/rides" : "#/login";
+    return;
+  }
+  setTabs(true);
+  offerA2hsAfterLogin();
+  shell(`<h1>Your account is ready</h1>
+    <p class="note">You're signed in. Your booking page is live, and you can add Nudge to your home screen.</p>
+    <section class="card" id="welcome-box"><p class="muted">Loading your booking link…</p></section>
+    <p class="welcome-links"><a class="btn full linkbtn-block" href="#/rides">Go to Rides</a></p>`);
+  const result = await api("/api/settings");
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#welcome-box");
+  if (!box) return;
+  if (!result.data.ok) { box.innerHTML = `<p class="err">${esc(result.data.error || "Could not load your booking link.")}</p>`; return; }
+  const s = result.data.settings;
+  const bookingUrl = location.origin + (s.bookingPath || (s.bookingSlug ? "/book/" + s.bookingSlug + "/" : ""));
+  const qrUrl = s.bookingSlug ? location.origin + "/book/" + encodeURIComponent(s.bookingSlug) + "/qr/" : "";
+  const publicUrl = s.bookingSlug ? "https://app.nudgedispatch.com/book/" + s.bookingSlug + "/" : bookingUrl;
+  box.innerHTML = `<h2>Your booking page</h2>
+    <p class="sub">Share this link or the QR code with clients. Your company code is <strong>${esc(s.bookingSlug || "")}</strong> — this can't be changed.</p>
+    <p><input class="booking-link" id="welcome-link" readonly value="${esc(publicUrl)}"></p>
+    <button class="btn full" id="welcome-copy" type="button">Copy link</button>
+    ${qrUrl ? `<a class="btn ghost full linkbtn-block" href="${esc(qrUrl)}" target="_blank" rel="noopener">Open booking QR</a>
+    <p class="sub">The QR page has Share and Save image buttons. Open it on your phone and add it to your home screen for one-tap access.</p>` : ""}
+    <p class="err" id="welcome-copy-note"></p>`;
+  const copy = document.querySelector("#welcome-copy");
+  if (copy) copy.onclick = async () => {
+    const input = document.querySelector("#welcome-link");
+    const note = document.querySelector("#welcome-copy-note");
+    const url = input && input.value;
+    if (!url) return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(url);
+      else { input.focus(); input.select(); document.execCommand("copy"); }
+      if (note) { note.style.color = "var(--green)"; note.textContent = "Link copied."; }
+    } catch {
+      if (input) { input.focus(); input.select(); }
+      if (note) note.textContent = "Copy the link from the box above.";
+    }
+  };
+}
+
 async function route() {
   locWatch.on = false;
   locWatch.rideId = "";
@@ -2521,7 +2676,7 @@ async function route() {
     }
     return renderAdmin(gen);
   }
-  if (billingLocked() && name !== "login" && name !== "start") return renderLocked();
+  if (billingLocked() && name !== "login" && name !== "start" && name !== "welcome") return renderLocked();
   if (state.me && state.me.role === "driver" && name !== "rides" && name !== "login" && name !== "start") {
     location.hash = "#/rides";
     return;
@@ -2529,6 +2684,7 @@ async function route() {
   if (!state.me && name !== "login" && name !== "start") return renderLogin();
   if (name === "login") return renderLogin();
   if (name === "start") return renderStart();
+  if (name === "welcome") return renderWelcome(gen);
   const parts = routeName().parts;
   if (isOwnerView() && name !== "rides") refreshScheduleBadge();
   if (name === "clients" && id && id !== "new" && parts[2] === "schedule" && parts[3]) return renderScheduleForm(id, parts[3] === "new" ? "" : parts[3], gen);

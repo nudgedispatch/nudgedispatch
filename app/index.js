@@ -1328,6 +1328,7 @@ function settingsJson(row) {
     prefix: row.prefix,
     nextNumber: row.next_number,
     logoDataUrl: row.logo_data_url,
+    themeColor: row.theme_color || "",
     paymentMethods: parseStoredPaymentMethods(row.payment_methods_json),
     updatedAt: row.updated_at
   };
@@ -1368,11 +1369,8 @@ async function releaseInvite(env, id) {
 }
 __name(releaseInvite, "releaseInvite");
 
-var BOOKING_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-var BOOKING_RESERVED = new Set(["book", "api", "admin", "login", "settings", "rides", "clients", "icons", "brand", "www", "app", "demo", "static", "assets", "public", "health", "start", "where", "index", "manifest", "sw", "new", "invoice", "invoices"]);
 function slugBase(name) {
-  const s = str(name, 80).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, "");
-  return s.length >= 2 ? s : "book";
+  return slugBaseFromName(str(name, 80));
 }
 __name(slugBase, "slugBase");
 async function allocateSlug(env, name) {
@@ -1453,7 +1451,7 @@ async function publicBookingCompany(env, slug) {
   if (typeof slug !== "string" || !BOOKING_SLUG_RE.test(slug)) return null;
   const row = await env.DB.prepare(
     `SELECT c.id, c.status, c.name, c.booking_slug, c.created_at, c.trial_status, c.trial_started_at, c.trial_ride_limit,
-            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.phone AS contact_phone, s.email AS contact_email
+            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.theme_color, s.phone AS contact_phone, s.email AS contact_email
      FROM companies c
      LEFT JOIN invoice_settings s ON s.company_id = c.id
      WHERE c.booking_slug = ?`
@@ -1570,7 +1568,7 @@ async function getPublicBook(request, env, slug) {
   const company = await publicBookingCompany(env, slug);
   if (!company) return fail(404, "Booking page not found.");
   if (publicBillingLocked(company)) {
-    return json({ ok: true, open: false, companyName: publicCompanyName(company), logoDataUrl: company.logo_data_url || "", quotes: null, closed: publicPausedView(company) });
+    return json({ ok: true, open: false, companyName: publicCompanyName(company), logoDataUrl: company.logo_data_url || "", themeColor: (company.theme_color || ""), theme: themeVars(company.theme_color || ""), quotes: null, closed: publicPausedView(company) });
   }
   const trial = await companyTrial(env, company.id, company);
   const settings = await loadBookingSettings(env, company.id);
@@ -1579,7 +1577,7 @@ async function getPublicBook(request, env, slug) {
       ok: true,
       open: false,
       companyName: publicCompanyName(company),
-      logoDataUrl: company.logo_data_url || "",
+      logoDataUrl: company.logo_data_url || "", themeColor: (company.theme_color || ""), theme: themeVars(company.theme_color || ""),
       quotes: null,
       closed: publicClosedView(company)
     });
@@ -1588,7 +1586,7 @@ async function getPublicBook(request, env, slug) {
     ok: true,
     open: true,
     companyName: publicCompanyName(company),
-    logoDataUrl: company.logo_data_url || "",
+    logoDataUrl: company.logo_data_url || "", themeColor: (company.theme_color || ""), theme: themeVars(company.theme_color || ""),
     quotes: await publicQuoteInfo(env, company.id, settings),
     airports: publicAirportInfo(settings.airports),
     capacities: settings.capacities,
@@ -2110,11 +2108,246 @@ function parseQuoteJson(text) {
 }
 __name(parseQuoteJson, "parseQuoteJson");
 
+
+async function rateLimitAllow(env, bucket, windowMs, maxHits) {
+  const now = Date.now();
+  const row = await env.DB.prepare("SELECT hits, window_started FROM booking_limits WHERE bucket = ?").bind(bucket).first();
+  if (!row || now - row.window_started > windowMs) {
+    await env.DB.prepare(
+      `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?, 1, ?)
+       ON CONFLICT(bucket) DO UPDATE SET hits = 1, window_started = excluded.window_started`
+    ).bind(bucket, now).run();
+    return true;
+  }
+  if (row.hits >= maxHits) return false;
+  await env.DB.prepare("UPDATE booking_limits SET hits = hits + 1 WHERE bucket = ?").bind(bucket).run();
+  return true;
+}
+__name(rateLimitAllow, "rateLimitAllow");
+async function slugTakenBy(env, slug, ignoreSignupId) {
+  const company = await env.DB.prepare("SELECT id FROM companies WHERE booking_slug = ?").bind(slug).first();
+  if (company) return "company";
+  const pending = await env.DB.prepare(
+    "SELECT id FROM signups WHERE booking_slug = ? AND status = 'pending' AND expires_at > ?"
+  ).bind(slug, Date.now()).first();
+  if (pending && pending.id !== ignoreSignupId) return "pending";
+  return "";
+}
+__name(slugTakenBy, "slugTakenBy");
+async function suggestAvailableSlug(env, raw, ignoreSignupId) {
+  const baseProblem = slugProblem(raw);
+  const base = baseProblem ? slugBaseFromName(raw) : normalizeSlug(raw);
+  for (let i = 0; i < 30; i++) {
+    const slug = i === 0 ? base : i < 20 ? `${base}-${i + 1}` : `${base}-${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
+    if (slugProblem(slug)) continue;
+    if (!await slugTakenBy(env, slug, ignoreSignupId)) return slug;
+  }
+  return "c-" + crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+}
+__name(suggestAvailableSlug, "suggestAvailableSlug");
+async function signupConfig(_request, env) {
+  return json({ ok: true, ...signupPublicConfig(env) });
+}
+__name(signupConfig, "signupConfig");
+async function signupSlugCheck(request, env) {
+  const ipHash = await sha256Hex("signup-slug:" + clientIp(request));
+  if (!await rateLimitAllow(env, "signup-slug:" + ipHash, SIGNUP_RATE_WINDOW_MS, SIGNUP_SLUG_MAX)) {
+    return fail(429, "Too many attempts. Wait a few minutes and try again.");
+  }
+  const url = new URL(request.url);
+  const rawSlug = url.searchParams.get("slug") || "";
+  const rawName = url.searchParams.get("name") || "";
+  const wanted = rawSlug.trim() ? normalizeSlug(rawSlug) : (rawName.trim() ? slugBaseFromName(str(rawName, 80)) : "");
+  if (!wanted) return json({ ok: true, available: false, slug: "", suggestion: "", path: "", error: "Enter a company code." });
+  const problem = slugProblem(wanted);
+  if (problem) {
+    const suggestion = rawName.trim() ? await suggestAvailableSlug(env, rawName) : "";
+    return json({ ok: true, available: false, slug: wanted, suggestion, path: "", error: problem });
+  }
+  const taken = await slugTakenBy(env, wanted);
+  if (!taken) {
+    return json({ ok: true, available: true, slug: wanted, suggestion: wanted, path: "/book/" + wanted + "/", error: "" });
+  }
+  const suggestion = await suggestAvailableSlug(env, wanted);
+  return json({ ok: true, available: false, slug: wanted, suggestion, path: "", error: "That company code is taken. Try another." });
+}
+__name(signupSlugCheck, "signupSlugCheck");
+async function startSignup(request, env) {
+  const ipHash = await sha256Hex("signup:" + clientIp(request));
+  if (!await rateLimitAllow(env, "signup:" + ipHash, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX)) {
+    return fail(429, "Too many attempts. Wait a few minutes and try again.");
+  }
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const fields = signupFieldProblems(body);
+  if (fields) return fail(400, fields);
+  if (signupWantsSms(body)) return fail(400, "Texting is available on Small fleet and up.");
+  const email = normSignupEmail(body.email);
+  const passwordIssue = passwordProblem(body.password, email);
+  if (passwordIssue) return fail(400, passwordIssue);
+  const turnstile = await verifyTurnstile(env, body.turnstileToken, clientIp(request));
+  if (!turnstile.ok) return fail(400, turnstile.error);
+  if (isListedPlatformAdmin(env, email)) return fail(409, "That email already has an account.");
+  const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
+  if (existing) return fail(409, "That email already has an account. Sign in instead.");
+  const slug = suggestedSlug(body.companyName, body.bookingSlug);
+  if (await slugTakenBy(env, slug)) return fail(409, "That company code is taken. Try another.");
+  const now = Date.now();
+  await env.DB.prepare("UPDATE signups SET status = 'expired' WHERE email = ? AND status = 'pending'").bind(email).run();
+  const hashed = await hashPassword(body.password);
+  const signupId = crypto.randomUUID();
+  const companyName = str(body.companyName, 80);
+  const ownerName = str(body.ownerName, 80);
+  const ownerPhone = str(body.ownerPhone, 40);
+  const address = str(body.address, 200);
+  const businessPhone = str(body.businessPhone, 40);
+  const website = str(body.website, 120);
+  const logo = typeof body.logoDataUrl === "string" ? body.logoDataUrl : "";
+  await env.DB.prepare(
+    `INSERT INTO signups (id, email, password_hash, password_salt, password_iterations, password_kdf, owner_name, owner_phone,
+       company_name, booking_slug, plan, sms_addon, business_address, business_phone, business_website, logo_data_url, theme_color,
+       terms_accepted_at, terms_version, status, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+  ).bind(
+    signupId, email, hashed.hash, hashed.salt, hashed.iterations, hashed.kdf, ownerName, ownerPhone,
+    companyName, slug, PUBLIC_BILLING_PLAN, address, businessPhone, website, logo, normalizeThemeHex(body.themeColor) || "",
+    now, SIGNUP_TERMS_VERSION, now, now + SIGNUP_TTL_MS
+  ).run();
+  const problem = stripeKeyProblem(env);
+  if (problem) {
+    await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
+    return fail(503, "Billing is not available right now. Email nudgedispatch@gmail.com.");
+  }
+  try {
+    const L = LOOKUP[PUBLIC_BILLING_PLAN];
+    const prices = await pricesByLookup(env, [L.base]);
+    const { params, built } = checkoutParams({
+      origin: new URL(request.url).origin,
+      customerEmail: email,
+      signupId,
+      slug,
+      sms: false,
+      prices,
+      pmc: env.STRIPE_CARD_PAYMENT_CONFIGURATION || "",
+      excludedTypes: CARD_SETUP_EXCLUDED_TYPES
+    });
+    if (built.missing.length) {
+      await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
+      return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing prices: " + built.missing.join(", ") + ".");
+    }
+    const session = await stripe(env, "POST", "/v1/checkout/sessions", params, "nudge-signup-" + signupId);
+    if (!session.url || !/^https:\/\/checkout\.stripe\.com\//.test(session.url)) {
+      await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
+      return fail(502, "Stripe did not return a payment page.");
+    }
+    await env.DB.prepare("UPDATE signups SET stripe_checkout_session_id = ? WHERE id = ?").bind(session.id, signupId).run();
+    return json({ ok: true, url: session.url }, 201);
+  } catch (error) {
+    await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
+    return stripeFail(env, error);
+  }
+}
+__name(startSignup, "startSignup");
+async function fulfillSignup(env, session, signup) {
+  if (signup.status === "complete" && signup.company_id) return { companyId: signup.company_id, result: "signup already complete", already: true };
+  const problem = signupSessionProblem(session, signup);
+  if (problem) return { companyId: signup.company_id || null, result: "ignored: " + problem, error: problem };
+  const now = Date.now();
+  const customerId = typeof session.customer === "string" ? session.customer : session.customer && session.customer.id;
+  const subRef = session.subscription;
+  const sub = subRef && typeof subRef === "object" ? subRef : (typeof subRef === "string" ? await stripe(env, "GET", "/v1/subscriptions/" + encodeURIComponent(subRef), { expand: ["default_payment_method"] }) : null);
+  const subscriptionId = sub && sub.id || (typeof subRef === "string" ? subRef : "");
+  if (!customerId || !subscriptionId) return { companyId: null, result: "ignored: missing customer or subscription", error: "Stripe did not finish the subscription. Try again." };
+  const companyId = crypto.randomUUID();
+  const userId = crypto.randomUUID();
+  const kind = kindForPlan(PUBLIC_BILLING_PLAN);
+  const liveFlag = stripeKeyMode(env) === "live" ? 1 : 0;
+  const billingStatus = subStatusToBilling(sub && sub.status) || "active";
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO companies (id, name, created_at, kind, status, booking_slug, trial_status, trial_started_at, billing_plan,
+           sms_addon_enabled, sms_addon_updated_at, setup_fee, signup_id, terms_accepted_at, terms_version,
+           stripe_customer_id, stripe_subscription_id, stripe_livemode, billing_status, billing_updated_at, billing_past_due_at)
+         VALUES (?, ?, ?, ?, 'active', ?, 'active', ?, ?, 0, ?, 'charge', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ).bind(companyId, signup.company_name || "My car service", now, kind, signup.booking_slug, now, PUBLIC_BILLING_PLAN, now,
+        signup.id, signup.terms_accepted_at || now, signup.terms_version || SIGNUP_TERMS_VERSION,
+        customerId, subscriptionId, liveFlag, billingStatus, now),
+      env.DB.prepare(
+        `INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at, full_name, phone)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(userId, companyId, signup.email, signup.password_hash, signup.password_salt, signup.password_iterations, signup.password_kdf || PASSWORD_KDF, now, now, signup.owner_name || "", signup.owner_phone || ""),
+      env.DB.prepare("INSERT INTO memberships (company_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)").bind(companyId, userId, now),
+      env.DB.prepare(
+        `INSERT INTO invoice_settings (company_id, business_name, address, phone, email, website, logo_data_url, theme_color, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(companyId, signup.company_name || "", signup.business_address || "", signup.business_phone || signup.owner_phone || "", signup.email, signup.business_website || "", signup.logo_data_url || "", signup.theme_color || "", now)
+    ]);
+  } catch (error) {
+    if (error instanceof Error && /UNIQUE/i.test(error.message)) {
+      const again = await env.DB.prepare("SELECT company_id, status FROM signups WHERE id = ?").bind(signup.id).first();
+      if (again && again.status === "complete" && again.company_id) return { companyId: again.company_id, result: "signup already complete", already: true };
+      const taken = await env.DB.prepare("SELECT id FROM companies WHERE booking_slug = ?").bind(signup.booking_slug).first();
+      if (taken) return { companyId: null, result: "slug taken", error: "That company code is taken. Try another." };
+      const userClash = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(signup.email).first();
+      if (userClash) return { companyId: null, result: "email taken", error: "That email already has an account. Sign in instead." };
+    }
+    throw error;
+  }
+  await env.DB.prepare(
+    "UPDATE signups SET status = 'complete', company_id = ?, stripe_customer_id = ?, stripe_subscription_id = ?, completed_at = ? WHERE id = ? AND status = 'pending'"
+  ).bind(companyId, customerId, subscriptionId, now, signup.id).run();
+  const row = await billingRow(env, companyId);
+  const pm = sub && sub.default_payment_method;
+  if (row && pm) {
+    try { await useCardForCompany(env, row, pm); } catch { /* card summary is best-effort; subscription already started */ }
+  }
+  return { companyId, userId, result: "signup fulfilled" };
+}
+__name(fulfillSignup, "fulfillSignup");
+async function completeSignup(request, env) {
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+  if (!/^cs_(test|live)_[A-Za-z0-9]{10,200}$/.test(sessionId)) return fail(400, "That payment link is not valid.");
+  const problem = stripeKeyProblem(env);
+  if (problem) return fail(503, "Billing is not available right now. Email nudgedispatch@gmail.com.");
+  try {
+    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(sessionId), { expand: ["subscription.default_payment_method"] });
+    const signupId = session.metadata && session.metadata.signup_id || "";
+    const signup = signupId
+      ? await env.DB.prepare("SELECT * FROM signups WHERE id = ?").bind(signupId).first()
+      : await env.DB.prepare("SELECT * FROM signups WHERE stripe_checkout_session_id = ?").bind(sessionId).first();
+    if (!signup) return fail(404, "We couldn't find that signup. If you were charged, email nudgedispatch@gmail.com.");
+    const fulfilled = await fulfillSignup(env, session, signup);
+    if (fulfilled.error) return fail(409, fulfilled.error);
+    const companyId = fulfilled.companyId;
+    const user = await env.DB.prepare("SELECT id, email FROM users WHERE company_id = ?").bind(companyId).first();
+    if (!user) return fail(500, "Your account was created, but we couldn't sign you in. Try signing in from the home page.");
+    const sessionRow = await startSession(env, request, user.id);
+    const company = await env.DB.prepare("SELECT name, booking_slug FROM companies WHERE id = ?").bind(companyId).first();
+    const slug = company && company.booking_slug || signup.booking_slug || "";
+    return json({
+      ok: true,
+      ...publicUser({ email: user.email, companyName: (company && company.name) || signup.company_name || "", csrf: sessionRow.csrf, role: "owner", accountKind: "individual" }),
+      bookingSlug: slug,
+      bookingPath: slug ? "/book/" + slug + "/" : "",
+      qrPath: slug ? "/book/" + slug + "/qr/" : ""
+    }, fulfilled.already ? 200 : 201, { "set-cookie": sessionRow.cookie });
+  } catch (error) {
+    return stripeFail(env, error);
+  }
+}
+__name(completeSignup, "completeSignup");
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method.toUpperCase();
   if (method === "GET" && path === "/api/health") return json({ ok: true, service: "nudge-app" });
+  if (path === "/api/signup/config" && method === "GET") return signupConfig(request, env);
+  if (path === "/api/signup/slug" && method === "GET") return signupSlugCheck(request, env);
+  if (path === "/api/signup" && method === "POST") return startSignup(request, env);
+  if (path === "/api/signup/complete" && method === "POST") return completeSignup(request, env);
   // Stripe calls this directly (no X-Nudge-Client header); it is authenticated by the Stripe-Signature HMAC instead.
   if (path === "/api/stripe/webhook" && method === "POST") {
     try { return await stripeWebhook(request, env); } catch (error) {
@@ -3139,6 +3372,14 @@ async function stripeWebhook(request, env) {
 __name(stripeWebhook, "stripeWebhook");
 async function applyStripeEvent(env, event) {
   const obj = event.data && event.data.object;
+  if (event.type === "checkout.session.completed" && obj && obj.mode === "subscription" && isSignupCheckout(obj)) {
+    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(obj.id), { expand: ["subscription.default_payment_method"] });
+    const signupId = (session.metadata && session.metadata.signup_id) || (obj.metadata && obj.metadata.signup_id) || "";
+    const signup = signupId ? await env.DB.prepare("SELECT * FROM signups WHERE id = ?").bind(signupId).first() : null;
+    if (!signup) return { result: "ignored: unknown signup" };
+    const fulfilled = await fulfillSignup(env, session, signup);
+    return { companyId: fulfilled.companyId || null, result: fulfilled.result || "signup" };
+  }
   const refs = refsOf(event.type, obj);
   if (!refs.customer && !refs.subscription) return { result: "ignored: no customer" };
   const company = await env.DB.prepare(
@@ -4459,6 +4700,12 @@ async function putSettings(request, env) {
     nextNumber = n;
   }
   if (emailRaw && !email) return fail(400, "Enter a valid business email, or leave it blank.");
+  let themeColor = existing.theme_color || "";
+  if (body.themeColor !== undefined) {
+    const normalized = normalizeThemeHex(body.themeColor);
+    if (normalized === null) return fail(400, "Enter a color as a 6-digit hex code, like #0b0b0b.");
+    themeColor = normalized;
+  }
   let logo = existing.logo_data_url;
   if (body.logoDataUrl !== void 0) {
     if (body.logoDataUrl === "") logo = "";
@@ -4475,8 +4722,8 @@ async function putSettings(request, env) {
   const now = Date.now();
   await env.DB.prepare(
     `UPDATE invoice_settings SET business_name = ?, address = ?, phone = ?, email = ?, website = ?, payment_instructions = ?,
-      gratuity_note = ?, terms = ?, prefix = ?, next_number = ?, logo_data_url = ?, payment_methods_json = ?, updated_at = ? WHERE company_id = ?`
-  ).bind(businessName, address, phone, email, website, paymentInstructions, gratuityNote, terms, prefix, nextNumber, logo, JSON.stringify(paymentMethods), now, user.companyId).run();
+      gratuity_note = ?, terms = ?, prefix = ?, next_number = ?, logo_data_url = ?, theme_color = ?, payment_methods_json = ?, updated_at = ? WHERE company_id = ?`
+  ).bind(businessName, address, phone, email, website, paymentInstructions, gratuityNote, terms, prefix, nextNumber, logo, themeColor, JSON.stringify(paymentMethods), now, user.companyId).run();
   const row = await loadSettings(env, user.companyId);
   const bookingSlug = await ensureBookingSlug(env, user.companyId);
   return json({ ok: true, settings: row ? { ...settingsJson(row), bookingSlug, bookingPath: bookingSlug ? "/book/" + bookingSlug + "/" : "" } : null });
@@ -4631,6 +4878,8 @@ __name(viewLocation, "viewLocation");
 import indexHtml from "./index.html";
 import appCss from "./app.css";
 import appJs from "./client-app.txt";
+import signupHtml from "./signup.html";
+import signupJs from "./client-signup.txt";
 import swJs from "./client-sw.txt";
 import robotsTxt from "./robots.txt";
 import manifest from "./manifest.webmanifest";
@@ -4660,12 +4909,16 @@ import { meetingPointForArrived } from "./progress-nav.js";
 import { readSchedule, parseDayList, matchDate, pendingOccurrences, describeSchedule, monthEndNote, todayInZone, addDays, shortDate, MAX_LOOKAHEAD_DAYS } from "./schedules.js";
 import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
+import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
+import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
+import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
 import { validatePaymentMethods, parseStoredPaymentMethods, payOptions, payLines } from "./payment-methods.js";
 import { readStops, stopsToStored, parseStoredStops, stopLines, stopsCell, STOPS_PRICE_MESSAGE } from "./stops.js";
 import { flightProvider, fetchFlightSnapshot, flightAlerts, flightRules, normalizeFlight, shouldWatch } from "./flight-alerts.js";
 var CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+var CSP_SIGNUP = "default-src 'self'; img-src 'self' data: https://challenges.cloudflare.com; style-src 'self' https://challenges.cloudflare.com; script-src 'self' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://checkout.stripe.com";
 var FILES = {
   "/": { body: indexHtml, type: "text/html; charset=utf-8", cache: "no-cache" },
   "/index.html": { body: indexHtml, type: "text/html; charset=utf-8", cache: "no-cache" },
@@ -4684,7 +4937,8 @@ var FILES = {
   "/icons/icon-512-maskable.png": { body: icon512Maskable, type: "image/png", cache: "public, max-age=300" },
   "/book.js": { body: bookJs, type: "text/javascript; charset=utf-8", cache: "no-store" },
   "/book-qr.js": { body: bookQrJs, type: "text/javascript; charset=utf-8", cache: "no-cache" },
-  "/book-qr.css": { body: bookQrCss, type: "text/css; charset=utf-8", cache: "no-cache" }
+  "/book-qr.css": { body: bookQrCss, type: "text/css; charset=utf-8", cache: "no-cache" },
+  "/signup.js": { body: signupJs, type: "text/javascript; charset=utf-8", cache: "no-cache" }
 };
 function assetTag(s) {
   let h = 0;
@@ -4694,8 +4948,8 @@ function assetTag(s) {
 }
 __name(assetTag, "assetTag");
 var BOOK_JS_SRC = "/book.js?v=" + assetTag(bookJs);
-function bookPageHtml(companyName) {
-  return applyBookingPageHtml(bookHtml, { jsSrc: BOOK_JS_SRC, companyName });
+function bookPageHtml(companyName, themeColor) {
+  return applyBookingPageHtml(bookHtml, { jsSrc: BOOK_JS_SRC, companyName, themeColor });
 }
 __name(bookPageHtml, "bookPageHtml");
 function bookServiceWorker() {
@@ -4722,8 +4976,8 @@ async function serveBookingManifest(env, slug) {
     start_url: base,
     scope: base,
     display: "standalone",
-    background_color: "#0b0b0b",
-    theme_color: "#0b0b0b",
+    background_color: themeVars(company.theme_color || "").background,
+    theme_color: themeVars(company.theme_color || "").background,
     icons: [
       { src: base + "icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
       { src: base + "icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
@@ -4764,7 +5018,7 @@ async function serveBookingQr(env, slug, rest, url) {
   const bookingUrl = bookingUrlFor(url.origin, slug);
   const logoDataUrl = company.logo_data_url || "";
   if (rest === "/qr/") {
-    const html = qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl, assetTag: BOOK_QR_TAG });
+    const html = qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl, themeColor: company.theme_color || "", assetTag: BOOK_QR_TAG });
     return new Response(html, { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/qr.svg") {
@@ -4775,7 +5029,7 @@ async function serveBookingQr(env, slug, rest, url) {
     return new Response(png, { status: 200, headers: securityHeaders("image/png", "public, max-age=300") });
   }
   if (rest === "/qr/manifest.webmanifest") {
-    return new Response(JSON.stringify(qrManifest(slug, companyName)), { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
+    return new Response(JSON.stringify(qrManifest(slug, companyName, company.theme_color || "")), { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
   }
   return new Response(bookQrSwJs, { status: 200, headers: securityHeaders("text/javascript; charset=utf-8", "no-store") });
 }
@@ -4792,7 +5046,12 @@ async function serveBookingAsset(request, env, slug, rest, url) {
   if (rest === "/") {
     const company = await publicBookingCompany(env, slug);
     const companyName = company ? publicCompanyName(company) : "";
-    return new Response(bookPageHtml(companyName), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+    return new Response(bookPageHtml(companyName, company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+  }
+  if (rest === "/theme.css") {
+    const company = await publicBookingCompany(env, slug);
+    const css = company ? themeCss(company.theme_color || "") : "";
+    return new Response(css, { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
   }
   if (rest === "/manifest.webmanifest") return serveBookingManifest(env, slug);
   if (rest === "/qr" || rest === "/qr/" || rest === "/qr.png" || rest === "/qr.svg" || rest === "/qr/manifest.webmanifest" || rest === "/qr/sw.js") {
@@ -4820,16 +5079,19 @@ async function serveShell(request, env) {
   if (book) return serveBookingAsset(request, env, book.slug, book.rest, url);
   let path = url.pathname;
   if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+  if (path === "/signup" || path === "/signup/complete") {
+    return new Response(signupHtml, { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-cache", null, CSP_SIGNUP) });
+  }
   const file = FILES[path] || (!path.includes(".") ? FILES["/index.html"] : void 0);
   if (!file) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
   return new Response(file.body, { status: 200, headers: securityHeaders(file.type, file.cache) });
 }
 __name(serveShell, "serveShell");
-function securityHeaders(type, cache, extra) {
+function securityHeaders(type, cache, extra, csp) {
   const headers = new Headers({
     "content-type": type,
     "cache-control": cache,
-    "content-security-policy": CSP,
+    "content-security-policy": csp || CSP,
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
     "x-frame-options": "DENY",
