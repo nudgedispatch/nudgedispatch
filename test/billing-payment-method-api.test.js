@@ -102,8 +102,10 @@ function startStripeMock() {
       const cs = /^\/v1\/checkout\/sessions\/(cs_test_\w+)$/.exec(p);
       if (cs) {
         const other = cs[1].includes("other");
-        return send({ id: cs[1], object: "checkout.session", livemode: false, mode: "setup", status: "complete", customer: other ? "cus_someone_else" : "cus_pm", setup_intent: { id: "seti_1", object: "setup_intent", livemode: false, status: "succeeded", payment_method: card("pm_new", "4242") } });
+        const pm = cs[1].includes("link") ? { id: "pm_link", object: "payment_method", livemode: false, type: "link", link: { email: "x@example.test" } } : card("pm_new", "4242");
+        return send({ id: cs[1], object: "checkout.session", livemode: false, mode: "setup", status: "complete", customer: other ? "cus_someone_else" : "cus_pm", setup_intent: { id: "seti_1", object: "setup_intent", livemode: false, status: "succeeded", payment_method: pm } });
       }
+      if (/^\/v1\/payment_methods\/pm_\w+\/detach$/.test(p)) { st.detached = (st.detached || []).concat(p.split("/")[3]); return send({ id: p.split("/")[3], object: "payment_method", livemode: false }); }
       if (p === "/v1/invoices/in_first/pay") { st.invoice = { ...st.invoice, status: st.payStatus, amount_paid: st.payStatus === "paid" ? 5900 : 0 }; return send(st.invoice); }
       if (p === "/v1/subscription_items" && req.method === "POST") return send({ id: "si_" + hits.length, object: "subscription_item", livemode: false });
       if (p === "/v1/invoiceitems" && req.method === "POST") return send({ id: "ii_1", object: "invoiceitem", livemode: false });
@@ -128,7 +130,7 @@ test("setup fee choice and client card flow (mocked Stripe test mode)", { timeou
     await run(["wrangler", "d1", "migrations", "apply", "nudge-app-local", "--local", "--persist-to", persistTo]);
     worker = await unstable_dev("app/index.js", {
       config: "wrangler.toml", local: true, persist: true, persistTo, logLevel: "error",
-      vars: { ADMIN_TOKEN: ADMIN, SMS_MODE: "off", PLATFORM_ADMIN_EMAILS: PLATFORM_EMAIL, STRIPE_SECRET_KEY: "sk_test_example", STRIPE_API_BASE: mock.url, STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET },
+      vars: { ADMIN_TOKEN: ADMIN, SMS_MODE: "off", PLATFORM_ADMIN_EMAILS: PLATFORM_EMAIL, STRIPE_SECRET_KEY: "sk_test_example", STRIPE_API_BASE: mock.url, STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET, STRIPE_CARD_PAYMENT_CONFIGURATION: "pmc_cardonlytest1" },
       experimental: { disableExperimentalWarning: true, watch: false, forceLocal: true },
     });
     const platform = await openOwner(worker, PLATFORM_EMAIL, "Platform Holder");
@@ -197,7 +199,8 @@ test("setup fee choice and client card flow (mocked Stripe test mode)", { timeou
     assert.match(csPost.body, /(^|&)mode=setup(&|$)/);
     assert.match(csPost.body, /(^|&)customer=cus_pm(&|$)/);
     assert.doesNotMatch(csPost.body, /(^|&)payment_method_types\[/, "the pinned API version refuses payment_method_types");
-    assert.match(csPost.body, /excluded_payment_method_types\[0\]=klarna/);
+    assert.match(csPost.body, /(^|&)payment_method_configuration=pmc_cardonlytest1(&|$)/, "cards only via the card-only config");
+    assert.doesNotMatch(csPost.body, /excluded_payment_method_types/);
     assert.match(csPost.body, /success_url=http:\/\/127\.0\.0\.1\/\?card_session=\{CHECKOUT_SESSION_ID\}#\/settings/);
 
     // Return from Stripe: a session for another customer is refused; ours sets the default card.
@@ -206,6 +209,13 @@ test("setup fee choice and client card flow (mocked Stripe test mode)", { timeou
     const foreign = await call(worker, "/api/billing/payment-method/confirm", { method: "POST", session: owner, body: { sessionId: "cs_test_otherxxxxxxxx" } });
     assert.equal(foreign.status, 409);
     assert.equal(mock.st.customerPm, null);
+    // Cards only: a Link payment method from the setup page is refused, detached, and never made the default.
+    const linkTry = await call(worker, "/api/billing/payment-method/confirm", { method: "POST", session: owner, body: { sessionId: "cs_test_linkxxxxxxxxx" } });
+    assert.equal(linkTry.status, 409, JSON.stringify(linkTry.data));
+    assert.match(linkTry.data.error, /Only a credit or debit card/);
+    assert.deepEqual(mock.st.detached, ["pm_link"]);
+    assert.equal(mock.st.customerPm, null);
+    assert.equal(mock.st.subPm, null);
     const confirmed = await call(worker, "/api/billing/payment-method/confirm", { method: "POST", session: owner, body: { sessionId: "cs_test_abcdefghijkl" } });
     assert.equal(confirmed.status, 200, JSON.stringify(confirmed.data));
     assert.deepEqual(confirmed.data.paymentMethod, { brand: "visa", last4: "4242", expMonth: 4, expYear: 2030 });
@@ -231,21 +241,16 @@ test("setup fee choice and client card flow (mocked Stripe test mode)", { timeou
     const payHook = await postWebhook(worker, { id: "evt_cs_2", type: "checkout.session.completed", livemode: false, created: Math.floor(Date.now() / 1000), data: { object: { id: "cs_test_payment", object: "checkout.session", mode: "payment", customer: "cus_pm" } } });
     assert.match(payHook.data.result, /not a card setup/);
 
-    // Texting setup fee follows the saved choice. Company must be paying first.
+    // Beta pays the FULL texting setup fee (Jesse, Nov 16): no promo lookup, no discount, texting turns on.
     await sql(persistTo, `UPDATE companies SET billing_status = 'active' WHERE id = '${id}'`);
     await call(worker, `/api/platform/companies/${id}/setup-fee`, { method: "POST", session: platform, body: { setupFee: "beta" } });
-    const itemsBefore = mock.hits.filter((h) => h.path === "/v1/subscription_items").length;
-    const betaBlocked = await call(worker, `/api/platform/companies/${id}/sms`, { method: "POST", session: platform, body: { enabled: true } });
-    assert.equal(betaBlocked.status, 409, JSON.stringify(betaBlocked.data));
-    assert.match(betaBlocked.data.error, /BETA50.*does not cover the texting setup fee/);
-    assert.equal(mock.hits.filter((h) => h.path === "/v1/subscription_items").length, itemsBefore, "no Stripe change when the promo can't apply");
-
-    await call(worker, `/api/platform/companies/${id}/setup-fee`, { method: "POST", session: platform, body: { setupFee: "free" } });
-    const smsOn = await call(worker, `/api/platform/companies/${id}/sms`, { method: "POST", session: platform, body: { enabled: true } });
-    assert.equal(smsOn.status, 200, JSON.stringify(smsOn.data));
+    const promoLookups = mock.hits.filter((h) => h.path === "/v1/promotion_codes").length;
+    const betaOn = await call(worker, `/api/platform/companies/${id}/sms`, { method: "POST", session: platform, body: { enabled: true } });
+    assert.equal(betaOn.status, 200, JSON.stringify(betaOn.data));
+    assert.equal(mock.hits.filter((h) => h.path === "/v1/promotion_codes").length, promoLookups);
     const ii = mock.hits.filter((h) => h.path === "/v1/invoiceitems").pop();
     assert.match(ii.body, /pricing\[price\]=price_nudge_sms_setup/);
-    assert.match(ii.body, /discounts\[0\]\[promotion_code\]=promo_free/);
+    assert.doesNotMatch(ii.body, /discounts/);
   } finally {
     if (worker) await worker.stop();
     await mock.close();
@@ -284,6 +289,15 @@ test("charge setup and legacy beta on start subscription", { timeout: 240000 }, 
     const rows = Object.fromEntries((await sql(persistTo, "SELECT name, setup_fee FROM companies", true)).map((r) => [r.name, r.setup_fee]));
     assert.equal(rows["Paying Client"], "charge");
     assert.equal(rows["Beta Client"], "beta");
+
+    // Free: the texting setup fee gets FREESETUP when texting is turned on.
+    mock.st.invoice = { ...mock.st.invoice, status: "paid" };
+    await sql(persistTo, `UPDATE companies SET billing_status = 'active', setup_fee = 'free' WHERE id = '${ids["Paying Client"]}'`);
+    const smsOn = await call(worker, `/api/platform/companies/${ids["Paying Client"]}/sms`, { method: "POST", session: platform, body: { enabled: true } });
+    assert.equal(smsOn.status, 200, JSON.stringify(smsOn.data));
+    const ii = mock.hits.filter((h) => h.path === "/v1/invoiceitems").pop();
+    assert.match(ii.body, /pricing\[price\]=price_nudge_sms_setup/);
+    assert.match(ii.body, /discounts\[0\]\[promotion_code\]=promo_free/);
   } finally {
     if (worker) await worker.stop();
     await mock.close();

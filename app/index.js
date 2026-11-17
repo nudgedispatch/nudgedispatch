@@ -2644,7 +2644,10 @@ async function billingPortal(request, env) {
 __name(billingPortal, "billingPortal");
 // ---- Client payment method (Jesse, Nov 16, 2026). Card details are entered on Stripe-hosted pages and
 // stored only by Stripe. D1 keeps brand, last 4, and expiry for display. Owner only, company-scoped. ----
+// Fallback when STRIPE_CARD_PAYMENT_CONFIGURATION is unset: hide what can be hidden. Link can't be excluded this
+// way, so the confirm step also refuses any non-card payment method. Set the card-only config in every environment.
 const CARD_SETUP_EXCLUDED_TYPES = ["klarna", "cashapp", "amazon_pay", "affirm", "afterpay_clearpay", "us_bank_account", "zip", "alipay", "paypal", "revolut_pay", "crypto"];
+const NOT_A_CARD = "Only a credit or debit card can be saved. Tap Add card and enter a card.";
 const BILLING_NOT_STARTED = "Billing not started yet. Your Nudge Dispatch contact starts it when your plan begins.";
 function openInvoiceJson(inv) {
   if (!inv || typeof inv !== "object" || inv.status !== "open") return null;
@@ -2676,12 +2679,18 @@ __name(syncCompanyCard, "syncCompanyCard");
 async function useCardForCompany(env, row, pm) {
   const pmId = typeof pm === "string" ? pm : pm && pm.id;
   if (!pmId || !/^pm_[A-Za-z0-9]+$/.test(pmId)) throw new StripeError(502, "Stripe did not return a card.");
+  // Cards only: check the type before making it the default anywhere.
+  const full = pm && typeof pm === "object" && pm.type ? pm : await stripe(env, "GET", "/v1/payment_methods/" + encodeURIComponent(pmId));
+  if (!isCardPaymentMethod(full)) {
+    // Checkout already attached it to the customer; detach so it can never be charged.
+    await stripe(env, "POST", "/v1/payment_methods/" + encodeURIComponent(pmId) + "/detach", {}, `nudge-detach-${pmId}`);
+    return { refused: true };
+  }
   await stripe(env, "POST", "/v1/customers/" + encodeURIComponent(row.stripe_customer_id), { invoice_settings: { default_payment_method: pmId } }, `nudge-card-cus-${row.id}-${pmId}`);
   if (row.stripe_subscription_id) {
     const sub = await liveSubscription(env, row.stripe_subscription_id);
     if (sub) await stripe(env, "POST", "/v1/subscriptions/" + encodeURIComponent(sub.id), { default_payment_method: pmId }, `nudge-card-sub-${row.id}-${pmId}`);
   }
-  const full = pm && typeof pm === "object" && pm.card ? pm : await stripe(env, "GET", "/v1/payment_methods/" + encodeURIComponent(pmId));
   const summary = cardSummary(full);
   await saveCardSummary(env, row.id, summary);
   return summary;
@@ -2735,9 +2744,9 @@ async function ownerCardSession(request, env) {
       mode: "setup",
       customer: row.stripe_customer_id,
       currency: "usd",
-      // The pinned API version refuses payment_method_types on Checkout; methods come from the Dashboard.
-      // Exclude non-card methods so the client saves a card (Link, which can't be excluded, is shown as "Link").
-      excluded_payment_method_types: CARD_SETUP_EXCLUDED_TYPES,
+      // The pinned API version refuses payment_method_types on Checkout. Cards only comes from a payment method
+      // configuration that enables only cards (STRIPE_CARD_PAYMENT_CONFIGURATION, pmc_...).
+      ...(cardOnlyPaymentConfig(env) ? { payment_method_configuration: cardOnlyPaymentConfig(env) } : { excluded_payment_method_types: CARD_SETUP_EXCLUDED_TYPES }),
       success_url: origin + "/?card_session={CHECKOUT_SESSION_ID}#/settings",
       cancel_url: origin + "/#/settings",
       metadata: { app: "nudge-dispatch", company_id: row.id, purpose: "card" },
@@ -2766,6 +2775,10 @@ async function ownerCardConfirm(request, env) {
     const problem = setupSessionProblem(session, row);
     if (problem) return fail(409, problem);
     const summary = await useCardForCompany(env, row, session.setup_intent.payment_method);
+    if (summary && summary.refused) {
+      await writeAudit(env, user.userId, "billing.card_refused", "company", row.id, { reason: "not a card", mode: stripeModeWord(env) });
+      return fail(409, NOT_A_CARD);
+    }
     await writeAudit(env, user.userId, "billing.card_saved", "company", row.id, { brand: summary ? summary.brand : "", last4: summary ? summary.last4 : "", mode: stripeModeWord(env) });
     const synced = await syncCompanyCard(env, await billingRow(env, row.id));
     return json({ ok: true, started: true, ...synced, paymentMethod: synced.paymentMethod || summary });
@@ -2805,7 +2818,7 @@ async function stripeSelfCheck(env) {
   const key = typeof env.STRIPE_SECRET_KEY === "string" ? env.STRIPE_SECRET_KEY : "";
   const keyClass = stripeKeyClass(key);
   const connection = billingConnection(env);
-  const out = { keyClass, keyLength: key.length > 90 ? "long" : key.length > 0 ? "short" : "none", mode: connection.mode, testMode: connection.testMode, problem: connection.problem, stripe: "not-tried", portalConfig: env.STRIPE_PORTAL_CONFIGURATION ? "set" : "unset", portal: "not-tried" };
+  const out = { keyClass, keyLength: key.length > 90 ? "long" : key.length > 0 ? "short" : "none", mode: connection.mode, testMode: connection.testMode, problem: connection.problem, stripe: "not-tried", portalConfig: env.STRIPE_PORTAL_CONFIGURATION ? "set" : "unset", cardConfig: cardOnlyPaymentConfig(env) ? "set" : "unset", portal: "not-tried" };
   if (connection.problem) return out;
   try { await stripe(env, "GET", "/v1/billing/meters", { limit: 1 }); out.stripe = "ok"; } catch (e) { out.stripe = "error " + (e && e.status); }
   if (env.STRIPE_PORTAL_CONFIGURATION) {
@@ -2859,8 +2872,8 @@ async function platformSmsChange(request, env, id) {
         if (enabled && missing.length) return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing texting prices: " + missing.join(", ") + ". Use \"Set up texting meter\" first.");
         // Texting setup fee follows the company's setup-fee choice. Checked before any Stripe change.
         let smsSetupPromoId = "";
-        if (enabled && !setupBilledAt && setupPromoCode(setupFee)) {
-          const code = setupPromoCode(setupFee);
+        if (enabled && !setupBilledAt && smsSetupPromoCode(setupFee)) {
+          const code = smsSetupPromoCode(setupFee);
           const promo = await findPromotion(env, code);
           if (!promo) return fail(409, "Promotion code " + code + " was not found in Stripe " + stripeModeWord(env) + " mode, so texting was not turned on. Fix it in Stripe or change this company's setup fee.");
           if (!couponCoversProduct(promo.coupon, catalog.products[LOOKUP.sms.setup])) return fail(409, "Promotion code " + code + " in Stripe " + stripeModeWord(env) + " mode does not cover the texting setup fee, so texting was not turned on. Change this company's setup fee or the coupon in Stripe.");
@@ -3146,6 +3159,7 @@ async function applyStripeEvent(env, event) {
     const problem = setupSessionProblem(session, row);
     if (problem) return { companyId: company.id, result: "ignored: " + problem };
     const summary = await useCardForCompany(env, row, session.setup_intent.payment_method);
+    if (summary && summary.refused) return { companyId: company.id, result: "ignored: not a card" };
     return { companyId: company.id, result: summary ? "card saved" : "card saved (no card details)" };
   }
   const createdMs = Number(event.created || 0) * 1000;
@@ -4639,7 +4653,7 @@ import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml 
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
 import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, BETA_SPOTS } from "./trial.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
-import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
+import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, smsSetupPromoCode, isCardPaymentMethod, cardOnlyPaymentConfig, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { meetingPointForArrived } from "./progress-nav.js";

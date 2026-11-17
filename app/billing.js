@@ -41,6 +41,19 @@ export function setupFeeFromBody(body, company) {
 export function setupPromoCode(choice) {
   return SETUP_FEE_PROMO[normSetupFee(choice)] || "";
 }
+// Texting setup fee (Jesse, Nov 16, 2026): free -> FREESETUP; beta and charge pay the full texting setup fee.
+export function smsSetupPromoCode(choice) {
+  return normSetupFee(choice) === "free" ? FREE_SETUP_PROMO_CODE : "";
+}
+// Cards only (Jesse, Nov 16, 2026). A saved payment method must be a card; Link, banks, wallets-as-other-types are refused.
+export function isCardPaymentMethod(pm) {
+  return !!(pm && typeof pm === "object" && pm.type === "card" && pm.card && typeof pm.card === "object");
+}
+// Stripe payment method configuration that enables only cards (pmc_...). "" when unset or malformed.
+export function cardOnlyPaymentConfig(env) {
+  const v = env && typeof env.STRIPE_CARD_PAYMENT_CONFIGURATION === "string" ? env.STRIPE_CARD_PAYMENT_CONFIGURATION.trim() : "";
+  return /^pmc_[A-Za-z0-9]{8,64}$/.test(v) ? v : "";
+}
 // Does a coupon (with applies_to expanded) cover this product? No restriction = covers everything.
 export function couponCoversProduct(coupon, productId) {
   if (!coupon || typeof coupon !== "object") return false;
@@ -51,7 +64,6 @@ export function couponCoversProduct(coupon, productId) {
 
 // Card summary kept in D1: brand, last 4, expiry. Never the number, CVC, or anything else.
 export function cardSummary(pm) {
-  if (pm && typeof pm === "object" && pm.type === "link") return { brand: "link", last4: null, expMonth: null, expYear: null };
   const card = pm && typeof pm === "object" && pm.card && typeof pm.card === "object" ? pm.card : null;
   if (!card) return null;
   const last4 = /^\d{4}$/.test(String(card.last4 || "")) ? String(card.last4) : "";
@@ -62,8 +74,8 @@ export function cardSummary(pm) {
   return { brand, last4, expMonth, expYear };
 }
 export function paymentMethodJson(company) {
-  if (!company || (!company.pm_last4 && company.pm_brand !== "link")) return null;
-  return { brand: company.pm_brand || "card", last4: company.pm_last4 || null, expMonth: company.pm_exp_month || null, expYear: company.pm_exp_year || null };
+  if (!company || !company.pm_last4) return null;
+  return { brand: company.pm_brand || "card", last4: company.pm_last4, expMonth: company.pm_exp_month || null, expYear: company.pm_exp_year || null };
 }
 export const SMS_METER_EVENT = "nudge_sms_text";
 export const SMS_INCLUDED_TEXTS = 500;
@@ -342,6 +354,8 @@ export function smsSetupInvoiceItem(customer, subscription, priceId, companyId, 
 export function subscriptionPlanItems(plan, driverCount, sms, prices, setupFee, promoId) {
   const choice = setupFee === true ? "beta" : setupFee === false ? "charge" : normSetupFee(setupFee) || "free";
   const discount = choice !== "charge" && promoId ? [{ promotion_code: promoId }] : null;
+  // The texting setup fee is discounted only for free (FREESETUP); beta pays it in full.
+  const smsDiscount = choice === "free" ? discount : null;
   const L = LOOKUP[plan];
   const items = [{ price: prices[L.base], quantity: 1 }];
   const extras = extraDrivers(plan, driverCount);
@@ -354,7 +368,7 @@ export function subscriptionPlanItems(plan, driverCount, sms, prices, setupFee, 
     items.push({ price: prices[LOOKUP.sms.monthly], quantity: 1 });
     items.push({ price: prices[LOOKUP.sms.overage] }); // metered: no quantity
     const smsSetup = { price: prices[LOOKUP.sms.setup], quantity: 1 };
-    if (discount) smsSetup.discounts = discount;
+    if (smsDiscount) smsSetup.discounts = smsDiscount;
     addInvoiceItems.push(smsSetup);
   }
   const need = [L.base, L.setup, extras > 0 ? L.extra : null, withSms ? LOOKUP.sms.monthly : null, withSms ? LOOKUP.sms.overage : null, withSms ? LOOKUP.sms.setup : null].filter(Boolean);

@@ -33,5 +33,6 @@ export interface NudgeEnv {
   STRIPE_WEBHOOK_SECRET?: string;
   /** Customer portal configuration id for the same Stripe mode as the secret key. */
   STRIPE_PORTAL_CONFIGURATION?: string;
+  STRIPE_CARD_PAYMENT_CONFIGURATION?: string;
   STRIPE_API_BASE?: string;
 }

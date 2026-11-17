@@ -11,6 +11,9 @@ import {
   setupFeeFromBody,
   setupFeeOf,
   setupPromoCode,
+  smsSetupPromoCode,
+  isCardPaymentMethod,
+  cardOnlyPaymentConfig,
   smsSetupInvoiceItem,
   subscriptionPlanItems,
 } from "../app/billing.js";
@@ -39,6 +42,10 @@ test("setup fee choices: free is the default, legacy beta still works", () => {
   assert.equal(setupPromoCode("free"), "FREESETUP");
   assert.equal(setupPromoCode("beta"), "BETA50");
   assert.equal(setupPromoCode("charge"), "");
+  // Texting setup: only free is discounted; beta pays the full texting setup fee (Jesse, Nov 16).
+  assert.equal(smsSetupPromoCode("free"), "FREESETUP");
+  assert.equal(smsSetupPromoCode("beta"), "");
+  assert.equal(smsSetupPromoCode("charge"), "");
 });
 
 test("subscriptionPlanItems discounts only the setup items, per choice", () => {
@@ -54,10 +61,13 @@ test("subscriptionPlanItems discounts only the setup items, per choice", () => {
   // Legacy booleans: true = beta, false = charge.
   assert.ok(subscriptionPlanItems("small", 1, false, PRICES, true, "promo_b").addInvoiceItems[0].discounts);
   assert.equal(subscriptionPlanItems("small", 1, false, PRICES, false, "promo_b").addInvoiceItems[0].discounts, undefined);
-  // With texting, the texting setup fee is discounted too; monthly texting is not.
+  // With texting: free discounts the texting setup fee too; beta pays it in full; monthly is never discounted.
   const sms = subscriptionPlanItems("small", 1, true, PRICES, "free", "promo_f");
   assert.deepEqual(sms.addInvoiceItems[1], { price: "price_sms_setup", quantity: 1, discounts: [{ promotion_code: "promo_f" }] });
   assert.ok(sms.items.every((it) => !it.discounts));
+  const betaSms = subscriptionPlanItems("small", 1, true, PRICES, "beta", "promo_b");
+  assert.deepEqual(betaSms.addInvoiceItems[0].discounts, [{ promotion_code: "promo_b" }]);
+  assert.deepEqual(betaSms.addInvoiceItems[1], { price: "price_sms_setup", quantity: 1 });
 });
 
 test("texting setup invoice item carries the promo only when given", () => {
@@ -81,8 +91,15 @@ test("card summary keeps brand, last 4, and expiry only", () => {
   assert.equal(cardSummary({ card: { brand: "visa", last4: "42x2" } }), null);
   assert.equal(cardSummary({ type: "us_bank_account" }), null);
   assert.equal(cardSummary(null), null);
-  assert.deepEqual(cardSummary({ type: "link", link: { email: "x@example.test" } }), { brand: "link", last4: null, expMonth: null, expYear: null });
-  assert.deepEqual(paymentMethodJson({ pm_brand: "link" }), { brand: "link", last4: null, expMonth: null, expYear: null });
+  assert.equal(cardSummary({ type: "link", link: { email: "x@example.test" } }), null);
+  assert.equal(paymentMethodJson({ pm_brand: "link" }), null);
+  assert.equal(isCardPaymentMethod(pm), false, "no type");
+  assert.equal(isCardPaymentMethod({ ...pm, type: "card" }), true);
+  assert.equal(isCardPaymentMethod({ type: "link", link: {} }), false);
+  assert.equal(isCardPaymentMethod({ type: "us_bank_account", us_bank_account: { last4: "6789" } }), false);
+  assert.equal(cardOnlyPaymentConfig({ STRIPE_CARD_PAYMENT_CONFIGURATION: " pmc_1UcaNs89AlupqlmB9qgbIW3Q " }), "pmc_1UcaNs89AlupqlmB9qgbIW3Q");
+  assert.equal(cardOnlyPaymentConfig({ STRIPE_CARD_PAYMENT_CONFIGURATION: "card" }), "");
+  assert.equal(cardOnlyPaymentConfig({}), "");
   assert.deepEqual(paymentMethodJson({ pm_brand: "amex", pm_last4: "0005", pm_exp_month: 1, pm_exp_year: 2031 }), { brand: "amex", last4: "0005", expMonth: 1, expYear: 2031 });
   assert.equal(paymentMethodJson({}), null);
   const b = billingJson({ billing_plan: "small", setup_fee: "charge", pm_brand: "visa", pm_last4: "4242" }, 1);
