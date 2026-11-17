@@ -149,6 +149,9 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     assert.equal(cfg.data.plan, "solo");
     assert.equal(cfg.data.smsAllowed, false);
     assert.equal(cfg.data.setupWaived, true);
+    assert.match(cfg.data.selfSetupLabel, /setup fee waived/);
+    assert.match(cfg.data.assistedSetupText, /\$299 one-time assisted setup/);
+    assert.match(cfg.data.assistedSetupMailto, /^mailto:nudgedispatch@gmail\.com\?subject=/);
     assert.match(cfg.data.textingUpgradeNote, /Small fleet and up/);
     assert.equal(cfg.data.bookingHost, "app.nudgedispatch.com");
 

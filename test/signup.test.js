@@ -73,6 +73,9 @@ test("public signup is Solo, no trial SMS, and requires terms plus permanent-cod
   const cfg = signupPublicConfig({});
   assert.equal(cfg.smsAllowed, false);
   assert.equal(cfg.setupWaived, true);
+  assert.match(cfg.selfSetupLabel, /^Self setup \(you're doing it now\): setup fee waived$/);
+  assert.equal(cfg.assistedSetupText, "Prefer we set it up for you? $299 one-time assisted setup.");
+  assert.equal(cfg.assistedSetupMailto, "mailto:nudgedispatch@gmail.com?subject=Nudge%20Dispatch%20Solo%20assisted%20setup");
   assert.ok(cfg.textingUpgradeNote);
 });
 
@@ -130,4 +133,14 @@ test("Turnstile is skipped when no secret is configured", async () => {
   assert.equal(skipped.skipped, true);
   const blocked = await verifyTurnstile({ TURNSTILE_SECRET_KEY: "sec" }, "");
   assert.equal(blocked.ok, false);
+});
+
+test("signup plan card shows self setup as default and assisted setup as the emailed alternative", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../app/client-signup.txt", import.meta.url), "utf8");
+  assert.match(src, /id="setup-self"/);
+  assert.match(src, /cfg\.selfSetupLabel/);
+  assert.match(src, /id="setup-assisted"/);
+  assert.match(src, /cfg\.assistedSetupMailto/);
+  assert.ok(src.indexOf('id="setup-self"') < src.indexOf('id="setup-assisted"'));
 });

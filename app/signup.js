@@ -18,6 +18,15 @@ export const SIGNUP_POST_MAX = 8;
 export const SIGNUP_SLUG_MAX = 60;
 export const SIGNUP_BOOKING_HOST = "app.nudgedispatch.com";
 
+// Solo setup choice (Jesse, Nov 17, 2026): self setup on this page is the default and waives the setup fee.
+// Assisted setup (we set it up for you) carries the one-time setup fee and is arranged by email, so the
+// self-serve Checkout never adds a setup line.
+export const CONCIERGE_EMAIL = "nudgedispatch@gmail.com";
+export const ASSISTED_SETUP_SUBJECT = "Nudge Dispatch Solo assisted setup";
+export function assistedSetupMailto() {
+  return "mailto:" + CONCIERGE_EMAIL + "?subject=" + encodeURIComponent(ASSISTED_SETUP_SUBJECT);
+}
+
 export function bookingPreviewUrl(slug) {
   const code = normalizeSlug(slug);
   return code ? "https://" + SIGNUP_BOOKING_HOST + "/book/" + code + "/" : "";
@@ -160,6 +169,9 @@ export function signupPublicConfig(env) {
     monthly: dollars(SOLO_MONTHLY_CENTS),
     setupWaived: true,
     setupWas: dollars(SOLO_SETUP_CENTS),
+    selfSetupLabel: "Self setup (you're doing it now): setup fee waived",
+    assistedSetupText: "Prefer we set it up for you? " + dollars(SOLO_SETUP_CENTS) + " one-time assisted setup.",
+    assistedSetupMailto: assistedSetupMailto(),
     smsAllowed: smsAllowed(PUBLIC_BILLING_PLAN),
     smsPlans: SMS_PLANS.slice(),
     smsPriceText: SMS_PRICE_TEXT,
