@@ -560,6 +560,7 @@
     confirm.textContent = q.confirm || "";
   }
   let lastQuote = null;
+  let lastQuoteKey = "";
   function normStreet(s) {
     return String(s || "").toLowerCase().replace(/[.,#]/g, " ").replace(/\s+/g, " ").trim();
   }
@@ -571,6 +572,7 @@
     return !!(a && a === b);
   }
   async function requestQuote() {
+    delete $("#quote").dataset.queued;
     if (!quoteInfo) return;
     if (stopValues().length) {
       // Stops: never an instant estimate. The operator prices the trip.
@@ -589,6 +591,14 @@
       renderQuote({ available: false, message: "Pickup and drop-off are the same address. Enter a different drop-off, or choose a drop-off at the airport." });
       return;
     }
+    // Same trip as the estimate on screen (e.g. a field lost focus, or an empty stop was added):
+    // keep it instead of flashing "Calculating" and asking the server again.
+    const key = JSON.stringify(tripBody());
+    if (lastQuote && key === lastQuoteKey) {
+      quoteSeq++;
+      renderQuote(lastQuote);
+      return;
+    }
     const my = ++quoteSeq;
     renderQuote(null, true);
     try {
@@ -600,6 +610,7 @@
         return;
       }
       lastQuote = result.data.quote;
+      lastQuoteKey = key;
       renderQuote(result.data.quote);
     } catch {
       if (my === quoteSeq) renderQuote({ available: false, message: "Send the request and the operator will confirm the price." });
@@ -608,6 +619,7 @@
   function scheduleQuote(delay) {
     if (!quoteInfo) return;
     clearTimeout(quoteTimer);
+    $("#quote").dataset.queued = "1";
     quoteTimer = setTimeout(requestQuote, delay == null ? 600 : delay);
   }
 
