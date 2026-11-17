@@ -420,6 +420,8 @@ body.signup-page { padding-bottom: 0; overflow-x: hidden; }
 }
 .signup-card .plan-card legend { font-weight: 700; padding: 0 4px; }
 .signup-card .plan-name { margin: 0 0 6px; font-size: 18px; font-weight: 700; }
+.signup-card .setup-self { margin: 8px 0 4px; color: var(--green); }
+.signup-card .setup-assisted { margin: 0 0 8px; }
 .signup-card .terms-check { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; margin: 12px 0; color: var(--text); font-size: 16px; min-height: 44px; }
 .signup-card .terms-check input {
   width: 22px; height: 22px; min-width: 22px; min-height: 22px; margin-top: 11px; padding: 0;
