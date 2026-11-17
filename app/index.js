@@ -1888,6 +1888,10 @@ async function postBlandInbound(request, env, token) {
        WHERE company_id = ? AND id = ? AND approval = 'requested'`
     ).bind(merged.date || openDraft.pickup_date, merged.time || "", merged.pickup || "", merged.dropoff || "", merged.flight || "", merged.passengers || openDraft.passengers || 1, merged.luggage ?? null,
       openDraft.driver_user_id || (suggestion ? suggestion.id : null), JSON.stringify(next), now, company.id, openDraft.id).run();
+    // A name in a follow-up text replaces the "Text from (404) ..." placeholder on a client this text created.
+    if (intake.createdClient && !(intake.parsed && intake.parsed.name) && merged.name) {
+      await env.DB.prepare("UPDATE clients SET name = ?, updated_at = ? WHERE company_id = ? AND id = ? AND name LIKE 'Text from %'").bind(merged.name.slice(0, 80), now, company.id, openDraft.client_id).run();
+    }
     await logInbound(env, { ...base, rideId: openDraft.id, dedupeKey, outcome: "merged" });
     return intakeOk({ rideId: openDraft.id, merged: true });
   }

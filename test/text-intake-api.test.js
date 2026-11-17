@@ -140,6 +140,7 @@ test("text-to-ride: webhook auth, draft in owner queue, suggested driver, merge,
     assert.equal(one.data.ride.dropoff, "3500 Lenox Rd NE");
     assert.equal(one.data.ride.pickup, "ATL · Domestic Terminal");
     assert.equal(one.data.ride.intake.messages.length, 2);
+    assert.equal(one.data.ride.clientName, "Dana Lee", "name from the follow-up text replaces the placeholder");
 
     // A text from a known client's phone matches that client.
     const known = await bland(worker, { ...msg, conversation_id: "conv-2", from: "+14045550188", message: "Pick me up at ATL tomorrow 6:40am UA 1189 to 10 Park Pl" });
@@ -153,10 +154,10 @@ test("text-to-ride: webhook auth, draft in owner queue, suggested driver, merge,
     assert.equal(refused.status, 400);
     assert.match(refused.data.error, /pickup time/);
 
-    const edit = await call(worker, "/api/rides/" + rideId + "/draft", { method: "PATCH", session, body: { time: "20:30", clientName: "Dana Lee", passengers: 2, driverUserId: ana.data.driver.id } });
+    const edit = await call(worker, "/api/rides/" + rideId + "/draft", { method: "PATCH", session, body: { time: "20:30", clientName: "Dana M. Lee", passengers: 2, driverUserId: ana.data.driver.id } });
     assert.equal(edit.status, 200, JSON.stringify(edit.data));
     assert.equal(edit.data.ride.time, "20:30");
-    assert.equal(edit.data.ride.clientName, "Dana Lee");
+    assert.equal(edit.data.ride.clientName, "Dana M. Lee");
     assert.equal((await call(worker, "/api/rides/" + rideId + "/draft", { method: "PATCH", session, body: { time: "25:99" } })).status, 400);
     const approved = await call(worker, "/api/rides/" + rideId + "/approve", { method: "POST", session, body: { fare: "145", driverUserId: ben.data.driver.id } });
     assert.equal(approved.status, 200, JSON.stringify(approved.data));

@@ -884,7 +884,7 @@ async function renderRide(id, gen) {
   }, 0);
   const links = loc.data.ok && Array.isArray(loc.data.links) ? loc.data.links.filter((link) => !link.revokedAt) : [];
   box.innerHTML = `<article class="card">
-      <div class="row"><h2>${esc(ride.clientName)}</h2><span class="badge ${esc(ride.status)}">${esc(schedule.now || label(ride.status))}</span></div>
+      <div class="row"><h2>${esc(ride.clientName)}</h2><span class="badge ${esc(ride.status)}">${esc(ride.source === "text" && ride.status === "requested" ? rideBadgeText(ride) : schedule.now || label(ride.status))}</span></div>
       <p class="route">${esc(ride.pickup)}<br>${rideStops(ride).map((stop, i) => `→ <span class="stop-tag">Stop ${i + 1}:</span> ${esc(stop)}<br>`).join("")}→ ${esc(ride.dropoff)}</p>
       ${rideStops(ride).length && ride.status === "requested" && !driverView && !ride.quote ? `<p class="sub">This request has stops. No estimate was shown; the client saw Price on request.</p>` : ""}
       ${tripLine(ride) ? `<p class="sub">${esc(tripLine(ride))}</p>` : ""}

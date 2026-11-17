@@ -199,7 +199,7 @@ function isAirportPhrase(s, airport) {
 }
 
 export function parseName(text) {
-  const m = /\b(?:this is|it'?s|its|my name is|name is|i am|i'm|im)\s+([A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+)?)/.exec(text);
+  const m = /\b(?:[Tt]his is|[Ii]t'?s|[Ii]ts|[Mm]y name is|[Nn]ame is|I am|I'm|[Ii]m)\s+([A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+)?)/.exec(text);
   if (m && !/^(Landing|Flying|Coming|Arriving|Going|Delta|American|United|Southwest|Here|On|At|In|Back)$/.test(m[1].split(/\s+/)[0])) return m[1].slice(0, 80);
   const sign = /(?:^|\n|[.!]\s+|[-–—~]\s*)([A-Z][a-z'’-]{1,20}(?:\s+[A-Z][a-z'’-]{1,20})?)\s*$/.exec(text.trim());
   if (sign && /[-–—~\n]/.test(text.trim().slice(Math.max(0, text.trim().length - sign[0].length - 1)))) {
