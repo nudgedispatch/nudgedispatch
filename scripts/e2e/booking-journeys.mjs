@@ -102,8 +102,8 @@ try {
     };
     const shot = (name) => page.screenshot({ path: join(shots, `nudge-${tag}-${name}.png`), fullPage: true });
     const quoteText = async () => {
-      await page.waitForFunction(() => { const q = document.querySelector("#quote"); return q && q.dataset.state !== "pending"; }, null, { timeout: 10000 }).catch(() => {});
-      await page.waitForTimeout(250);
+      // Settled: no quote request queued (debounce or blur) and none in flight.
+      await page.waitForFunction(() => { const q = document.querySelector("#quote"); return q && !q.dataset.queued && q.dataset.state !== "pending"; }, null, { timeout: 10000 }).catch(() => {});
       return (await vis("#quote")) ? await page.locator("#qPrice").textContent() : "";
     };
 
