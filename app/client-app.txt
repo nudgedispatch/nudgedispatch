@@ -2320,11 +2320,27 @@ async function renderRateSheet(gen) {
 }
 
 // Airport pickups on the booking page, passenger limits, and flight alerts (owner only).
-async function renderAirportSettings(gen) {
+// `notice` is shown after a save re-renders the card, so a tap on Save always gives visible feedback.
+/* air-save-logic-start */
+const AIR_SAVED = { preset: "Saved. ATL terminals are on your booking page.", off: "Saved. Airport options are off.", save: "Saved airport settings." };
+function airSaveBody(kind, s, sedanValue, earlyValue) {
+  if (kind === "preset") return { body: { preset: ["ATL"] } };
+  if (kind === "off") return { body: { airports: { airports: [] } } };
+  const sedan = Number(String(sedanValue == null ? "" : sedanValue).trim());
+  if (!Number.isInteger(sedan) || sedan < 1 || sedan > 56) return { error: "Most passengers in a sedan must be a whole number from 1 to 56." };
+  const early = Number(earlyValue);
+  return { body: {
+    capacities: { ...((s && s.capacities) || {}), sedan },
+    flightRules: { ...((s && s.flightRules) || {}), earlyMinutes: early },
+  } };
+}
+/* air-save-logic-end */
+async function renderAirportSettings(gen, notice) {
   const result = await api("/api/booking-settings");
   if (gen !== renderGen) return;
   const box = document.querySelector("#airbox");
-  if (!box || !result.data.ok) return;
+  if (!box) return;
+  if (!result.data.ok) { box.innerHTML = `<section class="card"><h2>Airport pickups</h2><p class="err">${esc(result.data.error || "Could not load airport settings.")}</p></section>`; return; }
   const s = result.data.settings;
   const airports = (s.airports && s.airports.airports) || [];
   const classes = result.data.fleetClasses || [];
@@ -2332,27 +2348,34 @@ async function renderAirportSettings(gen) {
       <h2>Airport pickups</h2>
       <p class="sub">${airports.length ? "On the booking page: " + esc(airports.map((a) => a.code + " (" + a.spots.map((x) => x.label).join(", ") + ")").join("; ")) : "Off. Clients type both addresses."}</p>
       ${airports.length ? airports.map((a) => `<p class="sub">${a.pickupMeet ? "Pickup meeting points: " + esc(a.pickupMeet.options.map((o) => o.label).join(", ")) + ". " : ""}${a.dropoffStyle ? "Drop-off: " + esc(a.dropoffStyle.options.map((o) => o.label).join(" or ")) + "." : ""}</p>`).join("") : ""}
-      <div class="actions"><button class="btn ghost" type="button" id="air-atl">Use the ATL terminals</button>${airports.length ? `<button class="btn ghost" type="button" id="air-off">Turn off airport options</button>` : ""}</div>
+      <div class="actions"><button class="btn ghost" type="button" id="air-atl">${airports.some((a) => a.code === "ATL") ? "Reset to the ATL terminals" : "Use the ATL terminals"}</button>${airports.length ? `<button class="btn ghost" type="button" id="air-off">Turn off airport options</button>` : ""}</div>
       <p class="sub">Your fleet: ${classes.length ? esc(classes.join(", ")) : "no vehicle types on the roster yet, so every vehicle on your rates is offered"}. Vehicles your fleet doesn't run are hidden from clients.</p>
-      <label>Most passengers in a sedan<input id="cap-sedan" type="number" min="1" max="8" value="${esc(s.capacities && s.capacities.sedan ? s.capacities.sedan : 3)}"></label>
+      <label>Most passengers in a sedan<input id="cap-sedan" type="number" inputmode="numeric" min="1" max="56" value="${esc(s.capacities && s.capacities.sedan ? s.capacities.sedan : 3)}"></label>
       <label>Alert drivers when a flight lands early by<select id="early-min">${[15, 20, 25, 30].map((n) => `<option value="${n}"${s.flightRules && s.flightRules.earlyMinutes === n ? " selected" : ""}>${n} minutes or more</option>`).join("")}</select></label>
       <p class="sub">Drivers are also alerted to delays over ${esc(s.flightRules ? s.flightRules.delayMinutes : 30)} minutes, cancellations, and other flight changes. ${result.data.flightTracking ? "Flight tracking is on." : "Flight tracking is not connected yet."}</p>
-      <button class="btn" type="button" id="air-save">Save</button>
-      <p class="sub" id="air-msg"></p>
+      <button class="btn full" type="button" id="air-save">Save airport settings</button>
+      <p class="sub air-msg${notice ? " ok" : ""}" id="air-msg" role="status" aria-live="polite">${notice ? esc(notice) : ""}</p>
     </section>`;
   const msg = document.querySelector("#air-msg");
-  const save = async (body) => {
-    const r = await api("/api/booking-settings", { method: "PUT", body });
-    if (!r.data.ok) { msg.textContent = r.data.error || "Could not save."; return; }
-    renderAirportSettings(gen);
+  const buttons = () => [...box.querySelectorAll("#air-atl, #air-off, #air-save")];
+  const showError = (text) => { msg.textContent = text; msg.classList.remove("ok"); msg.classList.add("bad"); };
+  const save = async (kind) => {
+    const built = airSaveBody(kind, s, (document.querySelector("#cap-sedan") || {}).value, (document.querySelector("#early-min") || {}).value);
+    if (built.error) { showError(built.error); return; }
+    buttons().forEach((b) => { b.disabled = true; });
+    msg.classList.remove("ok", "bad");
+    msg.textContent = "Saving\u2026";
+    const r = await api("/api/booking-settings", { method: "PUT", body: built.body });
+    if (gen !== renderGen) return;
+    if (!r.data.ok) { buttons().forEach((b) => { b.disabled = false; }); showError(r.data.error || "Could not save."); return; }
+    await renderAirportSettings(gen, AIR_SAVED[kind]);
+    const again = document.querySelector("#air-msg");
+    if (again && again.scrollIntoView) again.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
-  document.querySelector("#air-atl").onclick = () => save({ preset: ["ATL"] });
+  document.querySelector("#air-atl").onclick = () => save("preset");
   const off = document.querySelector("#air-off");
-  if (off) off.onclick = () => save({ airports: { airports: [] } });
-  document.querySelector("#air-save").onclick = () => save({
-    capacities: { ...(s.capacities || {}), sedan: Number(document.querySelector("#cap-sedan").value) },
-    flightRules: { ...(s.flightRules || {}), earlyMinutes: Number(document.querySelector("#early-min").value) },
-  });
+  if (off) off.onclick = () => save("off");
+  document.querySelector("#air-save").onclick = () => save("save");
 }
 
 // Regular client schedules. Rides are never created automatically: each upcoming date waits here

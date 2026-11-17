@@ -458,3 +458,7 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .brand-preview .brand { color: var(--teal); font-weight: 700; font-size: 17px; }
 .brand-preview .brand small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
 .signup-step { margin-top: 8px; }
+/* Airport settings save feedback */
+.air-msg { min-height: 1.4em; margin: 8px 0 0; }
+.air-msg.ok { color: var(--green); }
+.air-msg.bad { color: var(--red); }
