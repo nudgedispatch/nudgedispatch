@@ -233,6 +233,11 @@ label.check { flex-direction: row; align-items: center; gap: 10px; color: var(--
 label.check input { width: 22px; min-height: 22px; height: 22px; flex: 0 0 auto; }
 .billing-admin { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
 .billing-admin h3 { font-size: 1rem; margin: 0; }
+.billing-admin .setup-fee-label { margin: 0; }
+#card-card .pm-line { font-size: 17px; margin: 4px 0 6px; }
+#card-card .pm-brand { font-weight: 600; }
+#card-card .pm-invoice { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+#card-card .pm-hosted { display: block; text-align: center; text-decoration: none; }
 .billing-admin label.check, .sms-choice label.check { margin: 0; }
 /* Billing access (draft Nov 10, 2026) */
 .card.billing-banner { border-color: #6b4a1f; background: #1d170f; }
