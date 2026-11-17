@@ -2274,9 +2274,9 @@ async function fulfillSignup(env, session, signup) {
         signup.id, signup.terms_accepted_at || now, signup.terms_version || SIGNUP_TERMS_VERSION,
         customerId, subscriptionId, liveFlag, billingStatus, now),
       env.DB.prepare(
-        `INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at, full_name, phone)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(userId, companyId, signup.email, signup.password_hash, signup.password_salt, signup.password_iterations, signup.password_kdf || PASSWORD_KDF, now, now, signup.owner_name || "", signup.owner_phone || ""),
+        `INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at, full_name, phone, terms_accepted_at, terms_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(userId, companyId, signup.email, signup.password_hash, signup.password_salt, signup.password_iterations, signup.password_kdf || PASSWORD_KDF, now, now, signup.owner_name || "", signup.owner_phone || "", signup.terms_accepted_at || now, signup.terms_version || SIGNUP_TERMS_VERSION),
       env.DB.prepare("INSERT INTO memberships (company_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)").bind(companyId, userId, now),
       env.DB.prepare(
         `INSERT INTO invoice_settings (company_id, business_name, address, phone, email, website, logo_data_url, theme_color, updated_at)
@@ -3457,6 +3457,11 @@ async function acceptInvite(request, env) {
     await releaseInvite(env, invite.id);
     return fail(400, "This setup link is invalid or already used.");
   }
+  // Account creation from a setup link (owner or driver) needs the Terms + Privacy checkbox. Password resets don't.
+  if (invite.purpose === "invite" && body.termsAccepted !== true) {
+    await releaseInvite(env, invite.id);
+    return fail(400, TERMS_CONSENT_ERROR);
+  }
   const password = body.password;
   try {
     if (invite.purpose === "invite" && invite.join_company_id && invite.join_role === "driver") {
@@ -3470,8 +3475,8 @@ async function acceptInvite(request, env) {
       const hashed = await hashPassword(password);
       await env.DB.batch([
         env.DB.prepare(
-          "INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).bind(userId, company.id, invite.email, hashed.hash, hashed.salt, hashed.iterations, PASSWORD_KDF, now, now),
+          "INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at, terms_accepted_at, terms_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(userId, company.id, invite.email, hashed.hash, hashed.salt, hashed.iterations, PASSWORD_KDF, now, now, now, SIGNUP_TERMS_VERSION),
         env.DB.prepare("INSERT INTO memberships (company_id, user_id, role, created_at) VALUES (?, ?, 'driver', ?)").bind(company.id, userId, now)
       ]);
       const session = await startSession(env, request, userId);
@@ -3487,10 +3492,10 @@ async function acceptInvite(request, env) {
       // Texting is never turned on at signup (only after the company is paying).
       const smsChoice = 0;
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO companies (id, name, created_at, kind, trial_started_at, billing_plan, sms_addon_enabled, sms_addon_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(companyId, invite.company_name || "My car service", now, kind, now, billingPlan, smsChoice, now),
+        env.DB.prepare("INSERT INTO companies (id, name, created_at, kind, trial_started_at, billing_plan, sms_addon_enabled, sms_addon_updated_at, terms_accepted_at, terms_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(companyId, invite.company_name || "My car service", now, kind, now, billingPlan, smsChoice, now, now, SIGNUP_TERMS_VERSION),
         env.DB.prepare(
-          "INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).bind(userId, companyId, invite.email, hashed.hash, hashed.salt, hashed.iterations, PASSWORD_KDF, now, now),
+          "INSERT INTO users (id, company_id, email, password_hash, password_salt, password_iterations, password_kdf, created_at, password_changed_at, terms_accepted_at, terms_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(userId, companyId, invite.email, hashed.hash, hashed.salt, hashed.iterations, PASSWORD_KDF, now, now, now, SIGNUP_TERMS_VERSION),
         env.DB.prepare("INSERT INTO memberships (company_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)").bind(companyId, userId, now),
         env.DB.prepare(
           `INSERT INTO invoice_settings (company_id, business_name, email, updated_at) VALUES (?, ?, ?, ?)`
@@ -4911,7 +4916,7 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
-import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
+import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
 import { validatePaymentMethods, parseStoredPaymentMethods, payOptions, payLines } from "./payment-methods.js";

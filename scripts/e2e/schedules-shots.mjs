@@ -44,7 +44,7 @@ try {
   const base = `http://${worker.address}:${worker.port}`;
   assert.match(base, /^http:\/\/(127\.0\.0\.1|localhost):\d+$/, "local worker only");
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email: "preview@example.test", companyName: "The Gold Standard Limo", accountKind: "fleet" } });
-  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "preview-owner-pass-1" } });
+  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "preview-owner-pass-1", termsAccepted: true } });
   const session = { cookie: acc.cookie, csrf: acc.data.csrf };
   const driver = await call(worker, "/api/drivers", { method: "POST", session, body: { name: "Dee Driver", vehicle: "Black Chevy Suburban" } });
   const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });

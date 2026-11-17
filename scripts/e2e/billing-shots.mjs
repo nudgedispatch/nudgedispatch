@@ -73,7 +73,7 @@ try {
   assert.match(base, /^http:\/\/(127\.0\.0\.1|localhost):\d+$/, "local worker only");
   const open = async (email, companyName) => {
     const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName, accountKind: "fleet" } });
-    const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "preview-owner-pass-1" } });
+    const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "preview-owner-pass-1", termsAccepted: true } });
     assert.equal(acc.status, 201, JSON.stringify(acc.data));
     return { cookie: acc.cookie, csrf: acc.data.csrf };
   };

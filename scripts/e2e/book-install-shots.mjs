@@ -58,7 +58,7 @@ try {
   });
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email: "shots@example.test", companyName: "Bailey Consulting", accountKind: "fleet" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
-  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "shots-owner-pass-1" } });
+  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "shots-owner-pass-1", termsAccepted: true } });
   const session = { cookie: acc.cookie, csrf: acc.data.csrf };
   const settings = await call(worker, "/api/settings", { session });
   const slug = settings.data.settings.bookingSlug;

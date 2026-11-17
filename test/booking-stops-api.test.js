@@ -53,7 +53,7 @@ test("multi-stop booking: price on request, stored stops, owner views, CSV, invo
     });
     const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email: "stops@example.test", companyName: "Stops Cars", accountKind: "fleet" } });
     assert.equal(invite.status, 201, JSON.stringify(invite.data));
-    const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass" } });
+    const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass", termsAccepted: true } });
     const session = { cookie: accepted.cookie, csrf: accepted.data.csrf || "" };
     const settings = await call(worker, "/api/settings", { session });
     const slug = settings.data.settings.bookingSlug;

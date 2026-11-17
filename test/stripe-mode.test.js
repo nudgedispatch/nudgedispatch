@@ -321,7 +321,7 @@ test("webhooks follow the key mode and record livemode", { timeout: 240000 }, as
     assert.equal(invite.status, 201, JSON.stringify(invite.data));
     const accepted = await call(worker, "/api/invites/accept", {
       method: "POST",
-      body: { token: invite.data.inviteToken, password: "sample-owner-pass" },
+      body: { token: invite.data.inviteToken, password: "sample-owner-pass", termsAccepted: true },
     });
     assert.equal(accepted.status, 201, JSON.stringify(accepted.data));
     const session = { cookie: accepted.cookie, csrf: accepted.data.csrf || "" };

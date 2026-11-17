@@ -9,7 +9,8 @@ import { THEME_PRESETS, themeProblem } from "./theme.js";
 export const PUBLIC_BILLING_PLAN = "solo";
 export const SIGNUP_TERMS_URL = "https://nudgedispatch.com/terms.html";
 export const SIGNUP_PRIVACY_URL = "https://nudgedispatch.com/privacy.html";
-export const SIGNUP_TERMS_VERSION = "nudgedispatch.com/terms.html#2026-11-09";
+export const SIGNUP_TERMS_VERSION = "nudgedispatch.com/terms.html#2026-11-17";
+export const TERMS_CONSENT_ERROR = "Please agree to the Terms of Service and Privacy Policy.";
 export const SIGNUP_TTL_MS = 24 * 60 * 60 * 1000;
 export const SOLO_MONTHLY_CENTS = 3900;
 export const SOLO_SETUP_CENTS = 29900; // advertised price; waived for self-serve
@@ -126,7 +127,7 @@ export function signupFieldProblems(body) {
     if (signupWantsSms(body)) return "Texting is available on Small fleet and up.";
   }
   if (body.slugPermanentConfirmed !== true) return "Please confirm you understand the company code can't be changed.";
-  if (body.termsAccepted !== true) return "Please agree to the Terms of Service and Privacy Policy.";
+  if (body.termsAccepted !== true) return TERMS_CONSENT_ERROR;
   const address = String(body.address || "").trim();
   if (address.length > 200) return "Use 200 characters or fewer for the address.";
   const businessPhone = phoneProblem(body.businessPhone, "business phone");

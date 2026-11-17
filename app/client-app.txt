@@ -630,6 +630,7 @@ function renderStart() {
       </label>
       <label>Repeat password<input id="again" type="password" autocomplete="new-password" required></label>
       <p class="muted" id="pw-hint"></p>
+      <label class="check terms-check" id="terms-row"><input id="termsAccepted" type="checkbox"> <span>I agree to the <a href="https://nudgedispatch.com/terms.html" target="_blank" rel="noopener">Terms of Service</a> and <a href="https://nudgedispatch.com/privacy.html" target="_blank" rel="noopener">Privacy Policy</a>.</span></label>
       <p class="err" id="err"></p>
       <button class="btn full" type="submit">Save password and open my rides</button>
     </form>
@@ -641,6 +642,18 @@ function renderStart() {
   passwordInput.addEventListener("input", updateStartHint);
   againInput.addEventListener("input", updateStartHint);
   if (!state.inviteToken) formError("Open the one-time setup link you were given.");
+  // New accounts (owner or driver setup links) must agree to the Terms + Privacy; password-reset links don't show it.
+  const termsRow = document.querySelector("#terms-row");
+  const termsBox = document.querySelector("#termsAccepted");
+  let needsTerms = true;
+  if (state.inviteToken) {
+    api("/api/invites/peek", { method: "POST", auth: false, body: { token: state.inviteToken } }).then((peek) => {
+      if (peek && peek.data && peek.data.ok && peek.data.kind === "reset") {
+        needsTerms = false;
+        termsRow.style.display = "none";
+      }
+    }).catch(() => {});
+  }
   form.onsubmit = async (event) => {
     event.preventDefault();
     const password = passwordInput.value;
@@ -650,9 +663,10 @@ function renderStart() {
     if (password.length < 12 || password.length > 200) return formError("Use a password between 12 and 200 characters.");
     if (password !== again) return formError("Those passwords do not match.");
     if (!state.inviteToken) return formError("Open the one-time setup link you were given.");
+    if (needsTerms && !termsBox.checked) return formError("Please agree to the Terms of Service and Privacy Policy.");
     button.disabled = true;
     try {
-      const acceptBody = { token: state.inviteToken, password };
+      const acceptBody = { token: state.inviteToken, password, termsAccepted: needsTerms ? termsBox.checked : false };
       const result = await api("/api/invites/accept", { method: "POST", auth: false, body: acceptBody });
       if (!result.data.ok) return formError(startAcceptError(result.data));
       clearInviteToken();

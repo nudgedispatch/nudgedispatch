@@ -74,7 +74,7 @@ test("booking HTML is rendered per slug with escaped titles and no-store", { tim
     assert.equal(invite.status, 201, JSON.stringify(invite.data));
     const accepted = await call(worker, "/api/invites/accept", {
       method: "POST",
-      body: { token: invite.data.inviteToken, password: "sample-owner-pass" },
+      body: { token: invite.data.inviteToken, password: "sample-owner-pass", termsAccepted: true },
     });
     assert.equal(accepted.status, 201, JSON.stringify(accepted.data));
     const session = sessionOf(accepted);

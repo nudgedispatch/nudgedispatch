@@ -45,7 +45,7 @@ const sessions = new Map();
 async function tenant(worker, email, name, drivers, opts = {}) {
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName: name, accountKind: "fleet" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
-  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "e2e-owner-pass-1" } });
+  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "e2e-owner-pass-1", termsAccepted: true } });
   const session = { cookie: acc.cookie, csrf: acc.data.csrf };
   const settings = await call(worker, "/api/settings", { session });
   const r = await call(worker, "/api/rate-sheet", { method: "PUT", session, body: { enabled: true, rateSheet: {

@@ -57,7 +57,7 @@ function decode(path) {
 async function owner(worker, email, companyName) {
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName, accountKind: "fleet" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
-  const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass" } });
+  const accepted = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "sample-owner-pass", termsAccepted: true } });
   assert.equal(accepted.status, 201, JSON.stringify(accepted.data));
   const session = { cookie: accepted.cookie, csrf: accepted.data.csrf || "" };
   const settings = await call(worker, "/api/settings", { session });

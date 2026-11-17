@@ -43,7 +43,7 @@ async function call(worker, path, { method = "GET", body, session, admin } = {})
 async function company(worker, email, name, logoDataUrl) {
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName: name, accountKind: "fleet" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
-  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "shots-owner-pass-1" } });
+  const acc = await call(worker, "/api/invites/accept", { method: "POST", body: { token: invite.data.inviteToken, password: "shots-owner-pass-1", termsAccepted: true } });
   const session = { cookie: acc.cookie, csrf: acc.data.csrf };
   const s = (await call(worker, "/api/settings", { session })).data.settings;
   if (logoDataUrl) {
