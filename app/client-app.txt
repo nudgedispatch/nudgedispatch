@@ -722,19 +722,57 @@ function trialPausedHtml() {
   return `<p class="sub trial-paused">Approving new requests is paused because the free trial has ended. You can still decline.</p>`;
 }
 
+// Text-to-ride drafts: the client's own words, what Nudge could not tell, and the suggested driver.
+function intakeHtml(ride, full) {
+  const it = ride.intake;
+  if (!it) return "";
+  const msgs = (it.messages || []).map((m) => `<blockquote class="intake-msg">${esc(m.body)}${full && m.at ? `<span class="sub">${esc(new Date(m.at).toLocaleString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }))} ET</span>` : ""}</blockquote>`).join("");
+  const who = it.fromDisplay ? `<div class="sub">Texted from ${esc(it.fromDisplay)} · ${it.matchedClient ? "matched to an existing client" : "new client from this number"}</div>` : "";
+  const warn = (it.warnings || []).length ? `<ul class="intake-warn">${it.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : "";
+  const sug = it.suggested && ride.status === "requested" ? `<div class="sub">Suggested driver: <strong>${esc(it.suggested.name || "Driver")}</strong>${it.suggested.reason ? " · " + esc(it.suggested.reason) : ""}</div>` : "";
+  return `<div class="intake-box"><div class="sub intake-label">Original text${(it.messages || []).length > 1 ? "s" : ""}</div>${msgs}${who}${sug}${full ? warn : ((it.warnings || []).length ? `<div class="sub intake-count">${it.warnings.length} thing${it.warnings.length === 1 ? "" : "s"} to check</div>` : "")}</div>`;
+}
+
+function draftFormHtml(ride, roster) {
+  const it = ride.intake || {};
+  const driverSel = roster ? `<label>Driver<select id="d-driver"><option value="">Unassigned</option>${roster.map((m) => `<option value="${esc(m.id)}">${esc(driverOptionLabel(m))}${it.suggested && it.suggested.id === m.id ? " (suggested)" : ""}</option>`).join("")}</select></label>` : "";
+  return `<form id="draft-form" class="card noprint">
+      <h2>Review the draft</h2>
+      <p class="sub">Nudge filled this in from the text. Fix anything, then approve. Nothing is sent to the client.</p>
+      ${it.createdClient ? `<label>Client name<input id="d-name" value="${esc(ride.clientName)}" maxlength="80" autocomplete="off"></label>` : ""}
+      <div class="grid2"><label>Date<input id="d-date" type="date" value="${esc(ride.date)}"></label><label>Pickup time<input id="d-time" type="time" value="${esc(ride.time)}"></label></div>
+      <label>Pickup<input id="d-pickup" value="${esc(ride.pickup)}" maxlength="200" placeholder="Pickup address" autocomplete="off"></label>
+      <label>Drop-off<input id="d-dropoff" value="${esc(ride.dropoff)}" maxlength="200" placeholder="Ask the client" autocomplete="off"></label>
+      <div class="grid2"><label>Flight<input id="d-flight" value="${esc(ride.flight)}" maxlength="12" autocomplete="off"></label><label>Passengers<input id="d-pax" type="number" min="1" max="14" inputmode="numeric" value="${esc(ride.passengers)}"></label></div>
+      ${driverSel}
+      <label>Notes<textarea id="d-notes" rows="2" maxlength="2000">${esc(ride.notes || "")}</textarea></label>
+      <button class="btn ghost full" type="submit" id="d-save">Save draft</button>
+      <p class="err" id="d-err"></p>
+    </form>`;
+}
+
+function readDraftForm() {
+  const v = (sel) => { const el = document.querySelector(sel); return el ? el.value : undefined; };
+  const body = { date: v("#d-date"), time: v("#d-time"), pickup: v("#d-pickup"), dropoff: v("#d-dropoff"), flight: v("#d-flight"), notes: v("#d-notes"), passengers: Number(v("#d-pax") || 1) };
+  if (document.querySelector("#d-name")) body.clientName = v("#d-name");
+  if (document.querySelector("#d-driver")) body.driverUserId = v("#d-driver") || null;
+  return body;
+}
+
 function rideCardHtml(ride, pending) {
-  const when = `${esc(ride.date)} · ${esc(time12(ride.time))}`;
+  const when = `${esc(ride.date)} · ${ride.time ? esc(time12(ride.time)) : "time?"}${ride.flight && ride.source === "text" ? " · " + esc(ride.flight) : ""}`;
   const fare = ride.status === "requested" || !ride.fare || ride.fare === "$0.00" ? "" : " · " + esc(ride.fare);
   const phone = ride.clientPhone ? `<div class="sub">${esc(ride.clientPhone)}</div>` : "";
   const notes = pending && ride.notes ? `<div class="sub">${esc(ride.notes)}</div>` : "";
   const trip = (tripLine(ride) ? `<div class="sub">${esc(tripLine(ride))}</div>` : "") + airportHtml(ride, "div");
   const owner = !(state.me && state.me.role === "driver");
-  const quote = pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">${rideStops(ride).length ? "No estimate: this request has stops, so the client saw Price on request." : "No estimate was shown to the client."}</div>`) : "";
-  const actions = pending && owner ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, `data-fare="${esc(ride.id)}"`, `data-approve="${esc(ride.id)}"`)}<div class="pend-actions"><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : "";
+  const textDraft = pending && owner && ride.source === "text";
+  const quote = textDraft ? intakeHtml(ride, false) : pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">${rideStops(ride).length ? "No estimate: this request has stops, so the client saw Price on request." : "No estimate was shown to the client."}</div>`) : "";
+  const actions = textDraft ? `<div class="pend-actions"><a class="btn approve" href="#/rides/${esc(ride.id)}">Review draft</a><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : pending && owner ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, `data-fare="${esc(ride.id)}"`, `data-approve="${esc(ride.id)}"`)}<div class="pend-actions"><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : "";
   return `<div class="list-btn${pending ? " pending-request card" : ""}" data-id="${esc(ride.id)}">
       <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badge ${esc(ride.status)}">${esc(rideBadgeText(ride))}</span></div>
       <div class="sub when">${when}${fare}</div>
-      <div class="sub">${esc(ride.pickup)} → ${esc(ride.dropoff)}</div>
+      <div class="sub">${esc(ride.pickup || "Pickup?")} → ${esc(ride.dropoff || "Drop-off?")}</div>
       ${stopsSummaryHtml(ride, "div")}
       ${ride.driverName ? `<div class="sub">Driver: ${esc(ride.driverName)}</div>` : ""}
       ${trip}${phone}${notes}${quote}${actions}
@@ -790,6 +828,7 @@ async function renderRides(gen) {
       route();
       return;
     }
+    if (event.target.closest("a[href]")) return;
     const button = event.target.closest("[data-id]");
     if (button) location.hash = "#/rides/" + button.dataset.id;
   };
@@ -851,12 +890,14 @@ async function renderRide(id, gen) {
       ${tripLine(ride) ? `<p class="sub">${esc(tripLine(ride))}</p>` : ""}
       ${airportHtml(ride, "p")}
       ${ride.quote && !driverView ? quoteBoxHtml(ride.quote) : ""}
+      ${ride.intake && !driverView ? intakeHtml(ride, true) : ""}
       <p class="sub">${esc(ride.passengers)} passenger${ride.passengers === 1 ? "" : "s"}${ride.flight ? " · Flight " + esc(ride.flight) : ""}${ride.fare && ride.fare !== "$0.00" ? " · " + esc(ride.fare) : ""}${ride.clientPhone ? " · " + esc(ride.clientPhone) : ""}</p>
       ${ride.driverName ? `<p class="sub">Driver: ${esc(ride.driverName)}${driverView || onRoster || !ride.driverUserId ? "" : " (no longer on the roster)"}</p>` : ""}
       <table class="times">${rows.map(([name, value]) => `<tr><th>${esc(name)}</th><td>${esc(value)}</td></tr>`).join("")}</table>
       <p class="sub">Times are Eastern and come only from taps. Waiting is from Arrived to Picked up.</p>
       ${ride.notes ? `<p>${esc(ride.notes)}</p>` : ""}
     </article>
+    ${ride.status === "requested" && ride.source === "text" && !driverView ? draftFormHtml(ride, fleetOwner ? roster : null) : ""}
     <div class="stack noprint">
       ${ride.status === "requested" && !driverView ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, 'id="final-fare"', 'id="approve"')}<div class="pend-actions"><button class="btn ghost" id="decline" type="button">Decline</button></div>` : ""}
       ${schedule.nav ? `<a class="btn ghost" id="maps" href="${esc(schedule.nav.url)}" target="_blank" rel="noopener">${esc(schedule.nav.label)}</a>` : ""}
@@ -892,6 +933,18 @@ async function renderRide(id, gen) {
       <p class="err" id="err"></p>
     </form>`;
   wireApproveBlock(box);
+  const draftForm = document.querySelector("#draft-form");
+  if (draftForm) {
+    const dsel = document.querySelector("#d-driver");
+    if (dsel) dsel.value = ride.driverUserId || "";
+    draftForm.onsubmit = async (event) => {
+      event.preventDefault();
+      const next = await api("/api/rides/" + id + "/draft", { method: "PATCH", body: readDraftForm() });
+      if (gen !== renderGen) return;
+      if (!next.data.ok) { document.querySelector("#d-err").textContent = next.data.error || "Could not save the draft."; return; }
+      route();
+    };
+  }
   const stopsForm = document.querySelector("#stops-form");
   if (stopsForm) {
     wireStopEditor(document.querySelector("#ride-stops"));
@@ -954,7 +1007,15 @@ async function renderRide(id, gen) {
   if (approveBtn) approveBtn.onclick = async () => {
     const fareEl = document.querySelector("#final-fare");
     if (!fareEl || !fareOk(fareEl.value)) return formError("Enter the final price to approve.");
-    const next = await api("/api/rides/" + id + "/approve", { method: "POST", body: { fare: fareEl.value.trim() } });
+    const approveBody = { fare: fareEl.value.trim() };
+    if (document.querySelector("#draft-form")) {
+      const draft = readDraftForm();
+      const saved = await api("/api/rides/" + id + "/draft", { method: "PATCH", body: draft });
+      if (gen !== renderGen) return;
+      if (!saved.data.ok) { document.querySelector("#d-err").textContent = saved.data.error || "Could not save the draft."; return; }
+      if (draft.driverUserId !== undefined) approveBody.driverUserId = draft.driverUserId;
+    }
+    const next = await api("/api/rides/" + id + "/approve", { method: "POST", body: approveBody });
     if (gen !== renderGen) return;
     if (!next.data.ok) return formError(next.data.error);
     route();
@@ -2174,6 +2235,7 @@ function stepContactNote(nextStep, smsInfo) {
 }
 
 function rideBadgeText(ride) {
+  if (ride.status === "requested" && ride.source === "text") return "From text, needs approval";
   const schedule = ride.schedule || {};
   if (schedule.now && (ride.status !== "scheduled" || schedule.progress)) return schedule.now;
   return label(ride.status);

@@ -1298,7 +1298,7 @@ function rideJson(row, role = "owner") {
     luggage: row.luggage ?? null,
     flightAlert: row.flight_alert ? { kind: row.flight_alert_kind, message: row.flight_alert, at: row.flight_alert_at } : null,
     updatedAt: row.updated_at,
-    ...owner ? { clientId: row.client_id, clientPhone: row.client_phone || "", clientEmail: row.client_email || "", fareCents: row.fare_cents, fare: money(row.fare_cents), notes: row.notes, payment: row.payment, source: row.source || "", quote: rideQuoteJson(row) } : {},
+    ...owner ? { clientId: row.client_id, clientPhone: row.client_phone || "", clientEmail: row.client_email || "", fareCents: row.fare_cents, fare: money(row.fare_cents), notes: row.notes, payment: row.payment, source: row.source || "", quote: rideQuoteJson(row), intake: intakeJson(row) } : {},
     schedule: rideSchedule({
       pickupDate: row.pickup_date,
       pickupTime: row.pickup_time,
@@ -1315,6 +1315,26 @@ function rideJson(row, role = "owner") {
   };
 }
 __name(rideJson, "rideJson");
+function intakeJson(row) {
+  if (!row.intake_json) return null;
+  let v;
+  try { v = JSON.parse(row.intake_json); } catch { return null; }
+  if (!v || typeof v !== "object") return null;
+  return {
+    channel: v.channel || "sms",
+    fromNumber: v.fromNumber || "",
+    fromDisplay: prettyPhone(v.fromNumber || ""),
+    messages: Array.isArray(v.messages) ? v.messages.map((m) => ({ body: String(m.body || ""), at: Number(m.at) || null })) : [],
+    warnings: Array.isArray(v.warnings) ? v.warnings.map(String) : [],
+    suggested: v.suggested && v.suggested.id ? { id: v.suggested.id, name: String(v.suggested.name || ""), reason: String(v.suggested.reason || "") } : null,
+    matchedClient: Boolean(v.matchedClient),
+    createdClient: Boolean(v.createdClient),
+    ownerEdited: Boolean(v.ownerEdited),
+    direction: v.parsed && v.parsed.direction || "",
+    airport: v.parsed && v.parsed.airport || null
+  };
+}
+__name(intakeJson, "intakeJson");
 function settingsJson(row) {
   return {
     businessName: row.business_name,
@@ -1734,7 +1754,18 @@ async function decideBooking(request, env, id, decision) {
     if (fareRaw === void 0 || fareRaw === null || fareRaw === "") return fail(400, "Enter the final price to approve.");
     finalCents = parseFare(fareRaw);
     if (finalCents === null) return fail(400, "Enter the final price in dollars, such as 125 or 125.50.");
-    const driverId = user.accountKind === "individual" ? user.userId : existing.driver_user_id;
+    let driverId = user.accountKind === "individual" ? user.userId : existing.driver_user_id;
+    if (user.accountKind === "fleet" && body.driverUserId !== void 0) {
+      driverId = body.driverUserId === null || body.driverUserId === "" ? null : str(body.driverUserId, 36);
+      if (driverId && !await companyMember(env, user.companyId, driverId)) return fail(404, "That driver is not in this company.");
+    }
+    if (existing.source === "text") {
+      // A text draft must be complete before it becomes a ride.
+      if (!validDate(existing.pickup_date)) return fail(400, "Set the pickup date before approving.");
+      if (!validTime(existing.pickup_time)) return fail(400, "Set the pickup time before approving.");
+      if (!existing.pickup) return fail(400, "Set the pickup address before approving.");
+      if (!existing.dropoff) return fail(400, "Set the drop-off address before approving.");
+    }
     result = await env.DB.prepare("UPDATE rides SET approval = 'approved', status = 'scheduled', driver_user_id = ?, fare_cents = ?, updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'").bind(driverId, finalCents, now, user.companyId, id).run();
   } else {
     result = await env.DB.prepare("UPDATE rides SET approval = 'declined', status = 'cancelled', updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'").bind(now, user.companyId, id).run();
@@ -1744,6 +1775,251 @@ async function decideBooking(request, env, id, decision) {
   return json({ ok: true, ride: row ? rideJson(row, user.role) : null });
 }
 __name(decideBooking, "decideBooking");
+
+// ---- Text-to-ride (PREVIEW, Nov 17, 2026) ----
+// Bland POSTs every SMS message on a number to that number's sms_config.webhook. A client's text to
+// a company's inbound number becomes a DRAFT ride (approval 'requested', source 'text') in that
+// owner's queue with a suggested driver. Never books on its own, never texts anyone back.
+// Auth: secret path token (TEXT_INTAKE_TOKEN, required) and, when BLAND_WEBHOOK_SECRET is set,
+// Bland's X-Webhook-Signature HMAC-SHA256 of the raw body. Rate-limited per sender and overall.
+var TEXT_INTAKE_MAX_BODY = 16e3;
+function intakeOk(extra = {}) {
+  // Always 200 for anything we chose to ignore, so Bland does not retry it.
+  return json({ ok: true, ...extra });
+}
+__name(intakeOk, "intakeOk");
+async function logInbound(env, row) {
+  try {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO inbound_texts (id, company_id, ride_id, from_number, to_number, body, provider, conversation_id, dedupe_key, outcome, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'bland', ?, ?, ?, ?)`
+    ).bind(crypto.randomUUID(), row.companyId || null, row.rideId || null, row.from || "", row.to || "", row.body || "", row.conversationId || "", row.dedupeKey, row.outcome, Date.now()).run();
+  } catch {
+    // Logging never blocks the webhook.
+  }
+}
+__name(logInbound, "logInbound");
+function parseIntake(text) {
+  if (!text) return null;
+  try {
+    const v = JSON.parse(text);
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+__name(parseIntake, "parseIntake");
+async function intakeCandidates(env, companyId) {
+  const rows = await env.DB.prepare(`${DRIVER_ROWS} ORDER BY COALESCE(NULLIF(d.name, ''), u.email) COLLATE NOCASE`).bind(companyId).all();
+  return (rows.results || []).map((r) => ({ id: r.id, name: r.driver_name || (r.role === "owner" ? "Owner" : r.email || ""), role: r.role }));
+}
+__name(intakeCandidates, "intakeCandidates");
+async function suggestIntakeDriver(env, company, draft) {
+  if (company.kind !== "fleet") return null;
+  const candidates = await intakeCandidates(env, company.id);
+  if (!draft.date) return null;
+  const rows = await env.DB.prepare(
+    `SELECT driver_user_id, pickup_date, pickup_time, hours FROM rides
+     WHERE company_id = ? AND pickup_date = ? AND status = 'scheduled' AND approval IN ('none', 'approved') AND driver_user_id IS NOT NULL LIMIT 300`
+  ).bind(company.id, draft.date).all();
+  const rides = (rows.results || []).map((r) => ({ driverUserId: r.driver_user_id, date: r.pickup_date, time: r.pickup_time, hours: r.hours }));
+  // "Nearby" later: pass { distanceKm } built from driver locations once drivers report them.
+  return suggestDriver(candidates, rides, draft);
+}
+__name(suggestIntakeDriver, "suggestIntakeDriver");
+async function postBlandInbound(request, env, token) {
+  const configured = env.TEXT_INTAKE_TOKEN || "";
+  if (!configured || !token || !await safeEqual(token, configured)) return fail(404, "Not found.");
+  if (!await limitHit(env, "sms-in:all", 120, 10 * 60 * 1e3)) return fail(429, "Too many texts.");
+  const len = Number(request.headers.get("content-length") || "0");
+  if (Number.isFinite(len) && len > TEXT_INTAKE_MAX_BODY) return fail(413, "Too large.");
+  const raw = await request.text();
+  if (raw.length > TEXT_INTAKE_MAX_BODY) return fail(413, "Too large.");
+  if (env.BLAND_WEBHOOK_SECRET) {
+    const good = await verifyBlandSignature(env.BLAND_WEBHOOK_SECRET, raw, request.headers.get("x-webhook-signature"));
+    if (!good) return fail(401, "Bad signature.");
+  }
+  let payload;
+  try { payload = JSON.parse(raw); } catch { return fail(400, "Expected JSON."); }
+  const numbers = await env.DB.prepare(
+    `SELECT t.company_id, t.inbound_number, c.name, c.kind, c.status FROM text_intake_settings t JOIN companies c ON c.id = t.company_id WHERE t.enabled = 1`
+  ).all();
+  const byNumber = new Map((numbers.results || []).map((r) => [r.inbound_number, r]));
+  const inbound = readBlandInbound(payload, (n) => byNumber.has(n));
+  if (inbound.ignore) return intakeOk({ ignored: inbound.ignore });
+  const row = byNumber.get(inbound.ours);
+  const company = { id: row.company_id, name: row.name, kind: row.kind === "fleet" ? "fleet" : "individual", status: row.status };
+  const dedupeKey = await sha256Hex("bland|" + raw);
+  const base = { companyId: company.id, from: inbound.client, to: inbound.ours, body: inbound.body, conversationId: inbound.conversationId };
+  const seen = await env.DB.prepare("SELECT ride_id FROM inbound_texts WHERE dedupe_key = ?").bind(dedupeKey).first();
+  if (seen) return intakeOk({ duplicate: true, rideId: seen.ride_id || null });
+  if (company.status !== "active") {
+    await logInbound(env, { ...base, dedupeKey, outcome: "ignored" });
+    return intakeOk({ ignored: "company not active" });
+  }
+  if (!await limitHit(env, "sms-in:" + company.id + ":" + inbound.client, 12, 60 * 60 * 1e3)) {
+    await logInbound(env, { ...base, dedupeKey, outcome: "rate_limited" });
+    return intakeOk({ ignored: "rate limited" });
+  }
+  const now = Date.now();
+  const settings = await loadBookingSettings(env, company.id);
+  const parsed = parseRideText(inbound.body, { now, airports: settings.airports && settings.airports.airports });
+  const message = { body: inbound.body, at: now };
+
+  // Follow-up text from the same number while a text draft is still open: add it to that draft.
+  const open = await env.DB.prepare(
+    `SELECT r.id, r.intake_json, r.pickup_date, r.pickup_time, r.pickup, r.dropoff, r.flight, r.passengers, r.luggage, r.driver_user_id, r.client_id
+     FROM rides r JOIN clients c ON c.id = r.client_id AND c.company_id = r.company_id
+     WHERE r.company_id = ? AND r.source = 'text' AND r.approval = 'requested' AND r.created_at > ?
+     ORDER BY r.created_at DESC LIMIT 20`
+  ).bind(company.id, now - MERGE_WINDOW_MS).all();
+  const openDraft = (open.results || []).find((r) => {
+    const intake = parseIntake(r.intake_json);
+    return intake && intake.fromNumber === inbound.client && !intake.ownerEdited;
+  });
+  if (openDraft) {
+    const intake = parseIntake(openDraft.intake_json);
+    const merged = mergeParsed(intake.parsed || {}, parsed);
+    let suggestion = intake.suggested || null;
+    if (!openDraft.driver_user_id) suggestion = await suggestIntakeDriver(env, company, merged);
+    const next = { ...intake, messages: [...(intake.messages || []), message].slice(-10), parsed: merged, warnings: draftWarnings(merged), suggested: suggestion };
+    await env.DB.prepare(
+      `UPDATE rides SET pickup_date = ?, pickup_time = ?, pickup = ?, dropoff = ?, flight = ?, passengers = ?, luggage = ?, driver_user_id = ?, intake_json = ?, updated_at = ?
+       WHERE company_id = ? AND id = ? AND approval = 'requested'`
+    ).bind(merged.date || openDraft.pickup_date, merged.time || "", merged.pickup || "", merged.dropoff || "", merged.flight || "", merged.passengers || openDraft.passengers || 1, merged.luggage ?? null,
+      openDraft.driver_user_id || (suggestion ? suggestion.id : null), JSON.stringify(next), now, company.id, openDraft.id).run();
+    await logInbound(env, { ...base, rideId: openDraft.id, dedupeKey, outcome: "merged" });
+    return intakeOk({ rideId: openDraft.id, merged: true });
+  }
+  if (!parsed.looksLikeRide) {
+    // Still shown to the owner (a client may text "can you get me Friday?"), flagged as unclear.
+    parsed.warnings.unshift("This text may not be a ride request.");
+  }
+
+  // Match the sender to an existing client by phone; otherwise add a client for this number.
+  const clients = await env.DB.prepare("SELECT id, name, phone FROM clients WHERE company_id = ? LIMIT 2000").bind(company.id).all();
+  const match = (clients.results || []).find((c) => phonesMatch(c.phone, inbound.client));
+  let clientId;
+  let createdClient = false;
+  if (match) clientId = match.id;
+  else {
+    clientId = crypto.randomUUID();
+    createdClient = true;
+    const name = parsed.name || "Text from " + prettyPhone(inbound.client);
+    await env.DB.prepare("INSERT INTO clients (id, company_id, name, phone, email, notes, created_at, updated_at) VALUES (?, ?, ?, ?, '', ?, ?, ?)")
+      .bind(clientId, company.id, name.slice(0, 80), prettyPhone(inbound.client), "Added from a text to the fleet number.", now, now).run();
+  }
+  const suggestion = await suggestIntakeDriver(env, company, parsed);
+  const rideId = crypto.randomUUID();
+  const intake = {
+    v: 1, channel: "sms", provider: "bland", fromNumber: inbound.client, toNumber: inbound.ours, conversationId: inbound.conversationId,
+    messages: [message], parsed, warnings: parsed.warnings, suggested: suggestion, matchedClient: Boolean(match), createdClient, ownerEdited: false
+  };
+  await env.DB.prepare(
+    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, luggage, intake_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 'scheduled', 'unpaid', ?, ?, 'requested', 'text', ?, ?)`
+  ).bind(rideId, company.id, clientId, suggestion ? suggestion.id : null, parsed.date, parsed.time || "", parsed.pickup || "", parsed.dropoff || "", parsed.passengers || 1, parsed.flight || "",
+    now, now, parsed.luggage ?? null, JSON.stringify(intake)).run();
+  await logInbound(env, { ...base, rideId, dedupeKey, outcome: "draft" });
+  return intakeOk({ rideId, draft: true });
+}
+__name(postBlandInbound, "postBlandInbound");
+// Owner edits a text draft before approving (date, time, places, flight, passengers, notes, name, driver).
+async function updateTextDraft(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const existing = await ownedRide(env, user, id);
+  if (!existing) return fail(404, "Ride not found.");
+  if (existing.approval !== "requested" || existing.source !== "text") return fail(409, "Only a text draft waiting for approval can be edited here.");
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const date = body.date === void 0 ? existing.pickup_date : str(body.date, 10);
+  const time = body.time === void 0 ? existing.pickup_time : str(body.time, 5);
+  if (!validDate(date)) return fail(400, "Enter the pickup date.");
+  if (time && !validTime(time)) return fail(400, "Enter the pickup time as HH:MM.");
+  const pickup = body.pickup === void 0 ? existing.pickup : str(body.pickup, 200);
+  const dropoff = body.dropoff === void 0 ? existing.dropoff : str(body.dropoff, 200);
+  const flight = body.flight === void 0 ? existing.flight : str(body.flight, 12).toUpperCase();
+  const notes = body.notes === void 0 ? existing.notes : str(body.notes, 2e3);
+  const passengers = body.passengers === void 0 ? existing.passengers : Number(body.passengers);
+  if (!Number.isInteger(passengers) || passengers < 1 || passengers > 14) return fail(400, "Enter passengers from 1 to 14.");
+  let driverId = existing.driver_user_id;
+  if (body.driverUserId !== void 0) {
+    if (user.accountKind !== "fleet") return fail(403, "An individual account cannot assign drivers.");
+    driverId = body.driverUserId === null || body.driverUserId === "" ? null : str(body.driverUserId, 36);
+    if (driverId && !await companyMember(env, user.companyId, driverId)) return fail(404, "That driver is not in this company.");
+  }
+  const intake = parseIntake(existing.intake_json) || {};
+  const now = Date.now();
+  const clientName = body.clientName === void 0 ? "" : str(body.clientName, 80);
+  if (clientName && intake.createdClient) {
+    await env.DB.prepare("UPDATE clients SET name = ?, updated_at = ? WHERE company_id = ? AND id = ?").bind(clientName, now, user.companyId, existing.client_id).run();
+  }
+  const nextIntake = { ...intake, ownerEdited: true };
+  await env.DB.prepare(
+    `UPDATE rides SET pickup_date = ?, pickup_time = ?, pickup = ?, dropoff = ?, flight = ?, notes = ?, passengers = ?, driver_user_id = ?, intake_json = ?, updated_at = ?
+     WHERE company_id = ? AND id = ? AND approval = 'requested'`
+  ).bind(date, time, pickup, dropoff, flight, notes, passengers, driverId, JSON.stringify(nextIntake), now, user.companyId, id).run();
+  const row = await ownedRide(env, user, id);
+  return json({ ok: true, ride: row ? rideJson(row, user.role) : null });
+}
+__name(updateTextDraft, "updateTextDraft");
+async function companyMember(env, companyId, userId) {
+  return env.DB.prepare(
+    `SELECT m.role FROM memberships m
+     LEFT JOIN drivers d ON d.user_id = m.user_id AND d.company_id = m.company_id
+     WHERE m.company_id = ? AND m.user_id = ? AND d.deleted_at IS NULL`
+  ).bind(companyId, userId).first();
+}
+__name(companyMember, "companyMember");
+// Set a company's inbound texting number. Platform admin (signed in) or ADMIN_TOKEN only:
+// an owner must not be able to claim another fleet's number.
+async function textIntakeChange(request, env, companyId) {
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const company = await env.DB.prepare("SELECT id FROM companies WHERE id = ?").bind(companyId).first();
+  if (!company) return fail(404, "No company with that id.");
+  const now = Date.now();
+  if (body.inboundNumber === null || body.inboundNumber === "") {
+    await env.DB.prepare("DELETE FROM text_intake_settings WHERE company_id = ?").bind(companyId).run();
+    return json({ ok: true, textIntake: null });
+  }
+  const number = e164(body.inboundNumber);
+  if (!number) return fail(400, "Enter a US or Canada number, such as +14045550100.");
+  const enabled = body.enabled === void 0 ? 1 : body.enabled ? 1 : 0;
+  const taken = await env.DB.prepare("SELECT company_id FROM text_intake_settings WHERE inbound_number = ? AND company_id != ?").bind(number, companyId).first();
+  if (taken) return fail(409, "That number already feeds another company.");
+  await env.DB.prepare(
+    `INSERT INTO text_intake_settings (company_id, inbound_number, enabled, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(company_id) DO UPDATE SET inbound_number = excluded.inbound_number, enabled = excluded.enabled, updated_at = excluded.updated_at`
+  ).bind(companyId, number, enabled, now).run();
+  return json({ ok: true, textIntake: { inboundNumber: number, enabled: Boolean(enabled) } });
+}
+__name(textIntakeChange, "textIntakeChange");
+async function adminTextIntake(request, env, id) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  return textIntakeChange(request, env, id);
+}
+__name(adminTextIntake, "adminTextIntake");
+async function platformTextIntake(request, env, id) {
+  const user = await platformUser(request, env, true);
+  if (isResponse(user)) return user;
+  return textIntakeChange(request, env, id);
+}
+__name(platformTextIntake, "platformTextIntake");
+// Owner view: is text-to-ride on for my company, and on which number (read only).
+async function ownerTextIntake(request, env) {
+  const user = await authed(request, env, false);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const row = await env.DB.prepare("SELECT inbound_number, enabled FROM text_intake_settings WHERE company_id = ?").bind(user.companyId).first();
+  return json({ ok: true, textIntake: row ? { inboundNumber: row.inbound_number, display: prettyPhone(row.inbound_number), enabled: Boolean(row.enabled), webhookReady: Boolean(env.TEXT_INTAKE_TOKEN) } : null });
+}
+__name(ownerTextIntake, "ownerTextIntake");
 
 // ---- Rate sheet + instant quotes (draft, Nov 10, 2026) ----
 // Prices are always computed here from the company's saved rate sheet. The booking page only
@@ -2355,6 +2631,14 @@ async function handleApi(request, env) {
       return fail(500, "Webhook error.");
     }
   }
+  // Bland calls this directly (no X-Nudge-Client header): secret path token + optional HMAC signature.
+  const blandInbound = /^\/api\/inbound\/bland\/sms\/([A-Za-z0-9_-]{16,128})$/.exec(path);
+  if (blandInbound && method === "POST") {
+    try { return await postBlandInbound(request, env, blandInbound[1]); } catch (error) {
+      console.log(JSON.stringify({ level: "error", msg: "bland inbound", name: error instanceof Error ? error.name : "Error" }));
+      return fail(500, "Webhook error.");
+    }
+  }
   if (method !== "GET" && method !== "HEAD" && !clientHeader(request)) return fail(403, "Blocked.");
   try {
     if (path === "/api/admin/invites" && method === "POST") return adminInvite(request, env);
@@ -2453,6 +2737,13 @@ async function handleApi(request, env) {
     const publicBook = /^\/api\/public\/book\/([^/]+)$/.exec(path);
     if (publicBook && method === "GET") return getPublicBook(request, env, decodeURIComponent(publicBook[1]));
     if (publicBook && method === "POST") return postPublicBook(request, env, decodeURIComponent(publicBook[1]));
+    const draftMatch = /^\/api\/rides\/([0-9a-f-]{36})\/draft$/.exec(path);
+    if (draftMatch && method === "PATCH") return updateTextDraft(request, env, draftMatch[1]);
+    if (path === "/api/text-intake" && method === "GET") return ownerTextIntake(request, env);
+    const adminIntake = /^\/api\/admin\/companies\/([0-9a-f-]{36})\/text-intake$/.exec(path);
+    if (adminIntake && method === "PUT") return adminTextIntake(request, env, adminIntake[1]);
+    const platformIntake = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/text-intake$/.exec(path);
+    if (platformIntake && method === "PUT") return platformTextIntake(request, env, platformIntake[1]);
     const approveMatch = /^\/api\/rides\/([0-9a-f-]{36})\/approve$/.exec(path);
     if (approveMatch && method === "POST") return decideBooking(request, env, approveMatch[1], "approve");
     const declineMatch = /^\/api\/rides\/([0-9a-f-]{36})\/decline$/.exec(path);
@@ -3717,7 +4008,7 @@ __name(deleteClient, "deleteClient");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
   r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.arrived_at, r.picked_up_at, r.completed_at,
   r.driver_user_id, drv.name AS assigned_driver_name, drv.vehicle AS assigned_driver_vehicle, drv.plate AS assigned_driver_plate, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
-  r.airport_json, r.luggage, r.stops_json,
+  r.airport_json, r.luggage, r.stops_json, r.intake_json,
   (SELECT fa.message FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert,
   (SELECT fa.kind FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_kind,
   (SELECT fa.created_at FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_at
@@ -4910,6 +5201,7 @@ import { billingAccess, billingBanner, lockedView, lockedMessage } from "./acces
 import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, smsSetupPromoCode, isCardPaymentMethod, cardOnlyPaymentConfig, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
+import { parseRideText, mergeParsed, draftWarnings, readBlandInbound, suggestDriver, verifyBlandSignature, prettyPhone, e164, MERGE_WINDOW_MS } from "./text-intake.js";
 import { meetingPointForArrived } from "./progress-nav.js";
 import { readSchedule, parseDayList, matchDate, pendingOccurrences, describeSchedule, monthEndNote, todayInZone, addDays, shortDate, MAX_LOOKAHEAD_DAYS } from "./schedules.js";
 import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";

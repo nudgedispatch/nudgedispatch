@@ -24,6 +24,10 @@ export interface NudgeEnv {
   SMS_MODE?: string;
   SMS_TEST_ALLOWLIST?: string;
   BLAND_API_BASE?: string;
+  /** Text-to-ride webhook path token (secret). Empty means /api/inbound/bland/sms/* returns 404. */
+  TEXT_INTAKE_TOKEN?: string;
+  /** Bland webhook signing secret (Dev Portal > Keys). When set, X-Webhook-Signature is required. */
+  BLAND_WEBHOOK_SECRET?: string;
   /** Google Routes API for distance quotes. Absent means distance quotes are skipped. */
   GOOGLE_MAPS_SERVER_KEY?: string;
   /** sk_ or rk_ test or live key. A live key is used only when STRIPE_MODE is live. */
