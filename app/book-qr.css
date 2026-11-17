@@ -11,13 +11,13 @@ body.qrpage { min-height: 100vh; min-height: 100dvh; display: flex; }
 @supports (height: 1dvh) { .qr-frame { width: min(100%, 68dvh, 520px); } }
 .qr-img { display: block; width: 100%; height: auto; image-rendering: pixelated; -webkit-touch-callout: default; }
 .qr-url { margin: 14px 0 4px; font-size: 16px; overflow-wrap: anywhere; }
-.qr-url a { color: #ffffff; text-decoration: underline; text-underline-offset: 3px; }
+.qr-url a { color: #ffffff; text-decoration: underline; text-underline-offset: 3px; display: inline-flex; align-items: center; min-height: 44px; }
 .qr-actions { display: flex; gap: 10px; width: 100%; margin-top: 12px; }
 .qr-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center; min-height: 52px; padding: 12px 16px; border-radius: 12px; border: 2px solid #ffffff; background: transparent; color: #ffffff; font: inherit; font-weight: 700; text-decoration: none; cursor: pointer; }
 .qr-btn.primary { background: #ffffff; color: #0b0b0b; }
 .qr-btn:focus-visible, .qr-url a:focus-visible, .qr-more a:focus-visible { outline: 3px solid #8ee6d8; outline-offset: 3px; }
 .qr-more { margin: 14px 0 0; font-size: 14px; color: #bdbdbd; }
-.qr-more a { color: #bdbdbd; }
+.qr-more a { color: #bdbdbd; display: inline-flex; align-items: center; min-height: 44px; padding: 10px 4px; }
 .qr-note { min-height: 1.4em; margin: 10px 0 0; font-size: 15px; color: #8ee6d8; }
 .qr-hint { margin: 4px 0 0; font-size: 13px; color: #a8a8a8; }
 @media (display-mode: standalone) { .qr-hint { display: none; } }

@@ -35,4 +35,10 @@ export interface NudgeEnv {
   STRIPE_PORTAL_CONFIGURATION?: string;
   STRIPE_CARD_PAYMENT_CONFIGURATION?: string;
   STRIPE_API_BASE?: string;
+  /** Turnstile site key for the public signup page. Empty disables the widget. */
+  TURNSTILE_SITE_KEY?: string;
+  /** Turnstile secret. Empty skips verification (local tests). */
+  TURNSTILE_SECRET_KEY?: string;
+  /** Override Turnstile siteverify URL (tests). */
+  TURNSTILE_VERIFY_URL?: string;
 }
