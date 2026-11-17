@@ -318,3 +318,8 @@ fieldset.days legend { color: var(--muted); font-size: 14px; padding: 0 6px; }
 .day-grid label.check.day.last { grid-column: span 4; }
 .schedule-card { text-decoration: none; }
 label.check.s-active { align-self: end; margin-bottom: 8px; }
+
+/* Airport settings save feedback */
+.air-msg { min-height: 1.4em; margin: 8px 0 0; }
+.air-msg.ok { color: var(--green); }
+.air-msg.bad { color: var(--red); }
