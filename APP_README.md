@@ -137,7 +137,7 @@ Each booking page has a shareable QR page at `/book/<slug>/qr/` (Settings, Your 
 
 Public signup lives at `/signup` (app.nudgedispatch.com/signup). The only public plan is Solo. The plan setup fee is waived by omitting the setup line from Checkout (no typable promo codes). There is no trial; `trial_status` is set to `active` when the paid Checkout session is fulfilled. Texting stays on Small fleet and up; the Solo form has no texting checkbox.
 
-The company code / booking slug is chosen during signup, reserved on the pending row, and is permanent after the account is created. Owners cannot change it in settings.
+The company code / booking slug is chosen during signup, reserved on the pending row, and is permanent after the account is created. Owners cannot change it in settings. The owner's phone number is required (US format, stored as E.164). If the optional business phone is left blank, it defaults to the owner phone.
 
 Signup includes an optional Branding step: a logo (client-resized to a 384px PNG data URL under 180000 characters, the same limit as `invoice_settings.logo_data_url`) and a theme color (presets or a custom hex). Both can be skipped and edited later in Settings. The theme is stored on `invoice_settings.theme_color`. An empty value keeps the current teal-on-dark booking header; a custom hex becomes the booking and QR page header background, with text color chosen for WCAG 4.5:1 contrast. The public booking page loads `/book/<slug>/theme.css` so the color works under the page CSP.
 

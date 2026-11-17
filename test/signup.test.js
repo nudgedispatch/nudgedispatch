@@ -4,6 +4,7 @@ import { slugBase, slugProblem, normalizeSlug, BOOKING_RESERVED } from "../app/s
 import {
   PUBLIC_BILLING_PLAN,
   signupFieldProblems,
+  normalizeSignupPhone,
   signupWantsSms,
   signupLineItems,
   firstInvoiceCents,
@@ -41,8 +42,22 @@ test("public signup is Solo, no trial SMS, and requires terms plus permanent-cod
     bookingSlug: "gold-standard-limo",
     termsAccepted: true,
     slugPermanentConfirmed: true,
+    ownerPhone: "404-555-0100",
   };
   assert.equal(signupFieldProblems(base), "");
+  assert.equal(signupFieldProblems({ ...base, ownerPhone: undefined }), "Enter your phone number.");
+  assert.equal(signupFieldProblems({ ...base, ownerPhone: "" }), "Enter your phone number.");
+  assert.match(signupFieldProblems({ ...base, ownerPhone: "555-0100" }), /phone number/);
+  assert.equal(signupFieldProblems({ ...base, ownerPhone: "(404) 555-0100" }), "");
+  assert.equal(signupFieldProblems({ ...base, ownerPhone: "+1 404 555 0100" }), "");
+  assert.equal(signupFieldProblems({ ...base, ownerPhone: "14045550100" }), "");
+  assert.equal(signupFieldProblems({ ...base, businessPhone: "" }), "");
+  assert.match(signupFieldProblems({ ...base, businessPhone: "555-0100" }), /business phone/);
+  assert.equal(normalizeSignupPhone("404-555-0100"), "+14045550100");
+  assert.equal(normalizeSignupPhone("(404) 555-0100"), "+14045550100");
+  assert.equal(normalizeSignupPhone("1 404 555 0100"), "+14045550100");
+  assert.equal(normalizeSignupPhone("+14045550100"), "+14045550100");
+  assert.equal(normalizeSignupPhone("555-0100"), "");
   assert.equal(signupFieldProblems({ ...base, termsAccepted: false }), "Please agree to the Terms of Service and Privacy Policy.");
   assert.equal(signupFieldProblems({ ...base, slugPermanentConfirmed: false }), "Please confirm you understand the company code can't be changed.");
   assert.equal(signupFieldProblems({ ...base, plan: "fleet" }), "The public plan is Solo.");

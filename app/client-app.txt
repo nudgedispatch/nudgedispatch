@@ -1533,7 +1533,7 @@ async function renderSettings(gen) {
       <label class="full">Payment note (optional)<textarea id="pay" placeholder="Anything else clients should know, like card in the car or tips appreciated.">${esc(s.paymentInstructions)}</textarea></label>
       <label class="full">Terms<textarea id="terms">${esc(s.terms)}</textarea></label>
       <label class="full">Gratuity line<input id="gratuity" value="${esc(s.gratuityNote)}"></label>
-      <label class="full">Logo (optional)<input id="logo" type="file" accept="image/*,.heic,.heif,image/heic,image/heif">
+      <label class="full">Logo (optional)<input id="logo" type="file" accept="image/*,image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif">
         <span class="sub">PNG, JPG, WebP, or HEIC. We'll resize it to 384px and save a PNG under 120 KB.</span>
       </label>
       ${s.logoDataUrl ? `<p class="full"><img alt="Current logo" src="${esc(s.logoDataUrl)}" style="width:72px;height:72px;object-fit:contain;background:#fff;border-radius:8px"></p>` : ""}
@@ -1541,7 +1541,7 @@ async function renderSettings(gen) {
         <legend>Booking page color</legend>
         <p class="sub">Optional header color for your booking page and QR code. You can change this any time. Company code cannot be changed.</p>
         <div class="theme-presets" id="theme-presets"></div>
-        <label>Custom hex<input id="themeColor" value="${esc(s.themeColor || "")}" placeholder="#0b0b0b" maxlength="7" autocapitalize="none" spellcheck="false"></label>
+        <label>Custom hex<input id="themeColor" value="${esc(s.themeColor || "")}" placeholder="#0b0b0b" maxlength="7" autocapitalize="none" autocomplete="off" spellcheck="false" inputmode="text"></label>
         <div class="brand-preview" id="settings-brand-preview">
           <header class="top">
             <img class="logo" id="settings-preview-logo" src="${esc(s.logoDataUrl || "/icons/icon-192.png")}" alt="">

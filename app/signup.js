@@ -51,12 +51,23 @@ export function companyNameProblem(value) {
   return "";
 }
 
-export function phoneProblem(value, label) {
+// US/Canada NANP to E.164. Accepts 10 digits, a leading 1, and common punctuation.
+export function normalizeSignupPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  const national = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits.length === 10 ? digits : "";
+  if (!/^[2-9]\d{2}[2-9]\d{6}$/.test(national)) return "";
+  return "+1" + national;
+}
+
+export function phoneProblem(value, label, required = false) {
   const raw = String(value || "").trim();
-  if (!raw) return "";
+  if (!raw) return required ? "Enter your " + label + "." : "";
   if (raw.length > 40) return "Use 40 characters or fewer for the " + label + ".";
-  const digits = raw.replace(/\D/g, "");
-  if (digits.length && digits.length < 7) return "Enter a valid " + label + ", or leave it blank.";
+  if (!normalizeSignupPhone(raw)) {
+    return required
+      ? "Enter a valid US phone number for the " + label + "."
+      : "Enter a valid US " + label + ", or leave it blank.";
+  }
   return "";
 }
 
@@ -94,7 +105,7 @@ export function signupFieldProblems(body) {
   const name = ownerNameProblem(body.ownerName);
   if (name) return name;
   if (!normSignupEmail(body.email)) return "Enter a valid email.";
-  const ownerPhone = phoneProblem(body.ownerPhone, "phone number");
+  const ownerPhone = phoneProblem(body.ownerPhone, "phone number", true);
   if (ownerPhone) return ownerPhone;
   const slug = slugProblem(suggestedSlug(body.companyName, body.bookingSlug));
   if (slug) return slug;

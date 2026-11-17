@@ -119,6 +119,7 @@ const signupBody = {
   email: "ada@example.test",
   password: "sample-owner-pass",
   bookingSlug: "peach-state-cars",
+  ownerPhone: "404-555-0100",
   termsAccepted: true,
   slugPermanentConfirmed: true,
   themeColor: "#0f1c2e",
@@ -159,6 +160,10 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     const named = await call(worker, "/api/signup/slug?name=Peach%20State%20Cars");
     assert.equal(named.data.suggestion, "peach-state-cars");
 
+    const noPhone = await call(worker, "/api/signup", { method: "POST", body: { ...signupBody, ownerPhone: "" } });
+    assert.equal(noPhone.status, 400);
+    assert.match(noPhone.data.error || "", /phone/i);
+
     const missing = await call(worker, "/api/signup", { method: "POST", body: { ...signupBody, slugPermanentConfirmed: false } });
     assert.equal(missing.status, 400);
     assert.match(missing.data.error, /can't be changed/);
@@ -181,13 +186,15 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     assert.match(checkout.body, new RegExp(LOOKUP.solo.base.replace(/[.]/g, "[.]")));
     assert.match(checkout.body, /metadata\[sms\]=off/);
 
-    const pending = (await sql(persistTo, "SELECT email, booking_slug, status, sms_addon, plan, theme_color, logo_data_url FROM signups", true))[0];
+    const pending = (await sql(persistTo, "SELECT email, booking_slug, status, sms_addon, plan, theme_color, logo_data_url, owner_phone, business_phone FROM signups", true))[0];
     assert.equal(pending.status, "pending");
     assert.equal(pending.sms_addon, 0);
     assert.equal(pending.plan, "solo");
     assert.equal(pending.booking_slug, "peach-state-cars");
     assert.equal(pending.theme_color, "#0f1c2e");
     assert.match(pending.logo_data_url, /^data:image\/png;base64,/);
+    assert.equal(pending.owner_phone, "+14045550100");
+    assert.equal(pending.business_phone, "+14045550100");
 
     const taken = await call(worker, "/api/signup/slug?slug=peach-state-cars");
     assert.equal(taken.data.available, false);
@@ -206,9 +213,12 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     assert.equal(company.sms_addon_enabled, 0);
     assert.equal(company.stripe_subscription_id, "sub_signup");
 
-    const invoice = (await sql(persistTo, "SELECT theme_color, logo_data_url FROM invoice_settings", true))[0];
+    const invoice = (await sql(persistTo, "SELECT theme_color, logo_data_url, phone FROM invoice_settings", true))[0];
     assert.equal(invoice.theme_color, "#0f1c2e");
     assert.match(invoice.logo_data_url, /^data:image\/png;base64,/);
+    assert.equal(invoice.phone, "+14045550100");
+    const owner = (await sql(persistTo, "SELECT phone FROM users", true))[0];
+    assert.equal(owner.phone, "+14045550100");
 
     const session = { cookie: done.cookie, csrf: done.data.csrf };
     const me = await call(worker, "/api/me", { session });

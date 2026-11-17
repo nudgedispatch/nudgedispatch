@@ -2198,9 +2198,9 @@ async function startSignup(request, env) {
   const signupId = crypto.randomUUID();
   const companyName = str(body.companyName, 80);
   const ownerName = str(body.ownerName, 80);
-  const ownerPhone = str(body.ownerPhone, 40);
+  const ownerPhone = normalizeSignupPhone(body.ownerPhone);
   const address = str(body.address, 200);
-  const businessPhone = str(body.businessPhone, 40);
+  const businessPhone = normalizeSignupPhone(body.businessPhone) || ownerPhone;
   const website = str(body.website, 120);
   const logo = typeof body.logoDataUrl === "string" ? body.logoDataUrl : "";
   await env.DB.prepare(
@@ -4911,7 +4911,7 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
-import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail } from "./signup.js";
+import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
 import { validatePaymentMethods, parseStoredPaymentMethods, payOptions, payLines } from "./payment-methods.js";

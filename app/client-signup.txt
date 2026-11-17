@@ -39,6 +39,27 @@ async function runComplete() {
   location.replace("/#/welcome");
 }
 
+function normalizePhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  const national = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits.length === 10 ? digits : "";
+  if (!/^[2-9]\d{2}[2-9]\d{6}$/.test(national)) return "";
+  return "+1" + national;
+}
+function setPhoneValidity(el, required) {
+  if (!el) return true;
+  const raw = el.value.trim();
+  if (!raw) {
+    el.setCustomValidity(required ? "Enter your phone number." : "");
+    return !required;
+  }
+  if (!normalizePhone(raw)) {
+    el.setCustomValidity(required ? "Enter a valid US phone number." : "Enter a valid US business phone, or leave it blank.");
+    return false;
+  }
+  el.setCustomValidity("");
+  return true;
+}
+
 const LOGO_MAX_EDGE = 384;
 const LOGO_MAX_DATA_URL = 180000;
 
@@ -178,43 +199,49 @@ function renderForm(cfg) {
       <div class="signup-step" data-step="1">
         <p class="sub">Step 1 of 3 · Account</p>
         <div class="fields">
-          <label class="full">Company name<input id="companyName" name="companyName" maxlength="80" autocomplete="organization" required></label>
-          <label class="full">Company code<input id="bookingSlug" name="bookingSlug" maxlength="40" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+          <label class="full">Company name<input id="companyName" name="companyName" maxlength="80" autocomplete="organization" enterkeyhint="next" required></label>
+          <label class="full">Company code<input id="bookingSlug" name="bookingSlug" maxlength="40" autocomplete="off" autocapitalize="none" spellcheck="false" inputmode="text" required></label>
           <p class="note" id="slug-permanent-note">${esc(cfg.slugPermanentNote || "")}</p>
           <p class="sub" id="slug-preview">Booking link: https://${esc(cfg.bookingHost || "app.nudgedispatch.com")}/book/…/</p>
           <p class="sub slug-status" id="slug-status"></p>
           <label class="full">Your name<input id="ownerName" name="ownerName" maxlength="80" autocomplete="name" required></label>
-          <label class="full">Email<input id="email" name="email" type="email" maxlength="120" autocomplete="username" required></label>
-          <label>Phone (optional)<input id="ownerPhone" name="ownerPhone" type="tel" maxlength="40" autocomplete="tel"></label>
-          <label>Password<input id="password" name="password" type="password" minlength="12" maxlength="200" autocomplete="new-password" required>
+          <label class="full">Email<input id="email" name="email" type="email" maxlength="120" autocomplete="email" inputmode="email" required></label>
+          <label class="full">Phone<input id="ownerPhone" name="ownerPhone" type="tel" maxlength="40" autocomplete="tel" inputmode="tel" required>
+            <span class="sub">US number, like (404) 555-0100.</span>
+          </label>
+          <label class="full">Password<input id="password" name="password" type="password" minlength="12" maxlength="200" autocomplete="new-password" required>
             <span class="sub">12 to 200 characters, and not your email.</span>
           </label>
+          <label class="full">Address (optional)<input id="address" name="address" maxlength="200" autocomplete="street-address"></label>
+          <label>Business phone (optional)<input id="businessPhone" name="businessPhone" type="tel" maxlength="40" autocomplete="tel" inputmode="tel" placeholder="Same as your phone">
+            <span class="sub">Leave blank to use your phone number.</span>
+          </label>
+          <label>Website (optional)<input id="website" name="website" type="url" maxlength="120" autocomplete="url" inputmode="url" placeholder="https://"></label>
           <fieldset class="full plan-card">
             <legend>Your plan</legend>
             <p class="plan-name">Solo · ${esc(cfg.monthly)}/mo</p>
             <p class="sub">1 driver (owner-operator). The one-time ${esc(cfg.setupWas)} setup fee is waived.</p>
             <p class="note">${esc(cfg.textingUpgradeNote || "")}</p>
           </fieldset>
-          <label class="full">Address (optional)<input id="address" name="address" maxlength="200" autocomplete="street-address"></label>
-          <label>Business phone (optional)<input id="businessPhone" name="businessPhone" type="tel" maxlength="40" autocomplete="tel"></label>
-          <label class="full">Website (optional)<input id="website" name="website" maxlength="120" autocomplete="url"></label>
         </div>
         <p class="err full" id="step1-err"></p>
-        <button class="btn full" type="button" id="to-branding">Continue</button>
+        <div class="signup-actions">
+          <button class="btn full" type="button" id="to-branding">Continue</button>
+        </div>
       </div>
 
       <div class="signup-step hidden" data-step="2">
         <p class="sub">Step 2 of 3 · Branding (optional)</p>
         <p class="note">Add a logo and a header color for your booking page. You can skip this and change it later in settings. Your company code can't be changed later.</p>
         <div class="fields">
-          <label class="full">Logo (optional)<input id="logo" type="file" accept="image/*,.heic,.heif,image/heic,image/heif">
-            <span class="sub">PNG, JPG, WebP, or HEIC. We'll resize it to 384px and save a PNG under 120 KB, the same format invoices use.</span>
+          <label class="full">Logo (optional)<input id="logo" type="file" accept="image/*,image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif">
+            <span class="sub">Choose a photo from your camera roll. PNG, JPG, WebP, or HEIC. We'll resize it to 384px and save a PNG under 120 KB.</span>
           </label>
           <p class="sub" id="logo-status"></p>
           <fieldset class="full plan-card" id="theme-field">
             <legend>Theme color (optional)</legend>
             <div class="theme-presets" id="theme-presets"></div>
-            <label>Custom hex<input id="themeColor" name="themeColor" value="" placeholder="#0b0b0b" maxlength="7" autocapitalize="none" spellcheck="false"></label>
+            <label>Custom hex<input id="themeColor" name="themeColor" value="" placeholder="#0b0b0b" maxlength="7" autocapitalize="none" autocomplete="off" spellcheck="false" inputmode="text"></label>
           </fieldset>
           <div class="brand-preview" id="brand-preview" aria-label="Booking page header preview">
             <header class="top">
@@ -224,9 +251,11 @@ function renderForm(cfg) {
           </div>
         </div>
         <p class="err full" id="step2-err"></p>
-        <button class="btn full" type="button" id="to-review">Continue</button>
-        <button class="btn ghost full" type="button" id="skip-branding">Skip branding</button>
-        <button class="btn ghost full" type="button" id="back-account">Back</button>
+        <div class="signup-actions">
+          <button class="btn full" type="button" id="to-review">Continue</button>
+          <button class="btn ghost full" type="button" id="skip-branding">Skip branding</button>
+          <button class="btn ghost full" type="button" id="back-account">Back</button>
+        </div>
       </div>
 
       <div class="signup-step hidden" data-step="3">
@@ -236,11 +265,13 @@ function renderForm(cfg) {
         <label class="full terms-check"><input id="termsAccepted" type="checkbox" required> <span>I agree to the <a href="${esc(cfg.termsUrl)}" target="_blank" rel="noopener">Terms of Service</a> and <a href="${esc(cfg.privacyUrl)}" target="_blank" rel="noopener">Privacy Policy</a>.</span></label>
         ${cfg.turnstileSiteKey ? `<div class="full" id="turnstile"></div>` : ""}
         <p class="err full" id="err"></p>
-        <button class="btn full" type="submit" id="signup-submit">Continue to payment</button>
-        <button class="btn ghost full" type="button" id="back-branding">Back</button>
+        <div class="signup-actions">
+          <button class="btn full" type="submit" id="signup-submit">Continue to payment</button>
+          <button class="btn ghost full" type="button" id="back-branding">Back</button>
+        </div>
       </div>
     </form>
-    <p class="muted">Cards only. You'll enter your card on Stripe's secure page. Already have an account? <a href="/">Sign in</a>.</p>
+    <p class="muted signup-foot">Cards only. You'll enter your card on Stripe's secure page. Already have an account? <a class="signup-signin" href="/">Sign in</a>.</p>
   </section>`;
 
   let step = 1;
@@ -347,10 +378,16 @@ function renderForm(cfg) {
     }
   });
 
-  const step1Fields = ["#companyName", "#bookingSlug", "#ownerName", "#email", "#password"];
+  const step1Fields = ["#companyName", "#bookingSlug", "#ownerName", "#email", "#ownerPhone", "#password"];
+  const ownerPhone = $("#ownerPhone");
+  const businessPhone = $("#businessPhone");
+  if (ownerPhone) ownerPhone.addEventListener("input", () => setPhoneValidity(ownerPhone, true));
+  if (businessPhone) businessPhone.addEventListener("input", () => setPhoneValidity(businessPhone, false));
   $("#to-branding").addEventListener("click", () => {
     const err = $("#step1-err");
     err.textContent = "";
+    if (!setPhoneValidity(ownerPhone, true)) { ownerPhone.reportValidity(); return; }
+    if (!setPhoneValidity(businessPhone, false)) { businessPhone.reportValidity(); return; }
     for (const sel of step1Fields) {
       const el = $(sel);
       if (el && !el.checkValidity()) { el.reportValidity(); return; }
@@ -385,15 +422,17 @@ function renderForm(cfg) {
     const err = $("#err");
     const btn = $("#signup-submit");
     err.textContent = "";
+    if (!setPhoneValidity($("#ownerPhone"), true)) { showStep(1); $("#ownerPhone").reportValidity(); return; }
+    if (!setPhoneValidity($("#businessPhone"), false)) { showStep(1); $("#businessPhone").reportValidity(); return; }
     const body = {
       companyName: $("#companyName").value,
       bookingSlug: $("#bookingSlug").value,
       ownerName: $("#ownerName").value,
       email: $("#email").value,
-      ownerPhone: $("#ownerPhone").value,
+      ownerPhone: normalizePhone($("#ownerPhone").value) || $("#ownerPhone").value,
       password: $("#password").value,
       address: $("#address").value,
-      businessPhone: $("#businessPhone").value,
+      businessPhone: normalizePhone($("#businessPhone").value) || normalizePhone($("#ownerPhone").value) || $("#businessPhone").value,
       website: $("#website").value,
       themeColor: currentThemeHex(),
       termsAccepted: $("#termsAccepted").checked,
