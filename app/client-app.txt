@@ -1407,14 +1407,14 @@ const PAY_FIELDS = [
   { kind: "cashapp", label: "Cash App", what: "$cashtag", placeholder: "$cashtag" },
   { kind: "zelle", label: "Zelle", what: "phone or email", placeholder: "Zelle phone or email" },
   { kind: "venmo", label: "Venmo", what: "@username", placeholder: "@username" },
-  { kind: "paypal", label: "PayPal", what: "PayPal.Me name", placeholder: "paypal.me/name" },
+  { kind: "paypal", label: "PayPal", what: "PayPal.Me name or paypal.com/biz/profile link", placeholder: "paypal.me/name or paypal.com/biz/profile/name" },
 ];
 
 function paymentMethodsFieldset(methods) {
   const pm = methods || {};
-  const shown = (kind, handle) => !handle ? "" : kind === "cashapp" ? "$" + handle : kind === "venmo" ? "@" + handle : handle;
+  const shown = (kind, handle) => !handle ? "" : kind === "cashapp" ? "$" + handle : kind === "venmo" ? "@" + handle : kind === "paypal" && handle.startsWith("biz:") ? "paypal.com/biz/profile/" + handle.slice(4) : handle;
   return `<fieldset class="full paymeth" id="paymeth"><legend>How clients can pay you</legend>
-    <p class="sub">Turn on each way you take payment. Invoices get a Pay with section, and Cash App, Venmo, and PayPal open with the amount filled in. Money goes straight to you, so mark the ride paid yourself.</p>
+    <p class="sub">Turn on each way you take payment. Invoices get a Pay with section, and Cash App, Venmo, and PayPal.Me open with the amount filled in. A PayPal business profile link opens the profile without an amount. Money goes straight to you, so mark the ride paid yourself.</p>
     ${PAY_FIELDS.map((f) => {
       const m = pm[f.kind] || {};
       return `<div class="paymeth-row"><label class="check"><input type="checkbox" data-pay-on="${f.kind}"${m.on ? " checked" : ""}> ${esc(f.label)}</label>${f.placeholder ? `<input data-pay-handle="${f.kind}" aria-label="${esc(f.label + " " + f.what)}" placeholder="${esc(f.placeholder)}" value="${esc(shown(f.kind, m.handle))}" maxlength="120" autocomplete="off" autocapitalize="off" spellcheck="false">` : `<span class="muted">${"Pay your driver in cash"}</span>`}</div>`;
