@@ -219,7 +219,8 @@ function renderForm(cfg) {
           <label>Website (optional)<input id="website" name="website" type="url" maxlength="120" autocomplete="url" inputmode="url" placeholder="https://"></label>
           <fieldset class="full plan-card">
             <legend>Your plan</legend>
-            <p class="plan-name">Solo · ${esc(cfg.trialHeadline || "15 rides free")}, then ${esc(cfg.monthly)}/mo</p>
+            <p class="plan-name trial-headline" id="trial-headline">Solo · ${esc(cfg.trialHeadline || "15 rides free")}</p>
+            <p class="sub plan-then">Then ${esc(cfg.monthly)}/mo. No setup fee.</p>
             <p class="plan-trial-line" id="plan-trial-line">${esc(cfg.trialPlanLine || "")}</p>
             <p class="sub">1 driver (owner-operator).</p>
             <p class="setup-self" id="setup-self"><strong>${esc(cfg.selfSetupLabel || "Self setup (you're doing it now): setup fee waived")}</strong></p>

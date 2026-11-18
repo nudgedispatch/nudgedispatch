@@ -491,3 +491,5 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .profile-legal a { color: var(--muted); }
 .profile-cancel { margin: 4px 0 28px; font-size: 13px; text-align: center; }
 .profile-cancel a { color: var(--muted); }
+/* 15-rides headline stays on one line (390 to 1280+) */
+.signup-card .trial-headline { white-space: nowrap; overflow: hidden; text-overflow: clip; font-size: clamp(17px, 5.2vw, 22px); line-height: 1.25; }

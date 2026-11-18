@@ -172,6 +172,9 @@ test("signup page states the 15-ride trial, the small print near the card step, 
   assert.match(src, /Continue to add card/);
   assert.doesNotMatch(src, /Continue to payment/);
   assert.doesNotMatch(src, /Cancel trial/i);
+  assert.match(src, /class="plan-name trial-headline"/);
+  const css = await readFile(new URL("../app/app.css", import.meta.url), "utf8");
+  assert.match(css, /\.signup-card \.trial-headline \{ white-space: nowrap;[^}]*clamp\(/);
   assert.doesNotMatch(src, /\bbeta\b/i);
   // Small print sits on the card step, before the terms checkbox.
   assert.ok(src.indexOf('id="trial-small-print"') < src.indexOf('id="termsAccepted"'));
