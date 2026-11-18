@@ -12,7 +12,8 @@ import { TRIAL_RIDE_LIMIT, stripeTrialEnd } from "./trial.js";
 export const PUBLIC_BILLING_PLAN = "solo";
 export const SIGNUP_TERMS_URL = "https://nudgedispatch.com/terms.html";
 export const SIGNUP_PRIVACY_URL = "https://nudgedispatch.com/privacy.html";
-export const SIGNUP_TERMS_VERSION = "nudgedispatch.com/terms.html#2026-11-17";
+// Bumped for the 15-ride trial Terms (Section 7 trial bullets, in-app cancellation). Match the published Terms when they go live.
+export const SIGNUP_TERMS_VERSION = "nudgedispatch.com/terms.html#2026-11-17-trial";
 export const TERMS_CONSENT_ERROR = "Please agree to the Terms of Service and Privacy Policy.";
 export const SIGNUP_TTL_MS = 24 * 60 * 60 * 1000;
 export const SOLO_MONTHLY_CENTS = 3900;

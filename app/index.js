@@ -1655,8 +1655,8 @@ async function cancelPaidSolo(env, user, current, feedback) {
   return json({ ok: true, canceled: true, kind: "paid", charged: false, accessUntil: until });
 }
 __name(cancelPaidSolo, "cancelPaidSolo");
-// Optional email to nudgedispatch@gmail.com when a trial is canceled (DECISION FOR JESSE: off by default).
-// On only when CANCEL_NOTIFY = "on" and RESEND_API_KEY is set. Never sends on the preview unless both are set.
+// Email to nudgedispatch@gmail.com when an account is canceled (Jesse approved, Nov 17, 2026).
+// Sends only when CANCEL_NOTIFY = "on" AND the RESEND_API_KEY secret AND CANCEL_NOTIFY_FROM are set; otherwise a no-op.
 async function notifyCancellation(env, info) {
   if (!env || env.CANCEL_NOTIFY !== "on" || !env.RESEND_API_KEY) return { sent: false };
   const to = (env.CANCEL_NOTIFY_TO || "nudgedispatch@gmail.com").trim();
@@ -1664,7 +1664,7 @@ async function notifyCancellation(env, info) {
   if (!from) return { sent: false };
   const company = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(info.companyId).first();
   const text = [
-    "A free trial was canceled.",
+    info.mode === "paid" ? "A paid Solo subscription was canceled." : "A free trial was canceled.",
     "Company: " + (company && company.name || info.companyId),
     "Rides used: " + info.ridesUsed + " of " + TRIAL_RIDE_LIMIT,
     "Reasons: " + (info.reasons ? info.reasons.join(", ") : "(skipped)"),
@@ -1673,7 +1673,7 @@ async function notifyCancellation(env, info) {
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { authorization: "Bearer " + env.RESEND_API_KEY, "content-type": "application/json" },
-    body: JSON.stringify({ from, to: [to], subject: "Nudge Dispatch trial canceled", text })
+    body: JSON.stringify({ from, to: [to], subject: info.mode === "paid" ? "Nudge Dispatch subscription canceled" : "Nudge Dispatch trial canceled", text })
   });
   return { sent: res.ok };
 }
