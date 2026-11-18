@@ -464,3 +464,8 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .air-msg { min-height: 1.4em; margin: 8px 0 0; }
 .air-msg.ok { color: var(--green); }
 .air-msg.bad { color: var(--red); }
+/* PayPal invoices */
+#pp-invoice { margin: 10px 0; }
+#pp-invoice .err:empty, #paypal-card .err:empty { display: none; }
+#pp-invoice .actions { margin-top: 8px; }
+#pp-webhook-url { overflow-wrap: anywhere; }
