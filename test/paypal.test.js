@@ -92,3 +92,56 @@ test("bad client credentials give a plain message, never the secret", async () =
   const creds = { companyId: "c1", mode: "sandbox", clientId: "cid", secret: "do-not-leak-me", tokenEnc: "", tokenExpiresAt: 0 };
   await assert.rejects(paypalAccessToken(env, creds, { fetchImpl }), (error) => /Client ID and Secret/.test(error.message) && !error.message.includes("do-not-leak"));
 });
+
+test("draft invoice: Nudge number, one Car service line, tips on, no tax, rider email required", async () => {
+  const { buildPayPalInvoice, safePayerUrl } = await import("../app/paypal.js");
+  const draft = buildPayPalInvoice({ number: "TGS-1001", amountCents: 12550, issuedOn: "2026-11-18", billName: "Avery Cole", billEmail: "avery@example.test", trip: { date: "2026-11-18", time: "09:30", pickup: "Hotel", dropoff: "Airport" }, businessName: "TGS Limo", terms: "Due on receipt." });
+  assert.equal(draft.detail.invoice_number, "TGS-1001");
+  assert.equal(draft.detail.currency_code, "USD");
+  assert.equal(draft.detail.invoice_date, "2026-11-18");
+  assert.equal(draft.items.length, 1);
+  assert.equal(draft.items[0].name, "Car service");
+  assert.equal(draft.items[0].unit_amount.value, "125.50");
+  assert.equal(draft.items[0].tax, undefined);
+  assert.equal(draft.configuration.allow_tip, true);
+  assert.equal(draft.primary_recipients[0].billing_info.email_address, "avery@example.test");
+  assert.throws(() => buildPayPalInvoice({ number: "X", amountCents: 100, billEmail: "" }), /rider's email/);
+  assert.throws(() => buildPayPalInvoice({ number: "X", amountCents: 0, billEmail: "a@b.co" }), /no amount/);
+  assert.equal(safePayerUrl("https://www.sandbox.paypal.com/invoice/p/#INV2-AAAA"), "https://www.sandbox.paypal.com/invoice/p/#INV2-AAAA");
+  assert.equal(safePayerUrl("https://evil.example/paypal.com"), "");
+  assert.equal(safePayerUrl("javascript:alert(1)"), "");
+});
+
+test("create + send uses the Nudge invoice id as PayPal-Request-Id and reuses an existing draft", async () => {
+  const { createAndSendInvoice } = await import("../app/paypal.js");
+  const env = { PAYPAL_MODE: "sandbox", PAYPAL_CREDENTIALS_KEY: KEY, DB: fakeDb() };
+  const seen = [];
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname;
+    seen.push({ path, rid: init.headers["paypal-request-id"], body: init.body });
+    if (path === "/v1/oauth2/token") return new Response(JSON.stringify({ access_token: "t", expires_in: 100 }), { status: 200 });
+    if (path === "/v2/invoicing/invoices") return new Response(JSON.stringify({ id: "INV2-ABCD-1234", status: "DRAFT" }), { status: 201 });
+    if (path.endsWith("/send")) return new Response(JSON.stringify({ href: "https://www.sandbox.paypal.com/invoice/p/#INV2-ABCD-1234" }), { status: 200 });
+    return new Response("{}", { status: 404 });
+  };
+  const creds = { companyId: "c1", mode: "sandbox", clientId: "cid", secret: "sec", tokenEnc: "", tokenExpiresAt: 0 };
+  const drafts = [];
+  const out = await createAndSendInvoice(env, creds, "11111111-2222-3333-4444-555555555555", { detail: {} }, { fetchImpl, onDraft: async (id, st) => drafts.push([id, st]) });
+  assert.deepEqual(out, { id: "INV2-ABCD-1234", status: "SENT", payerUrl: "https://www.sandbox.paypal.com/invoice/p/#INV2-ABCD-1234" });
+  assert.deepEqual(drafts, [["INV2-ABCD-1234", "DRAFT"]]);
+  assert.equal(seen.find((r) => r.path === "/v2/invoicing/invoices").rid, "11111111-2222-3333-4444-555555555555");
+  assert.equal(seen.find((r) => r.path.endsWith("/send")).rid, "11111111-2222-3333-4444-555555555555-send");
+  assert.deepEqual(JSON.parse(seen.find((r) => r.path.endsWith("/send")).body), { send_to_invoicer: false, send_to_recipient: true });
+  seen.length = 0;
+  await createAndSendInvoice(env, creds, "11111111-2222-3333-4444-555555555555", { detail: {} }, { fetchImpl, existingId: "INV2-ABCD-1234" });
+  assert.equal(seen.some((r) => r.path === "/v2/invoicing/invoices"), false);
+});
+
+test("mock PayPal (preview) needs no network and is deterministic", async () => {
+  const { mockPayPal } = await import("../app/paypal-mock.js");
+  assert.equal(mockPayPal("POST", "/v1/oauth2/token", { authorization: "Basic x" }).status, 200);
+  const a = mockPayPal("POST", "/v2/invoicing/invoices", { authorization: "Bearer t", "paypal-request-id": "abc-123" }, "{}");
+  const b = mockPayPal("POST", "/v2/invoicing/invoices", { authorization: "Bearer t", "paypal-request-id": "abc-123" }, "{}");
+  assert.equal(a.data.id, b.data.id);
+  assert.equal(mockPayPal("GET", "/v2/invoicing/invoices/X", {}).status, 401);
+});

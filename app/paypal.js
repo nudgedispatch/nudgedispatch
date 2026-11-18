@@ -216,3 +216,90 @@ export async function testConnection(env, creds, opts) {
   await paypalAccessToken(env, creds, opts);
   return true;
 }
+
+// ---- Invoices
+const PAYER_URL_RE = /^https:\/\/www\.(sandbox\.)?paypal\.com\/[^\s"'<>]{1,400}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function validRiderEmail(email) {
+  const value = String(email || "").trim();
+  return EMAIL_RE.test(value) && value.length <= 254 ? value : "";
+}
+
+function cut(value, max) {
+  return String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
+}
+
+// PayPal v2 draft: Nudge invoice number, one "Car service" line, tips on, no tax, due on receipt.
+export function buildPayPalInvoice({ number, amountCents, issuedOn, billName, billEmail, trip, businessName, terms }) {
+  const cents = Math.round(Number(amountCents));
+  if (!Number.isFinite(cents) || cents <= 0) throw new PayPalError("This invoice has no amount, so it can't go to PayPal.", 400, "INPUT");
+  const email = validRiderEmail(billEmail);
+  if (!email) throw new PayPalError("Add the rider's email to send a PayPal invoice.", 400, "INPUT");
+  const t = trip || {};
+  const route = [t.pickup, t.dropoff].filter(Boolean).join(" to ");
+  const when = [t.date, t.time].filter(Boolean).join(" ");
+  const draft = {
+    detail: {
+      invoice_number: cut(number, 127),
+      currency_code: "USD",
+      payment_term: { term_type: "DUE_ON_RECEIPT" },
+    },
+    invoicer: {},
+    primary_recipients: [{ billing_info: { email_address: email, ...(billName ? { name: { full_name: cut(billName, 140) } } : {}) } }],
+    items: [{
+      name: "Car service",
+      ...(route || when ? { description: cut([when, route].filter(Boolean).join(", "), 1000) } : {}),
+      quantity: "1",
+      unit_amount: { currency_code: "USD", value: (cents / 100).toFixed(2) },
+      unit_of_measure: "AMOUNT",
+    }],
+    configuration: { allow_tip: true, tax_inclusive: false },
+  };
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(issuedOn || ""))) draft.detail.invoice_date = issuedOn;
+  if (terms) draft.detail.terms_and_conditions = cut(terms, 4000);
+  if (businessName) draft.invoicer.business_name = cut(businessName, 300);
+  return draft;
+}
+
+export function safePayerUrl(value) {
+  const url = String(value || "").trim();
+  return PAYER_URL_RE.test(url) ? url : "";
+}
+
+function payerUrlOf(invoice) {
+  const meta = invoice && invoice.detail && invoice.detail.metadata;
+  return safePayerUrl(meta && meta.recipient_view_url);
+}
+
+// Draft then send. The Nudge invoice id is the PayPal-Request-Id, so a retry never makes a second invoice.
+// existingId: a draft already created on an earlier try. onDraft(id, status) is called before sending.
+export async function createAndSendInvoice(env, creds, nudgeInvoiceId, draft, { existingId, onDraft, fetchImpl, now } = {}) {
+  let id = existingId || "";
+  let payerUrl = "";
+  if (!id) {
+    const created = await paypalRequest(env, creds, "POST", "/v2/invoicing/invoices", draft, { requestId: nudgeInvoiceId, fetchImpl, now });
+    id = String((created && created.id) || "");
+    if (!/^[A-Z0-9-]{5,64}$/.test(id)) throw new PayPalError("PayPal didn't return an invoice id. Try again.", 502, "NO_ID");
+    payerUrl = payerUrlOf(created);
+    if (onDraft) await onDraft(id, String(created.status || "DRAFT"));
+  }
+  const sent = await paypalRequest(env, creds, "POST", "/v2/invoicing/invoices/" + encodeURIComponent(id) + "/send", { send_to_invoicer: false, send_to_recipient: true }, { requestId: nudgeInvoiceId + "-send", fetchImpl, now });
+  payerUrl = safePayerUrl(sent && sent.href) || payerUrl;
+  return { id, status: "SENT", payerUrl };
+}
+
+export const PAYPAL_STATUS_LABELS = {
+  DRAFT: "Draft (not sent)",
+  SENT: "Sent, not paid yet",
+  SCHEDULED: "Scheduled",
+  UNPAID: "Not paid yet",
+  PAYMENT_PENDING: "Payment pending",
+  PARTIALLY_PAID: "Partly paid",
+  PAID: "Paid on PayPal",
+  MARKED_AS_PAID: "Marked paid on PayPal",
+  CANCELLED: "Cancelled on PayPal",
+  REFUNDED: "Refunded on PayPal",
+  PARTIALLY_REFUNDED: "Partly refunded on PayPal",
+  MARKED_AS_REFUNDED: "Marked refunded on PayPal",
+};
