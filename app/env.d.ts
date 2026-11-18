@@ -46,4 +46,10 @@ export interface NudgeEnv {
   RESEND_API_KEY?: string;
   /** Override Turnstile siteverify URL (tests). */
   TURNSTILE_VERIFY_URL?: string;
+  /** PayPal invoicing: off (default, hidden) | mock (preview, no network) | sandbox | live. */
+  PAYPAL_MODE?: string;
+  /** Base64 32-byte AES-GCM key that encrypts each fleet's PayPal app secret in D1. Worker secret only. */
+  PAYPAL_CREDENTIALS_KEY?: string;
+  /** Override the PayPal API host (tests only). */
+  PAYPAL_API_BASE?: string;
 }

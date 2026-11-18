@@ -1170,6 +1170,7 @@ async function renderInvoice(id, gen) {
       <button class="btn ghost" id="txt" type="button">Download text</button>
       <button class="btn ghost" id="html" type="button">Download page</button>
     </div>
+    ${payPalInvoiceHtml(invoice)}
     ${invoice.payment ? `<div class="row paid-row noprint"><span id="paid-state" class="${paid ? "paid-yes" : "muted"}">${paid ? "Paid" : "Not paid yet"}</span><button class="btn ghost" id="mark-paid" type="button" data-paid="${paid ? "1" : "0"}">${paid ? "Mark not paid" : "Mark paid"}</button></div><p class="err noprint" id="paid-err"></p>` : ""}
     <article class="sheet" id="sheet">
       <div class="who">${logo}<div><h2>INVOICE</h2><strong>${esc(business.name)}</strong><div>${esc([business.address, business.phone, business.email, business.website].filter(Boolean).join(" · "))}</div></div></div>
@@ -1201,6 +1202,27 @@ async function renderInvoice(id, gen) {
       setTimeout(() => { button.textContent = "Copy"; }, 2000);
     };
   });
+  const ppSend = document.querySelector("#pp-send");
+  if (ppSend) ppSend.onclick = async () => {
+    const pp = invoice.paypal || {};
+    if (!confirm(pp.mock ? "Preview: simulate sending a PayPal invoice? Nothing reaches PayPal." : "Send PayPal invoice " + invoice.number + " for " + invoice.fare + " to " + (invoice.billTo.email || "the client's email") + "? PayPal emails it to the rider.")) return;
+    ppSend.disabled = true;
+    const msg = document.querySelector("#pp-send-msg");
+    if (msg) { msg.style.color = ""; msg.textContent = "Sending to PayPal…"; }
+    const sent = await api("/api/invoices/" + invoice.id + "/paypal", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    if (!sent.data.ok) { ppSend.disabled = false; if (msg) msg.textContent = sent.data.error || "Could not send the PayPal invoice."; return; }
+    renderInvoice(invoice.id, gen);
+  };
+  const ppSync = document.querySelector("#pp-sync");
+  if (ppSync) ppSync.onclick = async () => {
+    ppSync.disabled = true;
+    const synced = await api("/api/invoices/" + invoice.id + "/paypal/sync", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    ppSync.disabled = false;
+    if (!synced.data.ok) { const msg = document.querySelector("#pp-send-msg"); if (msg) msg.textContent = synced.data.error || "Could not check PayPal."; return; }
+    renderInvoice(invoice.id, gen);
+  };
   const markPaid = document.querySelector("#mark-paid");
   if (markPaid) markPaid.onclick = async () => {
     const nowPaid = markPaid.getAttribute("data-paid") === "1";
@@ -1219,6 +1241,25 @@ async function renderInvoice(id, gen) {
   };
   document.querySelector("#txt").onclick = () => download(`invoice-${invoice.number}.txt`, invoice.snapshotText, "text/plain");
   document.querySelector("#html").onclick = () => download(`invoice-${invoice.number}.html`, `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Invoice ${esc(invoice.number)}</title></head><body><pre>${esc(invoice.snapshotText)}</pre></body></html>`, "text/html");
+}
+
+// "Send PayPal invoice" (explicit tap) or, once sent, the PayPal invoice status and payer link.
+function payPalInvoiceHtml(invoice) {
+  const pp = invoice.paypal || {};
+  if (pp.sent) {
+    return `<div class="card noprint" id="pp-invoice"><p><strong>PayPal invoice</strong> · <span id="pp-status">${esc(pp.statusLabel || pp.status)}</span>${pp.refunded ? ` · <span class="err">Refunded</span>` : ""}</p>
+      <p class="sub">${esc(pp.invoiceId)}${pp.mode === "sandbox" ? " · sandbox" : ""}${pp.mock ? " · simulated on this preview" : ""}. The plain PayPal link is hidden on this invoice; the rider pays the PayPal invoice.</p>
+      <div class="actions">${pp.payerUrl ? `<a class="btn ghost" id="pp-open" href="${esc(pp.payerUrl)}" target="_blank" rel="noopener noreferrer">Open PayPal invoice</a>` : ""}<button class="btn ghost" id="pp-sync" type="button">Check PayPal status</button></div>
+      <p class="err" id="pp-send-msg"></p></div>`;
+  }
+  if (!pp.available) return "";
+  const email = String((invoice.billTo && invoice.billTo.email) || "").trim();
+  const paid = invoice.payment === "paid";
+  const hasEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  return `<div class="card noprint" id="pp-invoice">
+      <button class="btn full" id="pp-send" type="button"${paid ? " disabled" : ""}>Send PayPal invoice</button>
+      <p class="sub">${paid ? "This ride is already marked paid." : `PayPal emails the invoice to ${hasEmail ? esc(email) : "the rider's email on this client (needed)"}. The rider can pay by card or PayPal and add a tip. It's marked paid here when PayPal says it's fully paid.`}${pp.mock ? " Preview: simulated, nothing reaches PayPal." : ""}${pp.status === "DRAFT" ? " A PayPal draft exists; tapping again sends that same invoice." : ""}</p>
+      <p class="err" id="pp-send-msg"></p></div>`;
 }
 
 function payOptionHtml(option, fare) {
@@ -1428,14 +1469,14 @@ const PAY_FIELDS = [
   { kind: "cashapp", label: "Cash App", what: "$cashtag", placeholder: "$cashtag" },
   { kind: "zelle", label: "Zelle", what: "phone or email", placeholder: "Zelle phone or email" },
   { kind: "venmo", label: "Venmo", what: "@username", placeholder: "@username" },
-  { kind: "paypal", label: "PayPal", what: "PayPal.Me name", placeholder: "paypal.me/name" },
+  { kind: "paypal", label: "PayPal", what: "PayPal.Me name or paypal.com/biz/profile link", placeholder: "paypal.me/name or paypal.com/biz/profile/name" },
 ];
 
 function paymentMethodsFieldset(methods) {
   const pm = methods || {};
-  const shown = (kind, handle) => !handle ? "" : kind === "cashapp" ? "$" + handle : kind === "venmo" ? "@" + handle : handle;
+  const shown = (kind, handle) => !handle ? "" : kind === "cashapp" ? "$" + handle : kind === "venmo" ? "@" + handle : kind === "paypal" && handle.startsWith("biz:") ? "paypal.com/biz/profile/" + handle.slice(4) : handle;
   return `<fieldset class="full paymeth" id="paymeth"><legend>How clients can pay you</legend>
-    <p class="sub">Turn on each way you take payment. Invoices get a Pay with section, and Cash App, Venmo, and PayPal open with the amount filled in. Money goes straight to you, so mark the ride paid yourself.</p>
+    <p class="sub">Turn on each way you take payment. Invoices get a Pay with section, and Cash App, Venmo, and PayPal.Me open with the amount filled in. A PayPal business profile link opens the profile without an amount. Money goes straight to you, so mark the ride paid yourself.</p>
     ${PAY_FIELDS.map((f) => {
       const m = pm[f.kind] || {};
       return `<div class="paymeth-row"><label class="check"><input type="checkbox" data-pay-on="${f.kind}"${m.on ? " checked" : ""}> ${esc(f.label)}</label>${f.placeholder ? `<input data-pay-handle="${f.kind}" aria-label="${esc(f.label + " " + f.what)}" placeholder="${esc(f.placeholder)}" value="${esc(shown(f.kind, m.handle))}" maxlength="120" autocomplete="off" autocapitalize="off" spellcheck="false">` : `<span class="muted">${"Pay your driver in cash"}</span>`}</div>`;
@@ -1453,6 +1494,60 @@ function readPaymentMethods() {
   return out;
 }
 
+// PayPal invoices (Pay with): the fleet's own PayPal REST app. The secret is write-only; only its last 4 come back.
+function payPalCardHtml(p) {
+  const modes = Array.isArray(p.allowedModes) ? p.allowedModes : [];
+  const label = { sandbox: "Sandbox (testing)", live: "Live" };
+  const saved = p.configured ? `<p class="sub" id="pp-saved">Saved: ${esc(label[p.mode] || p.mode)} app · Client ID ${esc(String(p.clientId).slice(0, 6))}… · Secret ending ${esc(p.secretLast4)}${p.webhookId ? " · webhook set" : " · no webhook yet"}</p>` : `<p class="sub" id="pp-saved">Not connected.</p>`;
+  return `<h2>PayPal invoices</h2>
+    <p class="sub">Optional. Connect your own PayPal business account so an invoice can be sent as a real PayPal invoice (card or PayPal, tips allowed) and marked paid when PayPal says it's paid. Money goes straight to your PayPal.</p>
+    ${p.serverMode === "mock" ? `<p class="note" id="pp-mock">Preview: PayPal is simulated here. Nothing reaches PayPal and no email goes out.</p>` : ""}
+    ${p.problem ? `<p class="note">${esc(p.problem)}</p>` : ""}
+    ${saved}
+    <form id="pp-form" class="stack" autocomplete="off">
+      <label>PayPal app<select id="pp-mode">${modes.map((m) => `<option value="${esc(m)}"${(p.mode || modes[0]) === m ? " selected" : ""}>${esc(label[m] || m)}</option>`).join("")}</select></label>
+      <label>Client ID<input id="pp-client" value="${esc(p.clientId || "")}" maxlength="128" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label>Secret<input id="pp-secret" type="password" value="" maxlength="128" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="${p.configured ? "Saved (ends " + esc(p.secretLast4) + "). Leave blank to keep." : "Paste your app Secret"}"></label>
+      <label>Webhook ID (optional)<input id="pp-webhook" value="${esc(p.webhookId || "")}" maxlength="64" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <p class="sub">In your PayPal app, add a webhook for <span class="handle" id="pp-webhook-url">${esc(p.webhookUrl)}</span> with ${esc((p.webhookEvents || []).join(", "))}, then paste its Webhook ID here. Your Secret is encrypted and never shown again.</p>
+      <p class="err" id="pp-msg"></p>
+      <button class="btn full" type="submit"${p.problem ? " disabled" : ""}>Save PayPal app</button>
+      ${p.configured ? `<button class="btn ghost full" id="pp-test" type="button">Test connection</button><button class="btn ghost full" id="pp-remove" type="button">Disconnect PayPal</button>` : ""}
+    </form>`;
+}
+
+async function loadPayPalCard(gen, note, ok) {
+  const card = document.querySelector("#paypal-card");
+  if (!card) return;
+  const r = await api("/api/paypal/credentials");
+  if (gen !== undefined && gen !== renderGen) return;
+  if (!r.data.ok || !r.data.paypal || !r.data.paypal.enabled) { card.hidden = true; return; }
+  card.innerHTML = payPalCardHtml(r.data.paypal);
+  card.hidden = false;
+  const msg = card.querySelector("#pp-msg");
+  if (note) setMsg(msg, note, ok);
+  card.querySelector("#pp-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const body = { mode: card.querySelector("#pp-mode").value, clientId: card.querySelector("#pp-client").value, secret: card.querySelector("#pp-secret").value, webhookId: card.querySelector("#pp-webhook").value };
+    const saved = await api("/api/paypal/credentials", { method: "PUT", body });
+    if (!saved.data.ok) return setMsg(msg, saved.data.error || "Could not save.", false);
+    loadPayPalCard(gen, "PayPal app saved.", true);
+  };
+  const test = card.querySelector("#pp-test");
+  if (test) test.onclick = async () => {
+    test.disabled = true;
+    const t = await api("/api/paypal/credentials/test", { method: "POST", body: {} });
+    test.disabled = false;
+    setMsg(msg, t.data.ok ? (t.data.mock ? "Connected (simulated on this preview)." : "Connected to PayPal.") : t.data.error || "Could not connect.", !!t.data.ok);
+  };
+  const remove = card.querySelector("#pp-remove");
+  if (remove) remove.onclick = async () => {
+    if (!confirm("Disconnect PayPal? Invoices already sent stay on PayPal.")) return;
+    const d = await api("/api/paypal/credentials", { method: "DELETE", body: {} });
+    if (!d.data.ok) return setMsg(msg, d.data.error || "Could not disconnect.", false);
+    loadPayPalCard(gen, "PayPal disconnected.", true);
+  };
+}
 
 const LOGO_MAX_EDGE = 384;
 const LOGO_MAX_DATA_URL = 180000;
@@ -1592,10 +1687,12 @@ async function renderSettings(gen) {
       <p class="err full" id="err"></p>
       <button class="btn full" type="submit">Save business details</button>
     </form>
+    ${state.me.role === "owner" ? `<section class="card" id="paypal-card" hidden></section>` : ""}
     <p class="note">Invoices are never sent by the app. Email and Text on an invoice open your own mail or messages app so you send it yourself.</p>
     <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
     <button class="btn ghost full" id="out" type="button">Sign out</button>`;
   if (state.me.role === "owner") loadPaymentCard(gen);
+  if (state.me.role === "owner") loadPayPalCard(gen);
   const presets = document.querySelector("#theme-presets");
   const themeInput = document.querySelector("#themeColor");
   const paintSettingsTheme = () => {
