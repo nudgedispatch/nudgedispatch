@@ -1656,12 +1656,15 @@ async function cancelPaidSolo(env, user, current, feedback) {
 }
 __name(cancelPaidSolo, "cancelPaidSolo");
 // Email to nudgedispatch@gmail.com when an account is canceled (Jesse approved, Nov 17, 2026).
-// Sends only when CANCEL_NOTIFY = "on" AND the RESEND_API_KEY secret AND CANCEL_NOTIFY_FROM are set; otherwise a no-op.
+// Sends only when CANCEL_NOTIFY = "on" AND the RESEND_API_KEY secret is set; otherwise a no-op.
+// From: CANCEL_NOTIFY_FROM, or Resend's shared test sender until nudgedispatch.com is verified in Resend
+// (that sender only delivers to the Resend account owner's own address, which is this notice's recipient).
+// Fails soft: a Resend error is logged (status only) and never breaks the cancel.
+var RESEND_TEST_FROM = "Nudge Dispatch <onboarding@resend.dev>";
 async function notifyCancellation(env, info) {
   if (!env || env.CANCEL_NOTIFY !== "on" || !env.RESEND_API_KEY) return { sent: false };
   const to = (env.CANCEL_NOTIFY_TO || "nudgedispatch@gmail.com").trim();
-  const from = (env.CANCEL_NOTIFY_FROM || "").trim();
-  if (!from) return { sent: false };
+  const from = (env.CANCEL_NOTIFY_FROM || "").trim() || RESEND_TEST_FROM;
   const company = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(info.companyId).first();
   const text = [
     info.mode === "paid" ? "A paid Solo subscription was canceled." : "A free trial was canceled.",
@@ -1675,6 +1678,7 @@ async function notifyCancellation(env, info) {
     headers: { authorization: "Bearer " + env.RESEND_API_KEY, "content-type": "application/json" },
     body: JSON.stringify({ from, to: [to], subject: info.mode === "paid" ? "Nudge Dispatch subscription canceled" : "Nudge Dispatch trial canceled", text })
   });
+  if (!res.ok) console.log(JSON.stringify({ level: "warn", msg: "cancel notify not sent", status: res.status, testSender: from === RESEND_TEST_FROM }));
   return { sent: res.ok };
 }
 __name(notifyCancellation, "notifyCancellation");
@@ -2752,7 +2756,7 @@ async function adminReset(request, env) {
 __name(adminReset, "adminReset");
 async function adminTrialRow(env, id) {
   return env.DB.prepare(
-    `SELECT ${TRIAL_COLS}, c.name, c.status, c.booking_slug,
+    `SELECT ${TRIAL_COLS}, c.name, c.status, c.booking_slug, c.billing_last_paid_at,
             (SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id
               WHERE m.company_id = c.id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1) AS owner_email,
             (SELECT COUNT(*) FROM rides r WHERE r.company_id = c.id AND r.status = 'scheduled' AND r.approval IN ('none', 'approved')) AS scheduled,
@@ -2808,14 +2812,15 @@ __name(platformTrials, "platformTrials");
 async function platformTrialChange(request, env, id) {
   const user = await platformUser(request, env, true);
   if (isResponse(user)) return user;
-  return trialChange(request, env, id);
+  return trialChange(request, env, id, user.id);
 }
 __name(platformTrialChange, "platformTrialChange");
-async function trialChange(request, env, id) {
+async function trialChange(request, env, id, actorId = "admin-token") {
   const body = await readJson(request);
   if (isResponse(body)) return body;
   const row = await adminTrialRow(env, id);
   if (!row) return fail(404, "No company with that id.");
+  if (body.moveBack === true) return moveCompanyBackToTrial(env, row, actorId);
   const change = applyTrialChange(row, body, Date.now());
   if (change.error) return fail(400, change.error);
   const n = change.next;
@@ -2826,6 +2831,27 @@ async function trialChange(request, env, id) {
   return json({ ok: true, company: await adminTrialView(env, fresh) });
 }
 __name(trialChange, "trialChange");
+// Platform admin "Move back to free trial" (rules in trial.js moveBackToTrial). Never calls Stripe.
+async function moveCompanyBackToTrial(env, row, actorId) {
+  const completed = await completedRides(env, row.id);
+  const result = moveBackToTrial(row, completed, Date.now());
+  if (result.error) return fail(409, result.error);
+  const n = result.next;
+  await env.DB.prepare(
+    `UPDATE companies SET trial_status = ?, trial_ended_at = ?, trial_end_reason = ?, trial_started_at = ?, trial_ride_limit = ?, trial_days = ?,
+       trial_billing = ?, trial_converted_at = ?, trial_convert_claimed_at = ?, trial_convert_error = ?, trial_canceled_at = ?,
+       trial_notice_dismissed_at = ?, stripe_subscription_id = ? WHERE id = ?`
+  ).bind(n.trial_status, n.trial_ended_at, n.trial_end_reason, n.trial_started_at, n.trial_ride_limit, n.trial_days, n.trial_billing,
+    n.trial_converted_at, n.trial_convert_claimed_at, n.trial_convert_error, n.trial_canceled_at, n.trial_notice_dismissed_at,
+    n.stripe_subscription_id, row.id).run();
+  await writeAudit(env, actorId, "trial.moved_back", "company", row.id, {
+    fresh: result.fresh, ridesCompleted: completed, rideLimit: n.trial_ride_limit, autoConvert: n.trial_billing === "auto",
+    detachedSubscription: result.detachedSubscription ? row.stripe_subscription_id : null
+  });
+  const fresh = await adminTrialRow(env, row.id);
+  return json({ ok: true, movedBack: { fresh: result.fresh, autoConvert: n.trial_billing === "auto" }, company: await adminTrialView(env, fresh) });
+}
+__name(moveCompanyBackToTrial, "moveCompanyBackToTrial");
 function csvCell(value) {
   let text = value === null || value === void 0 ? "" : String(value);
   // Keep spreadsheet apps from treating a cell as a formula.
@@ -5414,7 +5440,7 @@ import bookQrSwJs from "./client-book-qr-sw.txt";
 import bookQrCss from "./book-qr.css";
 import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml } from "./booking-qr.js";
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
-import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, TRIAL_RIDE_LIMIT, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, TRIAL_STRIPE_HORIZON_DAYS, CANCEL_REASONS, canCancelTrial, canCancelPaid, trialCancelColumns, cancelFeedback, stripeTrialEnd, isAutoTrial } from "./trial.js";
+import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, TRIAL_RIDE_LIMIT, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, TRIAL_STRIPE_HORIZON_DAYS, CANCEL_REASONS, canCancelTrial, canCancelPaid, trialCancelColumns, cancelFeedback, stripeTrialEnd, isAutoTrial, moveBackToTrial } from "./trial.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
 import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, smsSetupPromoCode, isCardPaymentMethod, cardOnlyPaymentConfig, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";

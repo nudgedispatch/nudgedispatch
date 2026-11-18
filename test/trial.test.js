@@ -77,3 +77,38 @@ test("admins can't mark a company as paying; paying (active) rows are still read
   assert.equal(applyTrialChange(auto, { status: "ended" }, now).next.trial_status, "ended");
   assert.equal(applyTrialChange(paying, { status: "trial" }, now).next.trial_status, "trial");
 });
+
+test("move back to free trial: fresh 15 if never paid, current limit if paid before, refuses live subscriptions", async () => {
+  const { moveBackToTrial } = await import("../app/trial.js");
+  const now = Date.UTC(2026, 10, 18);
+  const base = { id: "c1", created_at: now - 9e8, trial_ride_limit: 15, trial_days: 0, trial_started_at: now - 9e8 };
+  // Plain trial ended at 15 rides, no subscription.
+  let r = moveBackToTrial({ ...base, trial_status: "ended", trial_end_reason: "rides" }, 15, now);
+  assert.equal(r.fresh, true);
+  assert.equal(r.next.trial_ride_limit, 30);
+  assert.equal(r.next.trial_started_at, now);
+  assert.equal(r.next.trial_billing, "");
+  assert.equal(trialState({ ...base, ...r.next }, 15, now).ridesLeft, 15);
+  // Self-serve trial ended by admin, Stripe sub still trialing: stays auto (converts at the new limit).
+  r = moveBackToTrial({ ...base, trial_billing: "auto", trial_status: "ended", stripe_subscription_id: "sub_1", billing_status: "trialing" }, 3, now);
+  assert.equal(r.next.trial_billing, "auto");
+  assert.equal(r.next.stripe_subscription_id, "sub_1");
+  // Self-serve trial canceled by the owner: plain trial, sub detached, never charges.
+  r = moveBackToTrial({ ...base, trial_billing: "auto", trial_status: "ended", trial_canceled_at: now - 1, stripe_subscription_id: "sub_1", billing_status: "canceled" }, 4, now);
+  assert.equal(r.next.trial_billing, "");
+  assert.equal(r.next.stripe_subscription_id, null);
+  assert.equal(r.detachedSubscription, true);
+  assert.equal(r.next.trial_canceled_at, null);
+  // Paid before, subscription canceled: back to trial with the current limit, no auto-conversion.
+  r = moveBackToTrial({ ...base, trial_billing: "auto", trial_status: "active", trial_converted_at: now - 5, stripe_subscription_id: "sub_1", billing_status: "canceled", billing_paid_through: now - 1 }, 20, now);
+  assert.equal(r.fresh, false);
+  assert.equal(r.next.trial_ride_limit, 15);
+  assert.equal(r.next.trial_billing, "");
+  assert.equal(r.next.trial_converted_at, null);
+  assert.equal(trialState({ ...base, ...r.next }, 20, now).state, "ended");
+  // Live subscriptions are never touched.
+  for (const billing of ["active", "past_due", "incomplete"]) {
+    assert.match(moveBackToTrial({ ...base, trial_status: "active", stripe_subscription_id: "sub_1", billing_status: billing }, 1, now).error, /Cancel it in Stripe first/);
+  }
+  assert.match(moveBackToTrial({ ...base, trial_billing: "auto", trial_status: "active", trial_converted_at: now, stripe_subscription_id: "sub_1", billing_status: "active" }, 16, now).error, /Stripe/);
+});

@@ -358,6 +358,38 @@ test("cancel mid-trial: auth required, exit survey saved, Stripe sub canceled wi
   const after = await companyRow(persistTo);
   assert.equal(after.trial_status, before.trial_status, "status unchanged");
   assert.equal(after.billing_status, before.billing_status);
+
+  // "Move back to free trial" (Nov 18, 2026): canceled, never paid -> fresh 15 rides from today, no auto-charge, no Stripe call.
+  const stripeCallsBefore = mock.hits.length;
+  const back = await call(worker, "/api/platform/companies/" + before.id + "/trial", { method: "POST", session: platform, body: { moveBack: true } });
+  assert.equal(back.status, 200, JSON.stringify(back.data));
+  assert.deepEqual(back.data.movedBack, { fresh: true, autoConvert: false });
+  assert.equal(back.data.company.trial.state, "normal");
+  assert.equal(back.data.company.trial.ridesLeft, 15);
+  const moved = await companyRow(persistTo);
+  assert.equal(moved.trial_status, "trial");
+  const doneRides = (await sql(persistTo, `SELECT COUNT(*) AS n FROM rides WHERE company_id = '${before.id}' AND status = 'completed'`, true))[0].n;
+  assert.equal(moved.trial_ride_limit, doneRides + 15);
+  assert.equal(moved.trial_billing, "");
+  assert.equal(moved.trial_canceled_at, null);
+  assert.equal(moved.stripe_subscription_id, null, "canceled subscription detached");
+  assert.equal(mock.hits.length, stripeCallsBefore, "no Stripe calls");
+  const audit = await sql(persistTo, "SELECT action FROM admin_audit WHERE action = 'trial.moved_back'", true);
+  assert.equal(audit.length, 1);
+  // Owner now sees an open plain trial and can book again.
+  const ownerTrial = await call(worker, "/api/trial", { session: owner });
+  assert.equal(ownerTrial.data.trial.open, true);
+  assert.equal(ownerTrial.data.trial.auto, false);
+
+  // A paying account with a live Stripe subscription is refused, unchanged.
+  await sql(persistTo, `UPDATE companies SET stripe_subscription_id = 'sub_live_x', billing_status = 'active', trial_billing = 'auto', trial_status = 'active', trial_converted_at = ${Date.now()} WHERE id = '${before.id}'`);
+  const refused = await call(worker, "/api/admin/companies/" + before.id + "/trial", { method: "POST", admin: true, body: { moveBack: true } });
+  assert.equal(refused.status, 409, JSON.stringify(refused.data));
+  assert.match(refused.data.error, /Cancel it in Stripe first/);
+  const still = await companyRow(persistTo);
+  assert.equal(still.trial_status, "active");
+  assert.equal(still.stripe_subscription_id, "sub_live_x");
+  assert.equal(mock.hits.length, stripeCallsBefore, "still no Stripe calls");
 });
 
 test("Skip and cancel stores a row with null reasons; Stripe-side cancel during the trial counts as a cancel", { timeout: 180000 }, async (t) => {

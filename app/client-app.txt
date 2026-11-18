@@ -1826,10 +1826,13 @@ function adminTrialHtml(c) {
       <h3>Trial status</h3>
       <p class="trial-line">${esc(adminTrialText(t))}</p>
       <p class="sub">Booking page: ${t.open ? "open" : "paused (shows a call or email message)"}${c.waitingRequests ? " · " + esc(c.waitingRequests) + " waiting request" + (c.waitingRequests === 1 ? "" : "s") : ""}</p>
-      ${paying
+      ${paying || !t.open
         ? `<button class="btn ghost full" type="button" data-act="trial-back">Move back to free trial</button>
-           <p class="sub">Uses the current trial limit (${esc(t.rideLimit)} completed rides, no time limit). If it is already used up, the trial shows as ended; add rides below.</p>`
-        : `<p class="sub">Paying status comes from Stripe: the account becomes a paying customer automatically after its 15th completed ride, or when its Stripe subscription is paid.</p>`}
+           <p class="sub">${paying
+             ? "Has paid before: goes back to a free trial with the current limit (" + esc(t.rideLimit) + " completed rides). If that is used up it shows as ended; add rides below. Never charges on its own after this. A live Stripe subscription must be canceled in Stripe first."
+             : "Never paid: starts a fresh free trial with 15 completed rides left from today. Nothing is charged."}</p>`
+        : ""}
+      <p class="sub">Paying status comes from Stripe: the account becomes a paying customer automatically after its 15th completed ride, or when its Stripe subscription is paid.</p>
       <div class="trial-extend">
         <label>Add rides<input name="addRides" inputmode="numeric" placeholder="0"></label>
 ${t.timeLimited ? `        <label>Add days<input name="addDays" inputmode="numeric" placeholder="0"></label>` : ""}
@@ -2053,7 +2056,7 @@ async function renderAdmin(gen) {
       const box = card.querySelector(".trial-admin");
       const msg = box.querySelector(".trial-msg");
       let body = null;
-      if (act === "trial-back") body = { status: "trial" };
+      if (act === "trial-back") { if (!confirm("Move this account back to the free trial?")) return; body = { moveBack: true }; }
       else if (act === "trial-end") body = { status: "ended" };
       else if (act === "trial-extend") {
         const addRides = box.querySelector("[name=addRides]").value.trim();

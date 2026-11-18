@@ -313,3 +313,44 @@ export function trialJson(t, company) {
     priceText: TRIAL_PRICE_TEXT
   };
 }
+
+// "Move back to free trial" (platform admin, Jesse, Nov 18, 2026).
+//  - Never paid (no trial conversion, no paid invoice): a fresh trial with TRIAL_RIDE_LIMIT completed rides left
+//    from today (limit = rides already completed + 15). A self-serve trial keeps auto-conversion only while its
+//    Stripe subscription is still usable (not canceled); otherwise it becomes a plain trial that never charges.
+//  - Paid before: status goes back to trial with the current ride limit (if that is used up it shows as ended;
+//    add rides). Auto-conversion is turned off so it can never charge again on its own.
+//  - A live Stripe subscription (active, past_due, incomplete, or a trialing one from a paid account) is never
+//    touched from here: the change is refused until it is canceled in Stripe.
+//  - A canceled Stripe subscription is detached (stripe_subscription_id cleared, customer kept) so the old
+//    cancellation no longer locks the account.
+export const LIVE_SUB_STATUSES = ["active", "past_due", "incomplete", "trialing", "unpaid"];
+export function moveBackToTrial(company, completed, now = Date.now()) {
+  if (!company) return { error: "No company." };
+  const sub = company.stripe_subscription_id || null;
+  const billing = company.billing_status || "";
+  const paidBefore = !!(num(company.trial_converted_at) || num(company.billing_last_paid_at) || num(company.billing_paid_through));
+  const autoUnconverted = isAutoTrial(company) && !num(company.trial_converted_at) && !num(company.trial_canceled_at);
+  const subCanceled = billing === "canceled";
+  if (sub && !subCanceled && LIVE_SUB_STATUSES.includes(billing) && (paidBefore || !autoUnconverted)) {
+    return { error: `This account has a live Stripe subscription (${billing}). Cancel it in Stripe first, then move it back to the free trial. Nothing was changed.` };
+  }
+  const used = Math.max(0, int(completed, 0));
+  const keepAuto = autoUnconverted && !!sub && !subCanceled && !paidBefore;
+  const next = {
+    trial_status: "trial",
+    trial_ended_at: null,
+    trial_end_reason: "",
+    trial_started_at: paidBefore ? int(company.trial_started_at ?? company.created_at, now) : now,
+    trial_ride_limit: paidBefore ? Math.max(0, int(company.trial_ride_limit, TRIAL_RIDE_LIMIT)) : used + TRIAL_RIDE_LIMIT,
+    trial_days: int(company.trial_days, TRIAL_DAYS),
+    trial_billing: keepAuto ? AUTO_TRIAL : "",
+    trial_converted_at: null,
+    trial_convert_claimed_at: null,
+    trial_convert_error: "",
+    trial_canceled_at: null,
+    trial_notice_dismissed_at: null,
+    stripe_subscription_id: subCanceled ? null : sub
+  };
+  return { next, fresh: !paidBefore, detachedSubscription: subCanceled && !!sub };
+}
