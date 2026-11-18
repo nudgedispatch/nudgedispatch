@@ -175,3 +175,86 @@ test("PayPal credentials: off by default, encrypted at rest, secret never return
     await rm(persistTo, { recursive: true, force: true });
   }
 });
+
+async function readyInvoice(worker, session, { email = "avery@example.test", paypalLink = true } = {}) {
+  const saved = await call(worker, "/api/settings", { method: "PUT", session, body: { businessName: "PayPal Limo", prefix: "PPL-", paymentMethods: { cash: { on: true }, paypal: { on: paypalLink, handle: "paypal.me/PPLimo" } } } });
+  assert.equal(saved.status, 200, JSON.stringify(saved.data));
+  const client = await call(worker, "/api/clients", { method: "POST", session, body: { name: "Avery Cole", phone: "404-555-0199", email } });
+  assert.equal(client.status, 201, JSON.stringify(client.data));
+  const ride = await call(worker, "/api/rides", { method: "POST", session, body: { clientId: client.data.client.id, date: "2026-11-18", time: "09:30", pickup: "Hotel", dropoff: "Airport", passengers: 1, fare: "125" } });
+  assert.equal(ride.status, 201, JSON.stringify(ride.data));
+  let from = "";
+  for (const step of ["En route", "Arrived", "Picked up", "Completed"]) {
+    const moved = await call(worker, "/api/rides/" + ride.data.ride.id + "/progress", { method: "POST", session, body: { step, from } });
+    assert.equal(moved.status, 200, step + " " + JSON.stringify(moved.data));
+    from = step;
+  }
+  const made = await call(worker, "/api/rides/" + ride.data.ride.id + "/invoice", { method: "POST", session, body: {} });
+  assert.equal(made.status, 200, JSON.stringify(made.data));
+  return { invoice: made.data.invoice, rideId: ride.data.ride.id, clientId: client.data.client.id };
+}
+
+test("Send PayPal invoice: explicit, idempotent, rider email required, hides the plain PayPal link", { timeout: 180000 }, async () => {
+  const persistTo = await mkdtemp(join(tmpdir(), "nudge-paypal-send-"));
+  const mock = await startMockPayPal();
+  let worker;
+  try {
+    await applyMigrations(persistTo);
+    worker = await startWorker(persistTo, { PAYPAL_MODE: "sandbox", PAYPAL_CREDENTIALS_KEY: randomBytes(32).toString("base64"), PAYPAL_API_BASE: mock.base });
+    const session = await openOwner(worker, "pp-send@example.test", "PayPal Limo");
+    const { invoice, clientId } = await readyInvoice(worker, session, { email: "" });
+    assert.equal(invoice.paypal.available, false);
+    assert.equal(invoice.paypal.sent, false);
+    assert.deepEqual(invoice.payWith.map((o) => o.kind), ["paypal", "cash"]);
+    const notConnected = await call(worker, "/api/invoices/" + invoice.id + "/paypal", { method: "POST", session, body: {} });
+    assert.equal(notConnected.status, 400);
+
+    const creds = await call(worker, "/api/paypal/credentials", { method: "PUT", session, body: { mode: "sandbox", clientId: CLIENT_ID, secret: SECRET } });
+    assert.equal(creds.status, 200, JSON.stringify(creds.data));
+    assert.equal((await call(worker, "/api/invoices/" + invoice.id, { session })).data.invoice.paypal.available, true);
+
+    const noEmail = await call(worker, "/api/invoices/" + invoice.id + "/paypal", { method: "POST", session, body: {} });
+    assert.equal(noEmail.status, 400);
+    assert.match(noEmail.data.error, /email/);
+    assert.equal(mock.state.requests.length, 0, "no PayPal call without a rider email");
+
+    // Email added to the client later is picked up.
+    const patched = await call(worker, "/api/clients/" + clientId, { method: "PATCH", session, body: { name: "Avery Cole", phone: "404-555-0199", email: "avery@example.test" } });
+    assert.equal(patched.status, 200, JSON.stringify(patched.data));
+    const sent = await call(worker, "/api/invoices/" + invoice.id + "/paypal", { method: "POST", session, body: {} });
+    assert.equal(sent.status, 200, JSON.stringify(sent.data));
+    const pp = sent.data.invoice.paypal;
+    assert.equal(pp.sent, true);
+    assert.equal(pp.status, "SENT");
+    assert.equal(pp.invoiceId, "INV2-TEST-0001");
+    assert.equal(pp.payerUrl, "https://www.sandbox.paypal.com/invoice/p/#INV2-TEST-0001");
+    assert.equal(sent.data.invoice.billTo.email, "avery@example.test");
+    assert.deepEqual(sent.data.invoice.payWith.map((o) => o.kind), ["paypal_invoice", "cash"]);
+    assert.ok(!sent.data.invoice.snapshotText.includes("paypal.me"), "plain PayPal link hidden from the invoice text");
+    assert.ok(!sent.text.includes(SECRET));
+
+    const create = mock.state.requests.find((r) => r.path === "/v2/invoicing/invoices");
+    assert.equal(create.headers["paypal-request-id"], invoice.id);
+    const draft = JSON.parse(create.body);
+    assert.equal(draft.detail.invoice_number, "PPL-1001");
+    assert.equal(draft.items.length, 1);
+    assert.equal(draft.items[0].name, "Car service");
+    assert.equal(draft.items[0].unit_amount.value, "125.00");
+    assert.equal(draft.configuration.allow_tip, true);
+    assert.equal(draft.primary_recipients[0].billing_info.email_address, "avery@example.test");
+    assert.equal(mock.state.requests.find((r) => r.path.endsWith("/send")).headers["paypal-request-id"], invoice.id + "-send");
+
+    // A second tap does not create or send again.
+    const before = mock.state.requests.length;
+    const again = await call(worker, "/api/invoices/" + invoice.id + "/paypal", { method: "POST", session, body: {} });
+    assert.equal(again.status, 200);
+    assert.equal(mock.state.requests.length, before);
+    assert.equal(mock.state.invoices.size, 1);
+    const rows = await sql(persistTo, "SELECT paypal_invoice_id, paypal_status, paypal_mode FROM invoices");
+    assert.deepEqual(rows[0], { paypal_invoice_id: "INV2-TEST-0001", paypal_status: "SENT", paypal_mode: "sandbox" });
+  } finally {
+    if (worker) await worker.stop();
+    mock.server.close();
+    await rm(persistTo, { recursive: true, force: true });
+  }
+});

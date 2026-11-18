@@ -1149,6 +1149,7 @@ async function renderInvoice(id, gen) {
       <button class="btn ghost" id="txt" type="button">Download text</button>
       <button class="btn ghost" id="html" type="button">Download page</button>
     </div>
+    ${payPalInvoiceHtml(invoice)}
     ${invoice.payment ? `<div class="row paid-row noprint"><span id="paid-state" class="${paid ? "paid-yes" : "muted"}">${paid ? "Paid" : "Not paid yet"}</span><button class="btn ghost" id="mark-paid" type="button" data-paid="${paid ? "1" : "0"}">${paid ? "Mark not paid" : "Mark paid"}</button></div><p class="err noprint" id="paid-err"></p>` : ""}
     <article class="sheet" id="sheet">
       <div class="who">${logo}<div><h2>INVOICE</h2><strong>${esc(business.name)}</strong><div>${esc([business.address, business.phone, business.email, business.website].filter(Boolean).join(" · "))}</div></div></div>
@@ -1180,6 +1181,18 @@ async function renderInvoice(id, gen) {
       setTimeout(() => { button.textContent = "Copy"; }, 2000);
     };
   });
+  const ppSend = document.querySelector("#pp-send");
+  if (ppSend) ppSend.onclick = async () => {
+    const pp = invoice.paypal || {};
+    if (!confirm(pp.mock ? "Preview: simulate sending a PayPal invoice? Nothing reaches PayPal." : "Send PayPal invoice " + invoice.number + " for " + invoice.fare + " to " + (invoice.billTo.email || "the client's email") + "? PayPal emails it to the rider.")) return;
+    ppSend.disabled = true;
+    const msg = document.querySelector("#pp-send-msg");
+    if (msg) { msg.style.color = ""; msg.textContent = "Sending to PayPal…"; }
+    const sent = await api("/api/invoices/" + invoice.id + "/paypal", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    if (!sent.data.ok) { ppSend.disabled = false; if (msg) msg.textContent = sent.data.error || "Could not send the PayPal invoice."; return; }
+    renderInvoice(invoice.id, gen);
+  };
   const markPaid = document.querySelector("#mark-paid");
   if (markPaid) markPaid.onclick = async () => {
     const nowPaid = markPaid.getAttribute("data-paid") === "1";
@@ -1198,6 +1211,24 @@ async function renderInvoice(id, gen) {
   };
   document.querySelector("#txt").onclick = () => download(`invoice-${invoice.number}.txt`, invoice.snapshotText, "text/plain");
   document.querySelector("#html").onclick = () => download(`invoice-${invoice.number}.html`, `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Invoice ${esc(invoice.number)}</title></head><body><pre>${esc(invoice.snapshotText)}</pre></body></html>`, "text/html");
+}
+
+// "Send PayPal invoice" (explicit tap) or, once sent, the PayPal invoice status and payer link.
+function payPalInvoiceHtml(invoice) {
+  const pp = invoice.paypal || {};
+  if (pp.sent) {
+    return `<div class="card noprint" id="pp-invoice"><p><strong>PayPal invoice</strong> · <span id="pp-status">${esc(pp.statusLabel || pp.status)}</span>${pp.refunded ? ` · <span class="err">Refunded</span>` : ""}</p>
+      <p class="sub">${esc(pp.invoiceId)}${pp.mode === "sandbox" ? " · sandbox" : ""}${pp.mock ? " · simulated on this preview" : ""}. The plain PayPal link is hidden on this invoice; the rider pays the PayPal invoice.</p>
+      ${pp.payerUrl ? `<a class="btn ghost" id="pp-open" href="${esc(pp.payerUrl)}" target="_blank" rel="noopener noreferrer">Open PayPal invoice</a>` : ""}</div>`;
+  }
+  if (!pp.available) return "";
+  const email = String((invoice.billTo && invoice.billTo.email) || "").trim();
+  const paid = invoice.payment === "paid";
+  const hasEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  return `<div class="card noprint" id="pp-invoice">
+      <button class="btn full" id="pp-send" type="button"${paid ? " disabled" : ""}>Send PayPal invoice</button>
+      <p class="sub">${paid ? "This ride is already marked paid." : `PayPal emails the invoice to ${hasEmail ? esc(email) : "the rider's email on this client (needed)"}. The rider can pay by card or PayPal and add a tip. It's marked paid here when PayPal says it's fully paid.`}${pp.mock ? " Preview: simulated, nothing reaches PayPal." : ""}${pp.status === "DRAFT" ? " A PayPal draft exists; tapping again sends that same invoice." : ""}</p>
+      <p class="err" id="pp-send-msg"></p></div>`;
 }
 
 function payOptionHtml(option, fare) {

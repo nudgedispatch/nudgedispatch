@@ -2435,6 +2435,8 @@ async function handleApi(request, env) {
     if (path === "/api/paypal/credentials/test" && method === "POST") return testPayPalCredentials(request, env);
     const invoiceGet = /^\/api\/invoices\/([0-9a-f-]{36})$/.exec(path);
     if (invoiceGet && method === "GET") return getInvoice(request, env, invoiceGet[1]);
+    const invoicePayPal = /^\/api\/invoices\/([0-9a-f-]{36})\/paypal$/.exec(path);
+    if (invoicePayPal && method === "POST") return sendPayPalInvoice(request, env, invoicePayPal[1]);
     if (path === "/api/location" && method === "GET") return getLocation(request, env);
     if (path === "/api/location/sharing" && method === "POST") return setSharing(request, env);
     if (path === "/api/location" && method === "POST") return postLocation(request, env);
@@ -4427,13 +4429,23 @@ async function getInvoice(request, env, id) {
   const row = await env.DB.prepare(
     `SELECT i.id, i.ride_id, i.number, i.amount_cents, i.issued_on, i.snapshot_text, i.bill_name, i.bill_phone, i.bill_email, i.trip_json,
             s.business_name, s.address, s.phone, s.email, s.website, s.payment_instructions, s.gratuity_note, s.terms, s.logo_data_url,
-            s.payment_methods_json, r.payment AS ride_payment
+            s.payment_methods_json, r.payment AS ride_payment,
+            i.paypal_invoice_id, i.paypal_mode, i.paypal_status, i.paypal_payer_url, i.paypal_sent_at, i.paypal_refunded, pc.mode AS paypal_app_mode
      FROM invoices i JOIN invoice_settings s ON s.company_id = i.company_id
      LEFT JOIN rides r ON r.company_id = i.company_id AND r.id = i.ride_id
+     LEFT JOIN paypal_credentials pc ON pc.company_id = i.company_id
      WHERE i.company_id = ? AND i.id = ?`
   ).bind(user.companyId, id).first();
   if (!row) return fail(404, "Invoice not found.");
-  const payWith = payOptions(parseStoredPaymentMethods(row.payment_methods_json), Number(row.amount_cents), row.number);
+  const paypal = invoicePayPalJson(env, row);
+  let payWith = payOptions(parseStoredPaymentMethods(row.payment_methods_json), Number(row.amount_cents), row.number);
+  let snapshotText = row.snapshot_text;
+  if (paypal.sent) {
+    // A real PayPal invoice replaces the plain PayPal link on this invoice.
+    payWith = payWith.filter((o) => o.kind !== "paypal");
+    if (paypal.payerUrl) payWith.unshift({ kind: "paypal_invoice", label: "PayPal", handle: "", display: "PayPal invoice " + paypal.invoiceId, url: paypal.payerUrl, copy: "" });
+    snapshotText = String(snapshotText).split("\n").filter((line) => !/^PayPal: /.test(line)).join("\n");
+  }
   return json({
     ok: true,
     invoice: {
@@ -4443,11 +4455,12 @@ async function getInvoice(request, env, id) {
       amountCents: row.amount_cents,
       fare: money(Number(row.amount_cents)),
       issuedOn: row.issued_on,
-      snapshotText: row.snapshot_text,
+      snapshotText,
       billTo: { name: row.bill_name, phone: row.bill_phone, email: row.bill_email },
       payment: row.ride_payment || "",
       payWith,
       payLines: payLines(payWith),
+      paypal,
       trip: JSON.parse(String(row.trip_json)),
       business: {
         name: row.business_name,
@@ -4539,6 +4552,76 @@ async function testPayPalCredentials(request, env) {
   return json({ ok: true, connected: true, mock: paypalServerMode(env) === "mock" });
 }
 __name(testPayPalCredentials, "testPayPalCredentials");
+var PAYPAL_SENT_STATUSES = new Set(["SENT", "SCHEDULED", "UNPAID", "PAYMENT_PENDING", "PARTIALLY_PAID", "PAID", "MARKED_AS_PAID", "CANCELLED", "REFUNDED", "PARTIALLY_REFUNDED", "MARKED_AS_REFUNDED"]);
+function invoicePayPalJson(env, row) {
+  const status = row.paypal_status || "";
+  return {
+    available: paypalServerMode(env) !== "off" && !paypalServerProblem(env) && !!row.paypal_app_mode,
+    mock: paypalServerMode(env) === "mock",
+    invoiceId: row.paypal_invoice_id || "",
+    mode: row.paypal_mode || "",
+    status,
+    statusLabel: PAYPAL_STATUS_LABELS[status] || status,
+    sent: !!row.paypal_invoice_id && PAYPAL_SENT_STATUSES.has(status),
+    payerUrl: safePayerUrl(row.paypal_payer_url),
+    sentAt: row.paypal_sent_at || null,
+    refunded: Number(row.paypal_refunded || 0) === 1
+  };
+}
+__name(invoicePayPalJson, "invoicePayPalJson");
+// Explicit owner tap: create a PayPal draft from this Nudge invoice and send it to the rider's email.
+async function sendPayPalInvoice(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  const row = await env.DB.prepare(
+    `SELECT i.id, i.ride_id, i.number, i.amount_cents, i.issued_on, i.bill_name, i.bill_email, i.trip_json, i.paypal_invoice_id, i.paypal_status,
+            s.business_name, s.terms, r.payment AS ride_payment, r.client_id
+     FROM invoices i JOIN invoice_settings s ON s.company_id = i.company_id
+     LEFT JOIN rides r ON r.company_id = i.company_id AND r.id = i.ride_id
+     WHERE i.company_id = ? AND i.id = ?`
+  ).bind(user.companyId, id).first();
+  if (!row) return fail(404, "Invoice not found.");
+  if (row.paypal_invoice_id && PAYPAL_SENT_STATUSES.has(row.paypal_status || "")) return getInvoice(request, env, id);
+  if (row.ride_payment === "paid") return fail(409, "This ride is already marked paid.");
+  let email = validRiderEmail(row.bill_email);
+  if (!email && row.client_id) {
+    const client = await ownedClient(env, user.companyId, row.client_id);
+    email = validRiderEmail(client && client.email);
+    if (email) await env.DB.prepare("UPDATE invoices SET bill_email = ? WHERE company_id = ? AND id = ?").bind(email, user.companyId, id).run();
+  }
+  if (!email) return fail(400, "Add the rider's email to this client to send a PayPal invoice.");
+  try {
+    const creds = await loadPayPalCredentials(env, user.companyId);
+    if (!creds) return fail(400, "Connect your PayPal app in More first.");
+    const draft = buildPayPalInvoice({
+      number: row.number,
+      amountCents: row.amount_cents,
+      issuedOn: row.issued_on,
+      billName: row.bill_name,
+      billEmail: email,
+      trip: JSON.parse(String(row.trip_json || "{}")),
+      businessName: row.business_name,
+      terms: row.terms
+    });
+    const onDraft = /* @__PURE__ */ __name(async (ppId, status) => {
+      await env.DB.prepare("UPDATE invoices SET paypal_invoice_id = ?, paypal_mode = ?, paypal_status = ? WHERE company_id = ? AND id = ?").bind(ppId, creds.mode, status, user.companyId, id).run();
+    }, "onDraft");
+    const sent = await createAndSendInvoice(env, creds, id, draft, { existingId: row.paypal_invoice_id || "", onDraft });
+    const now = Date.now();
+    await env.DB.prepare(
+      "UPDATE invoices SET paypal_invoice_id = ?, paypal_mode = ?, paypal_status = ?, paypal_payer_url = ?, paypal_sent_at = ?, paypal_checked_at = ? WHERE company_id = ? AND id = ?"
+    ).bind(sent.id, creds.mode, sent.status, sent.payerUrl, now, now, user.companyId, id).run();
+    await writeAudit(env, user.userId, "paypal.invoice_sent", "invoice", id, { paypalInvoiceId: sent.id, mode: creds.mode, mock: paypalServerMode(env) === "mock" });
+  } catch (error) {
+    return paypalFail(error);
+  }
+  return getInvoice(request, env, id);
+}
+__name(sendPayPalInvoice, "sendPayPalInvoice");
 const DRIVER_ROWS = `SELECT u.id, u.email, m.role,
   d.name AS driver_name, d.vehicle, d.plate, d.login AS driver_login,
   CASE WHEN d.login = 'passcode' AND d.passcode_hash <> '' THEN 1 ELSE 0 END AS passcode_set
@@ -4995,7 +5078,7 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
-import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS } from "./paypal.js";
+import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS } from "./paypal.js";
 import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
