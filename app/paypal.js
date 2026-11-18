@@ -303,3 +303,59 @@ export const PAYPAL_STATUS_LABELS = {
   PARTIALLY_REFUNDED: "Partly refunded on PayPal",
   MARKED_AS_REFUNDED: "Marked refunded on PayPal",
 };
+
+// ---- Paid status (webhook + cron backup)
+const PAID_STATUSES = new Set(["PAID", "MARKED_AS_PAID"]);
+const REFUNDED_STATUSES = new Set(["REFUNDED", "PARTIALLY_REFUNDED", "MARKED_AS_REFUNDED"]);
+// Statuses the 5-minute cron re-checks (still waiting on the rider).
+export const PAYPAL_OPEN_STATUSES = ["SENT", "SCHEDULED", "UNPAID", "PAYMENT_PENDING", "PARTIALLY_PAID"];
+
+// PayPal invoice -> what Nudge should do. Paid only when fully paid (no amount still due).
+// CANCELLED changes nothing on the ride (it stays invoiced). Refunds only set the refunded flag.
+export function payPalOutcome(invoice) {
+  const status = String((invoice && invoice.status) || "").toUpperCase();
+  const due = invoice && invoice.due_amount && invoice.due_amount.value !== undefined ? Number(invoice.due_amount.value) : 0;
+  return {
+    status,
+    paid: PAID_STATUSES.has(status) && !(due > 0),
+    refunded: REFUNDED_STATUSES.has(status),
+  };
+}
+
+// Webhook resource -> PayPal invoice object. Invoicing events carry the invoice as resource or resource.invoice.
+export function invoiceFromEvent(event) {
+  const r = event && event.resource;
+  if (!r || typeof r !== "object") return null;
+  const inv = r.invoice && typeof r.invoice === "object" ? r.invoice : r;
+  return typeof inv.id === "string" && /^[A-Z0-9-]{5,64}$/.test(inv.id) ? inv : null;
+}
+
+// Event type implies a status when the resource doesn't carry one.
+export function eventInvoice(event) {
+  const inv = invoiceFromEvent(event);
+  if (!inv) return null;
+  const implied = { "INVOICING.INVOICE.PAID": "PAID", "INVOICING.INVOICE.CANCELLED": "CANCELLED", "INVOICING.INVOICE.REFUNDED": "REFUNDED" }[event.event_type];
+  return inv.status ? inv : { ...inv, status: implied || "" };
+}
+
+// PayPal's own check of a webhook delivery (verify-webhook-signature) against the fleet's webhook id.
+export async function verifyWebhook(env, creds, headers, event, opts) {
+  if (!creds.webhookId) return false;
+  const h = (name) => String(headers.get(name) || "");
+  const body = {
+    auth_algo: h("paypal-auth-algo"),
+    cert_url: h("paypal-cert-url"),
+    transmission_id: h("paypal-transmission-id"),
+    transmission_sig: h("paypal-transmission-sig"),
+    transmission_time: h("paypal-transmission-time"),
+    webhook_id: creds.webhookId,
+    webhook_event: event,
+  };
+  if (!body.transmission_id || !body.transmission_sig) return false;
+  const r = await paypalRequest(env, creds, "POST", "/v1/notifications/verify-webhook-signature", body, opts);
+  return !!r && r.verification_status === "SUCCESS";
+}
+
+export async function fetchPayPalInvoice(env, creds, id, opts) {
+  return paypalRequest(env, creds, "GET", "/v2/invoicing/invoices/" + encodeURIComponent(id), undefined, opts);
+}

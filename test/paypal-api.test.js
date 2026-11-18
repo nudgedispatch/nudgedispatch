@@ -96,8 +96,9 @@ function startMockPayPal() {
 }
 
 
-async function startWorker(persistTo, vars) {
+async function startWorker(persistTo, vars, extra = {}) {
   return unstable_dev("app/index.js", {
+    ...extra,
     config: "wrangler.toml",
     local: true,
     persist: true,
@@ -252,6 +253,103 @@ test("Send PayPal invoice: explicit, idempotent, rider email required, hides the
     assert.equal(mock.state.invoices.size, 1);
     const rows = await sql(persistTo, "SELECT paypal_invoice_id, paypal_status, paypal_mode FROM invoices");
     assert.deepEqual(rows[0], { paypal_invoice_id: "INV2-TEST-0001", paypal_status: "SENT", paypal_mode: "sandbox" });
+  } finally {
+    if (worker) await worker.stop();
+    mock.server.close();
+    await rm(persistTo, { recursive: true, force: true });
+  }
+});
+
+async function hook(worker, event, sig = "sig-from-paypal") {
+  const response = await worker.fetch("http://127.0.0.1/api/paypal/webhook", {
+    method: "POST",
+    headers: { "content-type": "application/json", "paypal-auth-algo": "SHA256withRSA", "paypal-cert-url": "https://api.sandbox.paypal.com/v1/notifications/certs/CERT", "paypal-transmission-id": "tx-" + event.id, "paypal-transmission-sig": sig, "paypal-transmission-time": "2026-11-18T13:00:00Z" },
+    body: JSON.stringify(event),
+  });
+  return { status: response.status, data: await response.json().catch(() => ({})) };
+}
+const evt = (id, type, resource) => ({ id, event_type: type, resource_type: "invoices", resource });
+
+test("PayPal webhook: verified by PayPal, idempotent, paid only when fully paid; cron backup", { timeout: 240000 }, async () => {
+  const persistTo = await mkdtemp(join(tmpdir(), "nudge-paypal-hook-"));
+  const mock = await startMockPayPal();
+  let worker;
+  try {
+    await applyMigrations(persistTo);
+    worker = await startWorker(persistTo, { PAYPAL_MODE: "sandbox", PAYPAL_CREDENTIALS_KEY: randomBytes(32).toString("base64"), PAYPAL_API_BASE: mock.base }, { testScheduled: true });
+    const session = await openOwner(worker, "pp-hook@example.test", "PayPal Limo");
+    const creds = await call(worker, "/api/paypal/credentials", { method: "PUT", session, body: { mode: "sandbox", clientId: CLIENT_ID, secret: SECRET, webhookId: "WH-1AB23456CD789012E" } });
+    assert.equal(creds.status, 200, JSON.stringify(creds.data));
+    const sendOne = async () => {
+      const ready = await readyInvoice(worker, session);
+      const sent = await call(worker, "/api/invoices/" + ready.invoice.id + "/paypal", { method: "POST", session, body: {} });
+      assert.equal(sent.status, 200, JSON.stringify(sent.data));
+      return { ...ready, ppId: sent.data.invoice.paypal.invoiceId };
+    };
+    const payment = async (rideId) => (await call(worker, "/api/rides/" + rideId, { session })).data.ride.payment;
+    const a = await sendOne();
+    const b = await sendOne();
+    const c = await sendOne();
+
+    // Bad signature: PayPal says FAILURE, nothing recorded.
+    mock.state.verify = "FAILURE";
+    assert.equal((await hook(worker, evt("WH-EVT-0", "INVOICING.INVOICE.PAID", { id: a.ppId, status: "PAID" }))).status, 400);
+    assert.equal(await payment(a.rideId), "invoiced");
+    assert.equal((await sql(persistTo, "SELECT COUNT(*) AS n FROM paypal_events"))[0].n, 0);
+    mock.state.verify = "SUCCESS";
+    const verifyCall = mock.state.requests.filter((r) => r.path === "/v1/notifications/verify-webhook-signature").at(-1);
+    const verifyBody = JSON.parse(verifyCall.body);
+    assert.equal(verifyBody.webhook_id, "WH-1AB23456CD789012E");
+    assert.equal(verifyBody.transmission_sig, "sig-from-paypal");
+    assert.equal(verifyBody.webhook_event.id, "WH-EVT-0");
+
+    // Not handled / unknown invoice: 200, ignored.
+    assert.equal((await hook(worker, evt("WH-EVT-X", "INVOICING.INVOICE.CREATED", { id: a.ppId }))).data.ignored, "event type not handled");
+    assert.equal((await hook(worker, evt("WH-EVT-Y", "INVOICING.INVOICE.PAID", { id: "INV2-NOPE-0000" }))).data.ignored, "unknown invoice");
+
+    // Partly paid is not paid.
+    const partial = await hook(worker, evt("WH-EVT-1", "INVOICING.INVOICE.PAID", { invoice: { id: a.ppId, status: "PARTIALLY_PAID", due_amount: { currency_code: "USD", value: "25.00" } } }));
+    assert.equal(partial.status, 200, JSON.stringify(partial.data));
+    assert.equal(await payment(a.rideId), "invoiced");
+    // Fully paid marks the ride paid; a re-delivery is a no-op.
+    const paid = await hook(worker, evt("WH-EVT-2", "INVOICING.INVOICE.PAID", { id: a.ppId, status: "PAID", due_amount: { currency_code: "USD", value: "0.00" } }));
+    assert.equal(paid.data.result, "paid");
+    assert.equal(await payment(a.rideId), "paid");
+    assert.equal((await hook(worker, evt("WH-EVT-2", "INVOICING.INVOICE.PAID", { id: a.ppId, status: "PAID" }))).data.duplicate, true);
+    const shown = await call(worker, "/api/invoices/" + a.invoice.id, { session });
+    assert.equal(shown.data.invoice.paypal.status, "PAID");
+    assert.equal(shown.data.invoice.payment, "paid");
+
+    // Refund sets the flag only.
+    const refund = await hook(worker, evt("WH-EVT-3", "INVOICING.INVOICE.REFUNDED", { id: a.ppId, status: "REFUNDED" }));
+    assert.equal(refund.data.result, "refunded flag set");
+    const refunded = (await call(worker, "/api/invoices/" + a.invoice.id, { session })).data.invoice;
+    assert.equal(refunded.paypal.refunded, true);
+    assert.equal(refunded.payment, "paid");
+
+    // Cancelled leaves the ride invoiced.
+    const cancel = await hook(worker, evt("WH-EVT-4", "INVOICING.INVOICE.CANCELLED", { id: b.ppId }));
+    assert.equal(cancel.data.result, "status CANCELLED");
+    assert.equal(await payment(b.rideId), "invoiced");
+    assert.equal((await sql(persistTo, "SELECT COUNT(*) AS n FROM paypal_events"))[0].n, 4);
+
+    // Cron backup: c is SENT and was just checked, so it waits 30 minutes; make it due and run the cron.
+    await sql(persistTo, "UPDATE invoices SET paypal_checked_at = 1 WHERE paypal_invoice_id = '" + c.ppId + "'");
+    mock.state.nextStatus = "PAID";
+    const cron = await worker.fetch("http://127.0.0.1/__scheduled?cron=*/5+*+*+*+*");
+    assert.equal(cron.status, 200);
+    let tries = 0;
+    while ((await payment(c.rideId)) !== "paid" && tries++ < 20) await new Promise((r) => setTimeout(r, 250));
+    assert.equal(await payment(c.rideId), "paid");
+    assert.equal(await payment(b.rideId), "invoiced", "cancelled invoices are not re-checked");
+
+    // Manual "Check PayPal status".
+    mock.state.nextStatus = "CANCELLED";
+    const d = await sendOne();
+    const synced = await call(worker, "/api/invoices/" + d.invoice.id + "/paypal/sync", { method: "POST", session, body: {} });
+    assert.equal(synced.status, 200, JSON.stringify(synced.data));
+    assert.equal(synced.data.invoice.paypal.status, "CANCELLED");
+    assert.equal(synced.data.invoice.payment, "invoiced");
   } finally {
     if (worker) await worker.stop();
     mock.server.close();

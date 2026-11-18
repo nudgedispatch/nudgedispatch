@@ -1193,6 +1193,15 @@ async function renderInvoice(id, gen) {
     if (!sent.data.ok) { ppSend.disabled = false; if (msg) msg.textContent = sent.data.error || "Could not send the PayPal invoice."; return; }
     renderInvoice(invoice.id, gen);
   };
+  const ppSync = document.querySelector("#pp-sync");
+  if (ppSync) ppSync.onclick = async () => {
+    ppSync.disabled = true;
+    const synced = await api("/api/invoices/" + invoice.id + "/paypal/sync", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    ppSync.disabled = false;
+    if (!synced.data.ok) { const msg = document.querySelector("#pp-send-msg"); if (msg) msg.textContent = synced.data.error || "Could not check PayPal."; return; }
+    renderInvoice(invoice.id, gen);
+  };
   const markPaid = document.querySelector("#mark-paid");
   if (markPaid) markPaid.onclick = async () => {
     const nowPaid = markPaid.getAttribute("data-paid") === "1";
@@ -1219,7 +1228,8 @@ function payPalInvoiceHtml(invoice) {
   if (pp.sent) {
     return `<div class="card noprint" id="pp-invoice"><p><strong>PayPal invoice</strong> · <span id="pp-status">${esc(pp.statusLabel || pp.status)}</span>${pp.refunded ? ` · <span class="err">Refunded</span>` : ""}</p>
       <p class="sub">${esc(pp.invoiceId)}${pp.mode === "sandbox" ? " · sandbox" : ""}${pp.mock ? " · simulated on this preview" : ""}. The plain PayPal link is hidden on this invoice; the rider pays the PayPal invoice.</p>
-      ${pp.payerUrl ? `<a class="btn ghost" id="pp-open" href="${esc(pp.payerUrl)}" target="_blank" rel="noopener noreferrer">Open PayPal invoice</a>` : ""}</div>`;
+      <div class="actions">${pp.payerUrl ? `<a class="btn ghost" id="pp-open" href="${esc(pp.payerUrl)}" target="_blank" rel="noopener noreferrer">Open PayPal invoice</a>` : ""}<button class="btn ghost" id="pp-sync" type="button">Check PayPal status</button></div>
+      <p class="err" id="pp-send-msg"></p></div>`;
   }
   if (!pp.available) return "";
   const email = String((invoice.billTo && invoice.billTo.email) || "").trim();
