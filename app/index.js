@@ -1451,7 +1451,7 @@ async function publicBookingCompany(env, slug) {
   if (typeof slug !== "string" || !BOOKING_SLUG_RE.test(slug)) return null;
   const row = await env.DB.prepare(
     `SELECT c.id, c.status, c.name, c.booking_slug, c.created_at, c.trial_status, c.trial_started_at, c.trial_ride_limit,
-            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.theme_color, s.phone AS contact_phone, s.email AS contact_email
+            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.theme_color, s.brand_json, s.phone AS contact_phone, s.email AS contact_email
      FROM companies c
      LEFT JOIN invoice_settings s ON s.company_id = c.id
      WHERE c.booking_slug = ?`
@@ -5451,6 +5451,8 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
+import { parseBrand, brandCss, BRAND_FONT_PATH } from "./brand.js";
+import { BRAND_FONT_FILES } from "./fonts/brand-fonts.js";
 import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS, PAYPAL_OPEN_STATUSES, payPalOutcome, eventInvoice, verifyWebhook, fetchPayPalInvoice } from "./paypal.js";
 import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, trialSubscriptionParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
@@ -5587,11 +5589,12 @@ async function serveBookingAsset(request, env, slug, rest, url) {
   if (rest === "/") {
     const company = await publicBookingCompany(env, slug);
     const companyName = company ? publicCompanyName(company) : "";
-    return new Response(bookPageHtml(companyName, company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+    const brand = company ? parseBrand(company.brand_json) : null;
+    return new Response(bookPageHtml(companyName, brand ? brand.colors.paper : company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/theme.css") {
     const company = await publicBookingCompany(env, slug);
-    const css = company ? themeCss(company.theme_color || "") : "";
+    const css = company ? (brandCss(company.brand_json) || themeCss(company.theme_color || "")) : "";
     return new Response(css, { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
   }
   if (rest === "/manifest.webmanifest") return serveBookingManifest(env, slug);
@@ -5618,6 +5621,7 @@ async function serveShell(request, env) {
   const url = new URL(request.url);
   const book = bookingPageMatch(url.pathname);
   if (book) return serveBookingAsset(request, env, book.slug, book.rest, url);
+  if (url.pathname.startsWith(BRAND_FONT_PATH)) return serveBrandFont(url.pathname.slice(BRAND_FONT_PATH.length));
   let path = url.pathname;
   if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
   if (path === "/signup" || path === "/signup/complete") {
@@ -5628,6 +5632,18 @@ async function serveShell(request, env) {
   return new Response(file.body, { status: 200, headers: securityHeaders(file.type, file.cache) });
 }
 __name(serveShell, "serveShell");
+var brandFontCache = new Map();
+function serveBrandFont(name) {
+  const b64 = Object.prototype.hasOwnProperty.call(BRAND_FONT_FILES, name) ? BRAND_FONT_FILES[name] : null;
+  if (!b64) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
+  let bytes = brandFontCache.get(name);
+  if (!bytes) {
+    bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+    brandFontCache.set(name, bytes);
+  }
+  return new Response(bytes, { status: 200, headers: securityHeaders("font/woff2", "public, max-age=31536000, immutable") });
+}
+__name(serveBrandFont, "serveBrandFont");
 function securityHeaders(type, cache, extra, csp) {
   const headers = new Headers({
     "content-type": type,
