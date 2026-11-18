@@ -1,0 +1,69 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { trialState, trialBanner, trialCancelColumns, cancelFeedback, canCancelTrial, stripeTrialEnd, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, CANCEL_REASON_KEYS } from "../app/trial.js";
+
+const DAY = 86400000;
+const now = Date.UTC(2026, 10, 17);
+const auto = { trial_status: "trial", trial_billing: "auto", trial_started_at: now - 400 * DAY, trial_ride_limit: 15, trial_days: 0, stripe_subscription_id: "sub_1" };
+
+test("no time expiry: a trial 60+ days old with rides left is still open", () => {
+  assert.equal(TRIAL_TIME_LIMIT_DAYS, 0);
+  const legacy = trialState({ trial_status: "trial", trial_started_at: now - 60 * DAY, trial_ride_limit: 15, trial_days: 30 }, 3, now);
+  assert.equal(legacy.open, true);
+  assert.equal(legacy.daysLeft, null);
+  assert.doesNotMatch(JSON.stringify(trialBanner(legacy)), /day|30/);
+  const a = trialState(auto, 3, now);
+  assert.equal(a.open, true);
+  assert.equal(a.state, "normal");
+});
+
+test("counter: warning from 12, converting at 15 without blocking; manual trials still end at 15", () => {
+  assert.equal(trialState(auto, 11, now).state, "normal");
+  assert.equal(trialState(auto, 12, now).state, "warning");
+  assert.equal(trialBanner(trialState(auto, 12, now)).cancelNote, "You can cancel in Account settings.");
+  const at15 = trialState(auto, 15, now);
+  assert.equal(at15.state, "converting");
+  assert.equal(at15.open, true);
+  assert.equal(at15.needsConversion, true);
+  const converted = trialState({ ...auto, trial_status: "active", trial_converted_at: now }, 15, now);
+  assert.equal(converted.state, "converted");
+  assert.equal(converted.needsConversion, false);
+  assert.equal(trialBanner(converted).dismissible, true);
+  assert.equal(trialState({ ...auto, trial_status: "active", trial_converted_at: now, trial_notice_dismissed_at: now }, 20, now).state, "active");
+  const manual = trialState({ trial_status: "trial", trial_started_at: now, trial_ride_limit: 15 }, 15, now);
+  assert.equal(manual.open, false);
+  assert.equal(manual.endedReason, "rides");
+});
+
+test("cancel during the trial closes at once: leftover free rides forfeited, never converts", () => {
+  assert.equal(TRIAL_CANCEL_MODE, "end_now");
+  const cols = trialCancelColumns(now);
+  assert.equal(cols.trial_status, "ended");
+  assert.equal(cols.trial_end_reason, "canceled");
+  const early = trialState({ ...auto, trial_canceled_at: now }, 4, now);
+  assert.equal(early.open, false, "access ends even with 11 free rides left");
+  assert.equal(early.needsConversion, false);
+  assert.equal(early.endedReason, "canceled");
+  const late = trialState({ ...auto, trial_status: "ended", trial_end_reason: "canceled", trial_canceled_at: now }, 30, now);
+  assert.equal(late.open, false);
+  assert.equal(late.needsConversion, false);
+  assert.equal(canCancelTrial(auto), true);
+  assert.equal(canCancelTrial({ ...auto, trial_canceled_at: now }), false);
+  assert.equal(canCancelTrial({ ...auto, trial_converted_at: now }), false);
+  assert.equal(canCancelTrial({ ...auto, trial_billing: "" }), false);
+});
+
+test("exit survey parsing", () => {
+  assert.deepEqual(CANCEL_REASON_KEYS, ["too_expensive", "too_hard", "doesnt_meet_needs", "switching_tools", "not_driving", "other"]);
+  assert.deepEqual(cancelFeedback({ skip: true, reasons: ["other"], details: "x" }), { reasons: null, details: null, skipped: true });
+  assert.deepEqual(cancelFeedback({ reasons: [], details: "  " }), { reasons: null, details: null, skipped: false });
+  assert.deepEqual(cancelFeedback({ reasons: ["other", "other", "too_hard"], details: " hi " }), { reasons: ["other", "too_hard"], details: "hi", skipped: false });
+  assert.ok(cancelFeedback({ reasons: ["nope"] }).error);
+  assert.equal(cancelFeedback({ reasons: [], details: "x".repeat(5000) }).details.length, 1000);
+});
+
+test("Stripe trial_end stays inside Stripe's 730-day limit", () => {
+  const end = stripeTrialEnd(now);
+  assert.ok(end < now / 1000 + 730 * 86400);
+  assert.ok(end > now / 1000 + 729 * 86400);
+});

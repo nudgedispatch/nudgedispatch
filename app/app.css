@@ -464,3 +464,30 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .air-msg { min-height: 1.4em; margin: 8px 0 0; }
 .air-msg.ok { color: var(--green); }
 .air-msg.bad { color: var(--red); }
+
+/* 15-ride free trial (Nov 17, 2026) */
+.card.trial { position: relative; }
+.card.trial-converted, .card.trial-converting { border-color: #2f6b45; }
+.trial-dismiss { position: absolute; top: 6px; right: 6px; width: 44px; height: 44px; border: 0; background: transparent; color: var(--muted, #9a9a9a); font-size: 24px; line-height: 1; cursor: pointer; }
+.card.trial-converted .trial-line { padding-right: 40px; }
+.trial-cancel-note { font-size: 13px; color: var(--muted, #9a9a9a); }
+.cancel-trial .cancel-reasons { border: 0; padding: 0; margin: 12px 0; }
+.cancel-trial .cancel-reasons legend { font-weight: 700; margin-bottom: 4px; color: var(--text); }
+.cancel-trial .terms-check { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; margin: 6px 0; min-height: 44px; color: var(--text); }
+.cancel-trial .terms-check input { width: 22px; height: 22px; margin: 10px 0 0; flex: 0 0 auto; }
+.cancel-trial .terms-check span { flex: 1; padding: 10px 0; }
+.cancel-trial textarea { width: 100%; box-sizing: border-box; }
+.cancel-actions { display: grid; gap: 10px; margin: 12px 0; }
+.feedback-row { border-top: 1px solid #262626; padding: 8px 0; }
+.feedback-row:first-child { border-top: 0; }
+.signup-card .trial-small-print { font-size: 13px; color: var(--muted, #9a9a9a); margin: 8px 0 4px; }
+.signup-card .plan-trial-line { margin: 4px 0 8px; color: var(--text); }
+/* Profile & account (gear) */
+.gear { margin-left: auto; display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 999px; color: var(--muted); text-decoration: none; }
+.gear:hover, .gear:focus-visible, .gear.on { color: var(--text); background: #1c1c1c; }
+.gear.hidden { display: none; }
+.profile-value { margin: 0 0 10px; color: var(--text); overflow-wrap: anywhere; }
+.profile-legal { margin: 16px 0 4px; font-size: 13px; color: var(--muted); text-align: center; }
+.profile-legal a { color: var(--muted); }
+.profile-cancel { margin: 4px 0 28px; font-size: 13px; text-align: center; }
+.profile-cancel a { color: var(--muted); }

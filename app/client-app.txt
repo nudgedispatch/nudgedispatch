@@ -709,14 +709,35 @@ function trialBannerHtml() {
       <p class="sub"><a href="#/settings">Export your rides and clients</a> any time from More.</p>
     </section>`;
   }
+  if (b.state === "converted" || b.state === "converting") {
+    // Informational only: no choices, never blocks booking.
+    return `<section class="card trial trial-${esc(b.state)}" id="trial-card" data-state="${esc(b.state)}" role="status">
+      ${b.dismissible ? `<button class="trial-dismiss" type="button" id="trial-dismiss" aria-label="Dismiss">×</button>` : ""}
+      <p class="trial-line"><strong>${esc(b.title)}</strong></p>
+      <p class="sub">${esc(b.line)}</p>
+      <p class="sub">${esc(b.detail)}</p>
+    </section>`;
+  }
   const t = state.trial;
   const pct = t && t.rideLimit ? Math.min(100, Math.round((t.ridesUsed / t.rideLimit) * 100)) : 0;
   return `<section class="card trial trial-${esc(b.state)}" id="trial-card" data-state="${esc(b.state)}">
       <p class="trial-line">${esc(b.line)}</p>
       <div class="trial-bar" aria-hidden="true"><span class="trial-fill w${Math.round(pct / 5) * 5}"></span></div>
       <p class="sub">${esc(b.detail)}</p>
+      ${b.cancelNote ? `<p class="sub trial-cancel-note">${esc(b.cancelNote)}</p>` : ""}
       ${contact}
     </section>`;
+}
+function wireTrialDismiss() {
+  const btn = document.querySelector("#trial-dismiss");
+  if (!btn) return;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    const card = document.querySelector("#trial-card");
+    if (card) card.remove();
+    state.trialBanner = null;
+    await api("/api/trial/notice/dismiss", { method: "POST", body: {} });
+  };
 }
 function trialPausedHtml() {
   return `<p class="sub trial-paused">Approving new requests is paused because the free trial has ended. You can still decline.</p>`;
@@ -749,7 +770,7 @@ async function renderRides(gen) {
   const [result, , regular] = await Promise.all([api("/api/rides"), loadTrial(), isOwnerView() ? api("/api/schedules/upcoming") : Promise.resolve(null)]);
   if (gen !== renderGen) return;
   const trialBox = document.querySelector("#trial");
-  if (trialBox) trialBox.innerHTML = billingBannerHtml() + trialBannerHtml();
+  if (trialBox) { trialBox.innerHTML = billingBannerHtml() + trialBannerHtml(); wireTrialDismiss(); }
   const list = document.querySelector("#list");
   const regularItems = regular && regular.data.ok ? regular.data.occurrences || [] : [];
   if (regular && regular.data.ok) paintScheduleBadge(regular.data.count);
@@ -1507,11 +1528,16 @@ async function renderSettings(gen) {
   const s = result.data.settings;
   const bookingUrl = location.origin + (s.bookingPath || (s.bookingSlug ? "/book/" + s.bookingSlug : ""));
   const qrUrl = s.bookingSlug ? location.origin + "/book/" + encodeURIComponent(s.bookingSlug) + "/qr/" : "";
-  if (state.me.role === "owner") api("/api/billing").then((b) => {
+  if (state.me.role === "owner") Promise.all([api("/api/billing"), api("/api/trial")]).then(([b, tr]) => {
     const card = document.querySelector("#plan-card");
     if (!card || !b.data.ok) return;
     const x = b.data.billing;
-    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">See past invoices on Stripe's secure billing page (${x.livemode ? "live" : "test"} mode).</p>${portalButtonHtml(true)}` : ""}`;
+    const t = tr && tr.data.ok ? tr.data.trial : null;
+    const trialLine = t && t.auto && t.plan === "trial" && !t.canceledAt
+      ? `<p class="sub plan-trial" data-trial="open">Free trial: ${esc(t.ridesUsed)} of ${esc(t.rideLimit)} free rides used. After your ${esc(t.rideLimit)}th completed ride, Solo is ${esc(t.priceText)}, charged automatically to your card. No setup fee.</p>`
+      : t && t.auto && t.convertedAt ? `<p class="sub plan-trial" data-trial="converted">Solo · ${esc(t.priceText)}. Your free trial ended after ${esc(t.rideLimit)} rides.</p>`
+        : t && t.auto && t.canceledAt ? `<p class="sub plan-trial" data-trial="canceled">Free trial canceled. You were not charged.</p>` : "";
+    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${trialLine}${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">See past invoices on Stripe's secure billing page (${x.livemode ? "live" : "test"} mode).</p>${portalButtonHtml(true)}` : ""}`;
     card.hidden = false;
   }).catch(() => {});
   box.innerHTML = `<section class="card" id="booking-card">
@@ -1527,7 +1553,7 @@ async function renderSettings(gen) {
     ${state.me.role === "owner" ? `<section class="card" id="card-card"><h2>Payment method</h2><p class="sub">Loading…</p></section>` : ""}
     <section class="card" id="export-card">
       <h2>Export</h2>
-      <p class="sub">Download your rides and clients as spreadsheet files (CSV). This works any time, including after a trial ends.</p>
+      <p class="sub">Download your rides and clients as spreadsheet files (CSV). This works any time, including after a trial ends or is canceled.</p>
       <div class="export-actions"><a class="btn ghost" href="/api/export/rides.csv" download>Rides (CSV)</a><a class="btn ghost" href="/api/export/clients.csv" download>Clients (CSV)</a></div>
     </section>
     <section class="card" id="rates-card">
@@ -1686,12 +1712,14 @@ function blobToDataUrl(file) {
 
 function adminTrialText(t) {
   if (!t) return "";
-  if (t.state === "active") return "Paying customer · no trial limits";
+  if (t.state === "active" || t.state === "converted") return t.auto && t.convertedAt ? "Paying customer · converted from the 15-ride trial" : "Paying customer · no trial limits";
   if (t.state === "ended") {
-    const why = t.endedReason === "rides" ? t.ridesUsed + " rides completed" : t.endedReason === "days" ? "30 days passed" : "ended by you";
+    const why = t.endedReason === "rides" ? t.ridesUsed + " rides completed" : t.endedReason === "days" ? "time limit passed" : t.endedReason === "canceled" ? "canceled by the owner" : "ended by you";
     return "Free trial ended (" + why + ") · " + t.ridesUsed + " of " + t.rideLimit + " rides used";
   }
-  return "Free trial · " + t.ridesUsed + " of " + t.rideLimit + " rides used, " + (t.daysLeft <= 1 ? "last day" : t.daysLeft + " days left") + " (ends " + t.endsOn + ")";
+  const kind = t.auto ? "15-ride trial, card on file" : "Free trial";
+  const extra = t.state === "converting" ? " · converting to Solo" : "";
+  return kind + " · " + t.ridesUsed + " of " + t.rideLimit + " rides used" + (t.timeLimited ? ", " + (t.daysLeft <= 1 ? "last day" : t.daysLeft + " days left") + " (ends " + t.endsOn + ")" : "") + extra;
 }
 function adminTrialHtml(c) {
   if (!c) return "";
@@ -1703,12 +1731,12 @@ function adminTrialHtml(c) {
       <p class="sub">Booking page: ${t.open ? "open" : "paused (shows a call or email message)"}${c.waitingRequests ? " · " + esc(c.waitingRequests) + " waiting request" + (c.waitingRequests === 1 ? "" : "s") : ""}</p>
       ${paying
         ? `<button class="btn ghost full" type="button" data-act="trial-back">Move back to free trial</button>
-           <p class="sub">Uses the current trial limits (${esc(t.rideLimit)} rides, ${esc(t.days)} days from the start). If they are already used up, the trial shows as ended; add rides or days below.</p>`
+           <p class="sub">Uses the current trial limit (${esc(t.rideLimit)} completed rides, no time limit). If it is already used up, the trial shows as ended; add rides below.</p>`
         : `<button class="btn approve full" type="button" data-act="trial-active">Mark as paying customer</button>
            <p class="sub">Lifts all trial limits right away and reopens the booking page. Rides, clients, and invoices all stay.</p>`}
       <div class="trial-extend">
         <label>Add rides<input name="addRides" inputmode="numeric" placeholder="0"></label>
-        <label>Add days<input name="addDays" inputmode="numeric" placeholder="0"></label>
+${t.timeLimited ? `        <label>Add days<input name="addDays" inputmode="numeric" placeholder="0"></label>` : ""}
       </div>
       <button class="btn ghost full" type="button" data-act="trial-extend">${paying ? "Save trial limits" : "Extend free trial"}</button>
       ${!paying && t.state !== "ended" ? `<button class="btn danger full" type="button" data-act="trial-end">End free trial now</button>` : ""}
@@ -1786,9 +1814,21 @@ async function renderAdmin(gen) {
     <section class="card" id="billing-status"><h2 id="billing-title">Billing (Stripe test mode)</h2><p class="sub" id="billing-line">Checking…</p>
       <button class="btn ghost full" type="button" id="sms-meter">Set up texting meter (one time)</button><p class="err" id="billing-msg"></p></section>
     <div id="accounts" class="muted">Loading…</div>
+    <section class="card" id="cancel-feedback"><h2>Cancellation feedback</h2><div id="cancel-feedback-list" class="muted">Loading…</div></section>
     <h2>Audit</h2>
     <div id="audit" class="muted">Loading…</div>`);
   document.querySelector("#out").onclick = () => signOut();
+  api("/api/platform/cancellation-feedback").then((f) => {
+    const list = document.querySelector("#cancel-feedback-list");
+    if (!list) return;
+    list.className = "";
+    if (!f.data.ok) { list.innerHTML = `<p class="err">${esc(f.data.error || "Could not load feedback.")}</p>`; return; }
+    list.innerHTML = f.data.feedback.length ? f.data.feedback.map((x) => `<div class="feedback-row" data-feedback="${esc(x.id)}">
+        <p class="sub"><strong>${esc(x.companyName || x.companyId)}</strong> · ${esc(when(x.createdAt))} · ${esc(x.ridesUsed)} rides used · ${esc(x.plan)}</p>
+        <p class="sub">${x.reasonLabels.length ? esc(x.reasonLabels.join(", ")) : "Skipped the survey"}</p>
+        ${x.details ? `<p class="note">“${esc(x.details)}”</p>` : ""}
+      </div>`).join("") : `<p class="sub">No cancellations yet.</p>`;
+  }).catch(() => {});
   api("/api/platform/billing").then((b) => {
     const line = document.querySelector("#billing-line");
     const title = document.querySelector("#billing-title");
@@ -1835,7 +1875,7 @@ async function renderAdmin(gen) {
       ${adminTrialHtml(trialById[account.id])}
       ${adminBillingHtml(account.billing, listed.data.stripeTestMode)}
     </article>`).join("") : `<p>No customer accounts yet.</p>`;
-  if (trials.data.ok) accounts.insertAdjacentHTML("afterbegin", `<p class="sub" id="beta-spots">Beta spots: ${esc(trials.data.betaSpots.onTrial)} of ${esc(trials.data.betaSpots.limit)} on a free trial now.</p>`);
+  if (trials.data.ok) accounts.insertAdjacentHTML("afterbegin", `<p class="sub" id="trial-count">Free trials: ${esc(trials.data.trials.onTrial)} on a ${esc(trials.data.trials.rideLimit)}-ride trial now.</p>`);
   auditBox.innerHTML = audit.data.ok && audit.data.audit.length ? audit.data.audit.map((row) => {
     let detail = "";
     try { detail = Object.entries(JSON.parse(row.detail || "{}")).map(([key, value]) => `${key} ${value}`).join(" · "); } catch { detail = ""; }
@@ -1922,7 +1962,8 @@ async function renderAdmin(gen) {
       else if (act === "trial-end") body = { status: "ended" };
       else if (act === "trial-extend") {
         const addRides = box.querySelector("[name=addRides]").value.trim();
-        const addDays = box.querySelector("[name=addDays]").value.trim();
+        const daysInput = box.querySelector("[name=addDays]");
+        const addDays = daysInput ? daysInput.value.trim() : "";
         body = { addRides: addRides ? Number(addRides) : 0, addDays: addDays ? Number(addDays) : 0 };
       }
       const result = await api("/api/platform/companies/" + id + "/trial", { method: "POST", body });
@@ -2650,6 +2691,125 @@ async function renderOccurrenceEdit(scheduleId, date, gen) {
   };
 }
 
+// Profile & account (gear icon in the header). Owners only. Reuses GET/PUT /api/settings for business details.
+// It holds the only cancel entry point: a quiet "Cancel" link.
+const TERMS_URL = "https://nudgedispatch.com/terms.html";
+const PRIVACY_URL = "https://nudgedispatch.com/privacy.html";
+function paintGear() {
+  const gear = document.querySelector("#gear");
+  if (!gear) return;
+  const show = !!(state.me && state.me.role === "owner" && !state.me.platformAdmin && !billingLocked());
+  gear.classList.toggle("hidden", !show);
+  gear.classList.toggle("on", show && routeName().name === "profile");
+}
+async function renderProfile(gen) {
+  if (!state.me || state.me.role !== "owner") { location.hash = "#/rides"; return; }
+  setTabs(true);
+  shell(`<h1>Profile &amp; account</h1><div id="profile-box" class="muted">Loading…</div>`);
+  const [settings, trial] = await Promise.all([api("/api/settings"), api("/api/trial")]);
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#profile-box");
+  if (!box) return;
+  box.className = "";
+  if (!settings.data.ok) { box.innerHTML = `<p class="err">${esc(settings.data.error || "Could not load your account.")}</p>`; return; }
+  const s = settings.data.settings;
+  const t = trial.data.ok ? trial.data.trial : null;
+  const planLine = !t ? "" : t.auto && t.plan === "trial" && !t.canceledAt
+    ? `Solo free trial · ${esc(t.ridesUsed)} of ${esc(t.rideLimit)} free rides used. Then ${esc(t.priceText)}, charged automatically to your card.`
+    : t.auto && t.convertedAt ? `Solo · ${esc(t.priceText)}` : "";
+  box.innerHTML = `<section class="card" id="profile-account">
+      <h2>Account</h2>
+      <p class="sub">Sign-in email</p><p class="profile-value" id="profile-email">${esc(state.me.email || "")}</p>
+      <p class="sub">Company code</p><p class="profile-value">${esc(s.bookingSlug || "")}</p>
+      ${planLine ? `<p class="sub">Plan</p><p class="profile-value" id="profile-plan">${planLine}</p>` : ""}
+      <p class="sub">To change your sign-in email, email <a href="mailto:nudgedispatch@gmail.com">nudgedispatch@gmail.com</a>.</p>
+    </section>
+    <form class="card" id="profile-form">
+      <h2>Business details</h2>
+      <p class="sub">Shown on your booking page and invoices.</p>
+      <label>Company name<input id="pf-name" maxlength="80" autocomplete="organization" value="${esc(s.businessName || "")}"></label>
+      <label>Phone<input id="pf-phone" type="tel" maxlength="40" autocomplete="tel" inputmode="tel" value="${esc(s.phone || "")}"></label>
+      <label>Email<input id="pf-email" type="email" maxlength="120" autocomplete="email" inputmode="email" value="${esc(s.email || "")}"></label>
+      <label>Address<input id="pf-address" maxlength="200" autocomplete="street-address" value="${esc(s.address || "")}"></label>
+      <label>Website<input id="pf-website" type="url" maxlength="120" inputmode="url" value="${esc(s.website || "")}"></label>
+      <p class="err" id="pf-msg"></p>
+      <button class="btn full" type="submit">Save</button>
+    </form>
+    <p class="profile-legal"><a href="${TERMS_URL}" target="_blank" rel="noopener">Terms of Service</a> · <a href="${PRIVACY_URL}" target="_blank" rel="noopener">Privacy Policy</a></p>
+    ${t && t.canCancelAccount ? `<p class="profile-cancel"><a href="#/profile/cancel" id="profile-cancel-link">Cancel</a></p>` : ""}`;
+  document.querySelector("#profile-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const msg = document.querySelector("#pf-msg");
+    const body = {
+      businessName: document.querySelector("#pf-name").value,
+      phone: document.querySelector("#pf-phone").value,
+      email: document.querySelector("#pf-email").value,
+      address: document.querySelector("#pf-address").value,
+      website: document.querySelector("#pf-website").value
+    };
+    const r = await api("/api/settings", { method: "PUT", body });
+    if (!r.data.ok) { msg.style.color = ""; msg.textContent = r.data.error || "Could not save."; return; }
+    msg.style.color = "var(--green)";
+    msg.textContent = "Saved.";
+  };
+}
+
+// Cancel (Profile & account > Cancel). Reason questionnaire first; nothing is final until Submit or Skip.
+async function renderCancelTrial(gen) {
+  if (!state.me || state.me.role !== "owner") { location.hash = "#/rides"; return; }
+  setTabs(true);
+  shell(`<h1>Cancel your account</h1><div id="cancel-box" class="muted">Loading…</div>`);
+  const r = await api("/api/trial");
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#cancel-box");
+  if (!box) return;
+  const t = r.data.ok ? r.data.trial : null;
+  box.className = "";
+  if (!t || !t.canCancelAccount) {
+    box.innerHTML = `<section class="card"><p class="sub">There is nothing to cancel on this account.</p><a class="btn ghost full linkbtn-block" href="#/profile">Back to Profile &amp; account</a></section>`;
+    return;
+  }
+  const paid = t.cancelKind === "paid";
+  const reasons = r.data.cancelReasons || [];
+  const what = paid
+    ? `<p class="sub">Your Solo subscription is canceled right away and you won't be charged again. There's no refund for the current month.</p>`
+    : `<p class="sub">You've used ${esc(t.ridesUsed)} of ${esc(t.rideLimit)} free rides. If you cancel now, your card won't be charged.</p>
+       <p class="sub">Your account closes right away: your booking page and new rides stop, and any free rides you haven't used are lost. Your rides, clients, and invoices stay readable, and you can export them.</p>`;
+  box.innerHTML = `<section class="card cancel-trial" id="cancel-card">
+      ${what}
+      <fieldset class="cancel-reasons"><legend>Why are you canceling?</legend>
+        ${reasons.map(([k, label]) => `<label class="terms-check"><input type="checkbox" name="reason" value="${esc(k)}"> <span>${esc(label)}</span></label>`).join("")}
+      </fieldset>
+      <label class="full">Tell us more (optional)<textarea id="cancel-details" maxlength="1000" rows="3"></textarea></label>
+      <p class="err" id="cancel-err"></p>
+      <div class="cancel-actions">
+        <button class="btn danger full" type="button" id="cancel-submit">Submit and cancel</button>
+        <button class="btn ghost full" type="button" id="cancel-skip">Skip and cancel</button>
+      </div>
+      <p class="sub"><a href="#/profile">Keep my account</a></p>
+    </section>`;
+  const go = async (skip) => {
+    const err = document.querySelector("#cancel-err");
+    const buttons = box.querySelectorAll("button");
+    buttons.forEach((b) => { b.disabled = true; });
+    const chosen = skip ? [] : [...box.querySelectorAll('input[name="reason"]:checked')].map((i) => i.value);
+    const details = skip ? "" : (document.querySelector("#cancel-details").value || "");
+    const res = await api("/api/account/cancel", { method: "POST", body: { confirm: true, skip, reasons: chosen, details } });
+    if (!res.data.ok) { if (err) err.textContent = res.data.error || "Could not cancel. Try again."; buttons.forEach((b) => { b.disabled = false; }); return; }
+    const until = res.data.accessUntil ? new Date(res.data.accessUntil).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric" }) : "";
+    shell(`<h1>Your account is cancelled</h1>
+      <section class="card" id="cancel-done">
+        <p class="sub">${res.data.kind === "paid" ? `Your Solo subscription is cancelled. You won't be charged again.${until ? ` You can keep using Nudge until ${esc(until)}.` : ""}` : "Your free trial is cancelled and your card was not charged. Your booking page is off."}</p>
+        <p class="sub">Your rides, clients, and invoices are kept. You can export them from More.</p>
+        <p class="sub">To come back, email <a href="mailto:nudgedispatch@gmail.com">nudgedispatch@gmail.com</a>.</p>
+        <a class="btn ghost full linkbtn-block" href="#/settings">Export my data</a>
+      </section>`);
+    window.scrollTo(0, 0);
+  };
+  document.querySelector("#cancel-submit").onclick = () => go(false);
+  document.querySelector("#cancel-skip").onclick = () => go(true);
+}
+
 async function renderWelcome(gen) {
   if (!state.me || state.me.role !== "owner") {
     location.hash = state.me ? "#/rides" : "#/login";
@@ -2701,6 +2861,7 @@ async function route() {
   const gen = ++renderGen;
   const { name, id } = routeName();
   setTag();
+  paintGear();
   if (name === "where" && id) return renderWhere(id, gen);
   if (state.me && state.me.platformAdmin && name !== "admin" && name !== "login" && name !== "start") {
     location.hash = "#/admin";
@@ -2733,6 +2894,8 @@ async function route() {
   if (name === "rides" && id) return renderRide(id, gen);
   if (name === "invoices" && id) return renderInvoice(id, gen);
   if (name === "settings" && id === "rates") return renderRateSheet(gen);
+  if (name === "profile" && id === "cancel") return renderCancelTrial(gen);
+  if (name === "profile") return renderProfile(gen);
   if (name === "settings") return renderSettings(gen);
   return renderRides(gen);
 }

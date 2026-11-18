@@ -10,6 +10,9 @@ import {
   firstInvoiceCents,
   signupPublicConfig,
   checkoutParams,
+  trialSubscriptionParams,
+  TRIAL_SMALL_PRINT,
+  TRIAL_PLAN_LINE,
   isSignupCheckout,
   signupSessionProblem,
   verifyTurnstile,
@@ -73,7 +76,11 @@ test("public signup is Solo, no trial SMS, and requires terms plus permanent-cod
   const cfg = signupPublicConfig({});
   assert.equal(cfg.smsAllowed, false);
   assert.equal(cfg.setupWaived, true);
-  assert.match(cfg.selfSetupLabel, /^Self setup \(you're doing it now\): setup fee waived$/);
+  assert.match(cfg.selfSetupLabel, /^Self setup \(you're doing it now\): no setup fee$/);
+  assert.equal(cfg.trial, true);
+  assert.equal(cfg.trialRides, 15);
+  assert.equal(cfg.trialSmallPrint, "Free for your first 15 rides. Then $39/month, charged automatically to this card. Cancel anytime in Account settings.");
+  assert.match(cfg.trialPlanLine, /15 rides free\. Card required, not charged until after your 15th ride\. Then \$39\/month\. No setup fee\. Cancel before then and you're never charged\./);
   assert.equal(cfg.assistedSetupText, "Prefer we set it up for you? $299 one-time assisted setup.");
   assert.equal(cfg.assistedSetupMailto, "mailto:nudgedispatch@gmail.com?subject=Nudge%20Dispatch%20Solo%20assisted%20setup");
   assert.ok(cfg.textingUpgradeNote);
@@ -96,34 +103,45 @@ test("checkout line items omit plan setup and never add SMS on Solo", () => {
   assert.equal(firstInvoiceCents(true), SOLO_MONTHLY_CENTS);
   const { params } = checkoutParams({
     origin: "https://app.nudgedispatch.com",
-    customerEmail: "owner@example.test",
+    customerId: "cus_1",
     signupId: "sig-1",
     slug: "tgs",
-    sms: true,
-    prices,
     pmc: "pmc_cardonlytest1",
   });
-  assert.equal(params.mode, "subscription");
+  // 15-ride trial: Checkout only saves the card (setup mode). Nothing is charged at signup.
+  assert.equal(params.mode, "setup");
+  assert.equal(params.currency, "usd");
+  assert.equal(params.customer, "cus_1");
+  assert.equal(params.line_items, undefined);
   assert.equal(params.allow_promotion_codes, undefined);
   assert.equal(params.payment_method_configuration, "pmc_cardonlytest1");
-  assert.equal(params.line_items.length, 1);
-  assert.equal(params.line_items[0].price, "price_solo");
   assert.equal(params.metadata.sms, "off");
+  assert.equal(params.metadata.trial, "rides-15");
+  assert.equal(params.custom_text.submit.message, TRIAL_SMALL_PRINT);
   assert.equal(params.success_url, "https://app.nudgedispatch.com/signup/complete?session_id={CHECKOUT_SESSION_ID}");
+  const now = Date.UTC(2026, 10, 17);
+  const sub = trialSubscriptionParams({ customerId: "cus_1", priceId: "price_solo", paymentMethodId: "pm_1", signupId: "sig-1", slug: "tgs", nowMs: now });
+  assert.deepEqual(sub.items, [{ price: "price_solo", quantity: 1 }]);
+  assert.equal(sub.default_payment_method, "pm_1");
+  assert.ok(sub.trial_end > now / 1000 + 729 * 86400 && sub.trial_end <= now / 1000 + 730 * 86400, "trial_end at Stripe's 730-day horizon");
+  assert.ok(TRIAL_PLAN_LINE.includes("No setup fee"));
 });
 
 test("signup checkout session checks", () => {
   const session = {
     object: "checkout.session",
-    mode: "subscription",
+    mode: "setup",
     status: "complete",
-    payment_status: "paid",
+    payment_status: "no_payment_required",
+    setup_intent: { status: "succeeded" },
     metadata: { purpose: "signup", signup_id: "abc" },
   };
   assert.equal(isSignupCheckout(session), true);
+  assert.match(signupSessionProblem({ ...session, mode: "subscription" }, { id: "abc" }), /not a signup card page/);
+  assert.match(signupSessionProblem({ ...session, setup_intent: { status: "requires_payment_method" } }, { id: "abc" }), /not saved/);
   assert.equal(isSignupCheckout({ mode: "setup", metadata: { purpose: "card" } }), false);
   assert.equal(signupSessionProblem(session, { id: "abc" }), "");
-  assert.match(signupSessionProblem({ ...session, status: "open" }, { id: "abc" }), /not finished/);
+  assert.match(signupSessionProblem({ ...session, status: "open" }, { id: "abc" }), /not saved/);
   assert.match(signupSessionProblem({ ...session, metadata: { purpose: "signup", signup_id: "other" } }, { id: "abc" }), /different signup/);
 });
 
@@ -143,4 +161,18 @@ test("signup plan card shows self setup as default and assisted setup as the ema
   assert.match(src, /id="setup-assisted"/);
   assert.match(src, /cfg\.assistedSetupMailto/);
   assert.ok(src.indexOf('id="setup-self"') < src.indexOf('id="setup-assisted"'));
+});
+
+test("signup page states the 15-ride trial, the small print near the card step, and has no cancel button", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("../app/client-signup.txt", import.meta.url), "utf8");
+  assert.match(src, /id="trial-small-print"/);
+  assert.match(src, /cfg\.trialSmallPrint/);
+  assert.match(src, /cfg\.trialPlanLine/);
+  assert.match(src, /Continue to add card/);
+  assert.doesNotMatch(src, /Continue to payment/);
+  assert.doesNotMatch(src, /Cancel trial/i);
+  assert.doesNotMatch(src, /\bbeta\b/i);
+  // Small print sits on the card step, before the terms checkbox.
+  assert.ok(src.indexOf('id="trial-small-print"') < src.indexOf('id="termsAccepted"'));
 });

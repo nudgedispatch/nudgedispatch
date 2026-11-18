@@ -1,16 +1,50 @@
-// Nudge Dispatch free trial (DRAFT, Nov 10, 2026).
-// Rule (Jesse, Nov 9, 2026): the trial ends at 15 COMPLETED rides or 30 days from the account start,
-// whichever comes first. Pure functions only, so they can be tested without a database.
+// Nudge Dispatch free trial.
+// Rules:
+//  - Nov 9, 2026 (Jesse): the trial ends at 15 COMPLETED rides.
+//  - Nov 17, 2026 (Jesse): no time expiry. The 15-ride cap is the only limit (TRIAL_TIME_LIMIT_DAYS = 0).
+//  - Nov 17, 2026 (Jesse): self-serve Solo signups get a 15-ride free trial with a card on file
+//    (trial_billing = 'auto'). The card is not charged during the trial. When the 15th ride is completed
+//    the trial converts to the paid Solo plan ($39/month) automatically: no opt-in, no prompt, no choice
+//    screen, and booking is never blocked by the conversion. The owner sees an informational notice only.
+//  - Cancel stays available but not prominent: a small link in More > Your plan, with an exit survey.
+//    Cancelling before the 15th ride means no charge, ever.
+// A "ride" is a ride with status 'completed' for the company. Requests, drafts, declined and cancelled
+// rides never count. Pure functions only, so they can be tested without a database.
 
 export const TRIAL_RIDE_LIMIT = 15;
-export const TRIAL_DAYS = 30;
-export const WARN_RIDES_LEFT = 3;   // warn at 12 of 15 used
-export const WARN_DAYS_LEFT = 5;    // warn with 5 days left
-export const BETA_SPOTS = 3;
+// Time expiry: 0 = none (Jesse, Nov 17, 2026). Set a number of days here to bring a time limit back.
+export const TRIAL_TIME_LIMIT_DAYS = 0;
+export const TRIAL_DAYS = TRIAL_TIME_LIMIT_DAYS; // legacy name, kept for the admin API
+export const WARN_AT_RIDES = 12;                // heads-up at 12 of 15 used
+export const WARN_RIDES_LEFT = TRIAL_RIDE_LIMIT - WARN_AT_RIDES;
+export const WARN_DAYS_LEFT = 5;                 // only used if a time limit is configured
 export const TRIAL_STATUSES = ["trial", "active", "ended"];
-// Who an operator contacts to keep going. Shown to operators only, never on the public booking page.
+// Self-serve auto-converting trial.
+export const AUTO_TRIAL = "auto";
+export const TRIAL_PRICE_TEXT = "$39/month";
+// Mid-trial cancel (decided by Jesse, Nov 17, 2026 8:01 PM ET; hardcoded, no setting): the account closes right
+// after the exit survey, the Stripe subscription is canceled immediately with no invoice and no charge, leftover
+// free rides are forfeited, and booking access ends at once. Data is kept read-only (export from More).
+export const TRIAL_CANCEL_MODE = "end_now";
+// Stripe trials are time-based, so the subscription's trial_end is set to Stripe's maximum (730 days)
+// and is ended programmatically at the 15th completed ride. A trial_will_end webhook pushes it out again.
+export const TRIAL_STRIPE_HORIZON_DAYS = 730;
+// Exit survey reasons (cancel screen).
+export const CANCEL_REASONS = [
+  ["too_expensive", "Too expensive"],
+  ["too_hard", "Too hard to use"],
+  ["doesnt_meet_needs", "Doesn't meet my needs"],
+  ["switching_tools", "Switching to another tool"],
+  ["not_driving", "Not driving anymore"],
+  ["other", "Other"]
+];
+export const CANCEL_REASON_KEYS = CANCEL_REASONS.map(([k]) => k);
+export const CANCEL_DETAILS_MAX = 1000;
+// Who an operator contacts. Shown to operators only, never on the public booking page.
 export const TRIAL_CONTACT_NAME = "Jesse";
 export const TRIAL_CONTACT_EMAIL = "nudgedispatch@gmail.com";
+// Kept so older admin code paths still import; the beta box is retired in favor of the 15-ride trial.
+export const BETA_SPOTS = 0;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -18,6 +52,7 @@ function int(v, fallback) {
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
 }
+function num(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; }
 
 export function etDate(ms) {
   return new Date(ms).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric" });
@@ -27,81 +62,192 @@ function plural(n, one, many) {
   return n + " " + (n === 1 ? one : many);
 }
 
-// company: { trial_status, trial_started_at, created_at, trial_ride_limit, trial_days, trial_ended_at, trial_end_reason }
+export function isAutoTrial(company) {
+  return !!company && company.trial_billing === AUTO_TRIAL;
+}
+
+// company: { trial_status, trial_started_at, created_at, trial_ride_limit, trial_days, trial_ended_at, trial_end_reason,
+//            trial_billing, trial_converted_at, trial_canceled_at, trial_notice_dismissed_at }
 // completed: number of rides with status 'completed' for the company.
-export function trialState(company, completed, now = Date.now()) {
+// timeLimitDays: 0 = no time expiry (default).
+export function trialState(company, completed, now = Date.now(), timeLimitDays = TRIAL_TIME_LIMIT_DAYS) {
   const status = TRIAL_STATUSES.includes(company && company.trial_status) ? company.trial_status : "trial";
   const startedAt = int(company && (company.trial_started_at ?? company.created_at), now);
   const rideLimit = Math.max(0, int(company && company.trial_ride_limit, TRIAL_RIDE_LIMIT));
-  const days = Math.max(0, int(company && company.trial_days, TRIAL_DAYS));
-  const endsAt = startedAt + days * DAY_MS;
+  const timed = timeLimitDays > 0;
+  const days = timed ? Math.max(0, int(company && company.trial_days, timeLimitDays) || timeLimitDays) : 0;
+  const endsAt = timed ? startedAt + days * DAY_MS : null;
   const ridesUsed = Math.max(0, int(completed, 0));
   const ridesLeft = Math.max(0, rideLimit - ridesUsed);
-  const msLeft = endsAt - now;
-  const daysLeft = msLeft <= 0 ? 0 : Math.ceil(msLeft / DAY_MS);
-  const base = { plan: status, startedAt, endsAt, rideLimit, days, ridesUsed, ridesLeft, daysLeft };
+  const daysLeft = timed ? (endsAt - now <= 0 ? 0 : Math.ceil((endsAt - now) / DAY_MS)) : null;
+  const auto = isAutoTrial(company);
+  const convertedAt = num(company && company.trial_converted_at);
+  const canceledAt = num(company && company.trial_canceled_at);
+  const base = {
+    plan: status, startedAt, endsAt, rideLimit, days, ridesUsed, ridesLeft, daysLeft, timeLimited: timed,
+    auto, convertedAt, canceledAt, needsConversion: false,
+    noticeDismissed: !!num(company && company.trial_notice_dismissed_at)
+  };
 
   if (status === "active") {
-    return { ...base, state: "active", open: true, endedAt: null, endedReason: "", newlyEnded: false };
+    // Paying. A self-serve trial that just converted shows one informational notice until dismissed.
+    const state = auto && convertedAt && !base.noticeDismissed ? "converted" : "active";
+    return { ...base, state, open: true, endedAt: null, endedReason: "", newlyEnded: false };
   }
   if (status === "ended") {
     return { ...base, state: "ended", open: false, endedAt: company.trial_ended_at ?? null, endedReason: company.trial_end_reason || "admin", newlyEnded: false };
   }
-  // status === "trial": work out whether it has run out.
+  // status === "trial"
+  if (auto && convertedAt) {
+    return { ...base, plan: "active", state: base.noticeDismissed ? "active" : "converted", open: true, endedAt: null, endedReason: "", newlyEnded: false };
+  }
+  if (auto && !canceledAt) {
+    if (ridesUsed >= rideLimit) {
+      // Converts to paid Solo automatically. Never blocks booking, never asks.
+      return { ...base, state: "converting", open: true, endedAt: null, endedReason: "", newlyEnded: false, needsConversion: true };
+    }
+    const warning = ridesUsed >= Math.max(0, rideLimit - WARN_RIDES_LEFT);
+    return { ...base, state: warning ? "warning" : "normal", open: true, endedAt: null, endedReason: "", newlyEnded: false };
+  }
+  if (auto && canceledAt) {
+    // Canceled during the trial: closed at once, leftover free rides forfeited, never charged.
+    return { ...base, plan: "ended", state: "ended", open: false, endedAt: now, endedReason: "canceled", newlyEnded: true };
+  }
+  // Manual (team-invited) trials: end at the ride limit.
   let endedReason = "";
   if (ridesUsed >= rideLimit) endedReason = "rides";
-  else if (now >= endsAt) endedReason = "days";
+  else if (timed && now >= endsAt) endedReason = "days";
   if (endedReason) {
     return { ...base, plan: "ended", state: "ended", open: false, endedAt: now, endedReason, newlyEnded: true };
   }
-  const warning = ridesLeft <= WARN_RIDES_LEFT || daysLeft <= WARN_DAYS_LEFT;
+  const warning = ridesUsed >= Math.max(0, rideLimit - WARN_RIDES_LEFT) || (timed && daysLeft <= WARN_DAYS_LEFT);
   return { ...base, state: warning ? "warning" : "normal", open: true, endedAt: null, endedReason: "", newlyEnded: false };
 }
 
-// What the operator sees on the Rides screen. Calm, plain words.
+// Owner-facing copy on Rides. Calm, plain words. No buttons except "Dismiss" on the converted notice.
 export function trialBanner(t, contactEmail = TRIAL_CONTACT_EMAIL) {
   const contact = TRIAL_CONTACT_NAME + " at " + contactEmail;
   if (t.state === "active") return null;
-  const rides = `${t.ridesUsed} of ${t.rideLimit} rides used`;
-  const daysText = t.daysLeft <= 1 ? "last day" : plural(t.daysLeft, "day", "days") + " left";
-  if (t.state === "ended") {
-    const why = t.endedReason === "rides"
-      ? `You completed ${plural(t.ridesUsed, "ride", "rides")}, which uses up the free trial.`
-      : t.endedReason === "days"
-        ? `The 30-day free trial finished on ${etDate(t.endsAt)}.`
-        : "The free trial is finished.";
+  const rides = `${t.ridesUsed} of ${t.rideLimit} free rides used`;
+  if (t.state === "converted") {
     return {
-      state: "ended",
-      title: "Your free trial has ended",
-      line: why,
-      detail: "Your clients, rides, and invoices are all still here, and rides already on the schedule can still be completed. New rides and booking requests are paused for now.",
-      contact: `To keep going, contact ${contact}.`,
+      state: "converted",
+      title: "Your Solo plan has started",
+      line: `You've used your ${t.rideLimit} free rides, so your Solo plan started: ${TRIAL_PRICE_TEXT}, charged to the card you added.`,
+      detail: "Nothing changes in how you work. Your receipt comes from Stripe.",
+      contact: "",
+      contactEmail,
+      dismissible: true
+    };
+  }
+  if (t.state === "converting") {
+    return {
+      state: "converting",
+      title: "Free trial complete",
+      line: `You've used your ${t.rideLimit} free rides. Your Solo plan (${TRIAL_PRICE_TEXT}) is starting on the card you added.`,
+      detail: "Keep booking as usual.",
+      contact: "",
       contactEmail
     };
   }
-  const line = `Free trial: ${rides}, ${daysText}`;
+  if (t.state === "ended") {
+    const why = t.endedReason === "canceled"
+      ? (t.auto ? "You canceled your free trial. You were not charged." : "The free trial was canceled.")
+      : t.endedReason === "rides"
+        ? `You completed ${plural(t.ridesUsed, "ride", "rides")}, which uses up the free trial.`
+        : t.endedReason === "days"
+          ? `The free trial finished${t.endsAt ? " on " + etDate(t.endsAt) : ""}.`
+          : "The free trial is finished.";
+    return {
+      state: "ended",
+      title: t.endedReason === "canceled" ? "Your free trial was canceled" : "Your free trial has ended",
+      line: why,
+      detail: "Your clients, rides, and invoices are all still here, and rides already on the schedule can still be completed. New rides and booking requests are paused for now.",
+      contact: `To start again, contact ${contact}.`,
+      contactEmail
+    };
+  }
+  const daysText = t.timeLimited ? (t.daysLeft <= 1 ? ", last day" : ", " + plural(t.daysLeft, "day", "days") + " left") : "";
+  const line = `Free trial: ${rides}${daysText}`;
+  if (t.auto) {
+    const after = `After your ${ordinal(t.rideLimit)} completed ride, Solo is ${TRIAL_PRICE_TEXT}, charged automatically to the card you added. No setup fee.`;
+    if (t.state === "warning") {
+      return {
+        state: "warning",
+        title: "Free trial",
+        line,
+        detail: `Heads-up: ${plural(t.ridesLeft, "free ride", "free rides")} left. ${after} You don't need to do anything.`,
+        cancelNote: "You can cancel in Account settings.",
+        contact: "",
+        contactEmail
+      };
+    }
+    return { state: "normal", title: "Free trial", line, detail: `Your first ${t.rideLimit} completed rides are free. ${after}`, contact: "", contactEmail };
+  }
+  const endText = t.timeLimited
+    ? `It ends at ${t.rideLimit} completed rides or on ${etDate(t.endsAt)}, whichever comes first.`
+    : `It ends at ${t.rideLimit} completed rides.`;
   if (t.state === "warning") {
     return {
       state: "warning",
       title: "Free trial",
       line,
-      detail: `Your trial is nearly done. It ends at ${t.rideLimit} completed rides or on ${etDate(t.endsAt)}, whichever comes first.`,
+      detail: `Your trial is nearly done. ${endText}`,
       contact: `To keep taking rides after that, contact ${contact}.`,
       contactEmail
     };
   }
-  return {
-    state: "normal",
-    title: "Free trial",
-    line,
-    detail: `The trial ends at ${t.rideLimit} completed rides or on ${etDate(t.endsAt)}, whichever comes first.`,
-    contact: "",
-    contactEmail
-  };
+  return { state: "normal", title: "Free trial", line, detail: `The trial ${endText.replace(/^It /, "")}`, contact: "", contactEmail };
+}
+
+export function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
 export function trialBlockedMessage(contactEmail = TRIAL_CONTACT_EMAIL) {
   return `Your free trial has ended, so new rides and booking approvals are paused. Your rides and clients are still here. To keep going, contact ${TRIAL_CONTACT_NAME} at ${contactEmail}.`;
+}
+
+// Can the owner cancel this trial from More? Only a self-serve trial that hasn't converted or been canceled.
+export function canCancelTrial(company) {
+  return isAutoTrial(company) && company.trial_status === "trial" && !num(company.trial_converted_at) && !num(company.trial_canceled_at) && !!company.stripe_subscription_id;
+}
+
+// Paid Solo (converted from the self-serve trial) can cancel from Profile & account too. No further charges.
+export function canCancelPaid(company) {
+  return isAutoTrial(company) && !!num(company.trial_converted_at) && !!company.stripe_subscription_id && company.billing_status !== "canceled";
+}
+export function canCancelAccount(company) {
+  return canCancelTrial(company) || canCancelPaid(company);
+}
+
+// Column values to store when the owner cancels during the trial (always closes at once).
+export function trialCancelColumns(now) {
+  return { trial_canceled_at: now, trial_status: "ended", trial_ended_at: now, trial_end_reason: "canceled" };
+}
+
+// Exit survey. skip = true or no reasons -> reasons null. Returns { reasons, details } or { error }.
+export function cancelFeedback(body) {
+  const skip = !!(body && body.skip === true);
+  if (skip) return { reasons: null, details: null, skipped: true };
+  const raw = body && Array.isArray(body.reasons) ? body.reasons : [];
+  if (raw.length > CANCEL_REASON_KEYS.length) return { error: "Choose up to " + CANCEL_REASON_KEYS.length + " reasons." };
+  const reasons = [];
+  for (const r of raw) {
+    const k = String(r || "");
+    if (!CANCEL_REASON_KEYS.includes(k)) return { error: "Unknown reason." };
+    if (!reasons.includes(k)) reasons.push(k);
+  }
+  const text = typeof (body && body.details) === "string" ? body.details.trim().slice(0, CANCEL_DETAILS_MAX) : "";
+  return { reasons: reasons.length ? reasons : null, details: text || null, skipped: false };
+}
+
+// Stripe trial_end for a new self-serve subscription (seconds).
+export function stripeTrialEnd(nowMs = Date.now(), horizonDays = TRIAL_STRIPE_HORIZON_DAYS) {
+  // One hour short of the maximum so clock skew never trips Stripe's limit.
+  return Math.floor(nowMs / 1000) + horizonDays * 86400 - 3600;
 }
 
 // Admin changes. Returns the new column values or { error }.
@@ -132,9 +278,6 @@ export function applyTrialChange(company, body, now = Date.now()) {
     next.trial_ended_at = now;
     next.trial_end_reason = "admin";
   } else if (status === "trial" || addRides || addDays) {
-    // "Move back to free trial" (status trial) always returns to the trial. Extending a trial or an
-    // ended trial reopens it; extending a paying customer only changes the stored limits.
-    // Either way it ends again on its own if it is still over the limits.
     if (status === "trial" || next.trial_status !== "active") {
       next.trial_status = "trial";
       next.trial_ended_at = null;
@@ -144,7 +287,7 @@ export function applyTrialChange(company, body, now = Date.now()) {
   return { next };
 }
 
-export function trialJson(t) {
+export function trialJson(t, company) {
   return {
     plan: t.plan,
     state: t.state,
@@ -152,12 +295,21 @@ export function trialJson(t) {
     ridesUsed: t.ridesUsed,
     rideLimit: t.rideLimit,
     ridesLeft: t.ridesLeft,
+    timeLimited: t.timeLimited,
     days: t.days,
     daysLeft: t.daysLeft,
     startedAt: t.startedAt,
     endsAt: t.endsAt,
-    endsOn: etDate(t.endsAt),
+    endsOn: t.endsAt ? etDate(t.endsAt) : "",
     endedAt: t.endedAt,
-    endedReason: t.endedReason
+    endedReason: t.endedReason,
+    auto: t.auto,
+    convertedAt: t.convertedAt,
+    canceledAt: t.canceledAt,
+    canCancel: company ? canCancelTrial(company) : false,
+    canCancelAccount: company ? canCancelAccount(company) : false,
+    cancelKind: company ? (canCancelTrial(company) ? "trial" : canCancelPaid(company) ? "paid" : "") : "",
+    cancelMode: TRIAL_CANCEL_MODE,
+    priceText: TRIAL_PRICE_TEXT
   };
 }
