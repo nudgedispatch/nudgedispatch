@@ -39,6 +39,11 @@ export interface NudgeEnv {
   TURNSTILE_SITE_KEY?: string;
   /** Turnstile secret. Empty skips verification (local tests). */
   TURNSTILE_SECRET_KEY?: string;
+  /** "on" emails nudgedispatch@gmail.com when a trial is canceled (needs RESEND_API_KEY; CANCEL_NOTIFY_FROM defaults to Resend's test sender). Off by default. */
+  CANCEL_NOTIFY?: string;
+  CANCEL_NOTIFY_TO?: string;
+  CANCEL_NOTIFY_FROM?: string;
+  RESEND_API_KEY?: string;
   /** Override Turnstile siteverify URL (tests). */
   TURNSTILE_VERIFY_URL?: string;
   /** PayPal invoicing: off (default, hidden) | mock (preview, no network) | sandbox | live. */

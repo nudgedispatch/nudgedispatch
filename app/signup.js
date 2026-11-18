@@ -1,15 +1,19 @@
-// Self-serve signup helpers (pure + Turnstile + Checkout line items).
-// Public plan is Solo only. Plan setup fee is waived by omitting the setup line (no typable promo codes).
+// Self-serve signup helpers (pure + Turnstile + Checkout params).
+// Public plan is Solo only, as a 15-ride free trial (Jesse, Nov 17, 2026): Stripe Checkout in SETUP mode saves
+// a card without charging it; the Worker then starts a Solo subscription in a trial that ends at the 15th
+// completed ride. No setup fee on self-serve (no setup line, no typable promo codes).
 // Texting stays gated to Small fleet and up — Solo signup has no texting checkbox.
 
 import { LOOKUP, SMS_PRICE_TEXT, SMS_PLANS, PLAN_LABELS, cardOnlyPaymentConfig, dollars, smsAllowed } from "./billing.js";
 import { normalizeSlug, slugBase, slugProblem } from "./slug.js";
 import { THEME_PRESETS, themeProblem } from "./theme.js";
+import { TRIAL_RIDE_LIMIT, stripeTrialEnd } from "./trial.js";
 
 export const PUBLIC_BILLING_PLAN = "solo";
 export const SIGNUP_TERMS_URL = "https://nudgedispatch.com/terms.html";
 export const SIGNUP_PRIVACY_URL = "https://nudgedispatch.com/privacy.html";
-export const SIGNUP_TERMS_VERSION = "nudgedispatch.com/terms.html#2026-11-17";
+// Bumped for the 15-ride trial Terms (Section 7 trial bullets, in-app cancellation). Match the published Terms when they go live.
+export const SIGNUP_TERMS_VERSION = "nudgedispatch.com/terms.html#2026-11-17-trial";
 export const TERMS_CONSENT_ERROR = "Please agree to the Terms of Service and Privacy Policy.";
 export const SIGNUP_TTL_MS = 24 * 60 * 60 * 1000;
 export const SOLO_MONTHLY_CENTS = 3900;
@@ -18,6 +22,11 @@ export const SIGNUP_RATE_WINDOW_MS = 15 * 60 * 1000;
 export const SIGNUP_POST_MAX = 8;
 export const SIGNUP_SLUG_MAX = 60;
 export const SIGNUP_BOOKING_HOST = "app.nudgedispatch.com";
+
+// Trial wording (Nov 17, 2026). The small print sits next to the card step on our page and on Stripe's card page.
+export const TRIAL_HEADLINE = TRIAL_RIDE_LIMIT + " rides free";
+export const TRIAL_PLAN_LINE = "15 rides free. Card required, not charged until after your 15th ride. Then $39/month. No setup fee. Cancel before then and you're never charged.";
+export const TRIAL_SMALL_PRINT = "Free for your first 15 rides. Then $39/month, charged automatically to this card. Cancel anytime in Account settings.";
 
 // Solo setup choice (Jesse, Nov 17, 2026): self setup on this page is the default and waives the setup fee.
 // Assisted setup (we set it up for you) carries the one-time setup fee and is arranged by email, so the
@@ -170,7 +179,12 @@ export function signupPublicConfig(env) {
     monthly: dollars(SOLO_MONTHLY_CENTS),
     setupWaived: true,
     setupWas: dollars(SOLO_SETUP_CENTS),
-    selfSetupLabel: "Self setup (you're doing it now): setup fee waived",
+    trial: true,
+    trialRides: TRIAL_RIDE_LIMIT,
+    trialHeadline: TRIAL_HEADLINE,
+    trialPlanLine: TRIAL_PLAN_LINE,
+    trialSmallPrint: TRIAL_SMALL_PRINT,
+    selfSetupLabel: "Self setup (you're doing it now): no setup fee",
     assistedSetupText: "Prefer we set it up for you? " + dollars(SOLO_SETUP_CENTS) + " one-time assisted setup.",
     assistedSetupMailto: assistedSetupMailto(),
     smsAllowed: smsAllowed(PUBLIC_BILLING_PLAN),
@@ -188,43 +202,61 @@ export function signupPublicConfig(env) {
   };
 }
 
-export function checkoutParams({ origin, customerEmail, signupId, slug, sms, prices, pmc, excludedTypes }) {
-  const built = signupLineItems(prices, sms);
+// Stripe Checkout in setup mode: the card is saved to the customer and NOT charged.
+// customerId comes from a customer the Worker created first (setup mode does not create one).
+export function checkoutParams({ origin, customerId, signupId, slug, pmc, excludedTypes }) {
+  const meta = { app: "nudge-dispatch", purpose: "signup", signup_id: signupId, plan: PUBLIC_BILLING_PLAN, slug, sms: "off", trial: "rides-" + TRIAL_RIDE_LIMIT };
   const params = {
-    mode: "subscription",
+    mode: "setup",
+    currency: "usd",
+    customer: customerId,
     success_url: origin + "/signup/complete?session_id={CHECKOUT_SESSION_ID}",
     cancel_url: origin + "/signup?canceled=1",
-    customer_email: customerEmail,
     client_reference_id: signupId,
-    metadata: { app: "nudge-dispatch", purpose: "signup", signup_id: signupId, plan: PUBLIC_BILLING_PLAN, slug, sms: "off" },
-    subscription_data: { metadata: { app: "nudge-dispatch", purpose: "signup", signup_id: signupId, plan: PUBLIC_BILLING_PLAN, slug, sms: "off" } },
-    line_items: built.items,
+    metadata: meta,
+    setup_intent_data: { metadata: meta },
+    custom_text: { submit: { message: TRIAL_SMALL_PRINT } },
   };
   if (pmc && cardOnlyPaymentConfig({ STRIPE_CARD_PAYMENT_CONFIGURATION: pmc })) {
     params.payment_method_configuration = pmc;
   } else if (excludedTypes && excludedTypes.length) {
     params.excluded_payment_method_types = excludedTypes;
   }
-  return { params, built };
+  return { params };
+}
+
+// The trialing Solo subscription started after the card is saved. trial_end = Stripe's max horizon; the
+// Worker ends the trial (trial_end=now) at the 15th completed ride. No setup line, no SMS.
+export function trialSubscriptionParams({ customerId, priceId, paymentMethodId, signupId, slug, nowMs = Date.now() }) {
+  const meta = { app: "nudge-dispatch", purpose: "signup", signup_id: signupId, plan: PUBLIC_BILLING_PLAN, slug, sms: "off", trial: "rides-" + TRIAL_RIDE_LIMIT };
+  return {
+    customer: customerId,
+    items: [{ price: priceId, quantity: 1 }],
+    default_payment_method: paymentMethodId,
+    trial_end: stripeTrialEnd(nowMs),
+    proration_behavior: "none",
+    trial_settings: { end_behavior: { missing_payment_method: "cancel" } },
+    metadata: meta,
+  };
 }
 
 export function isSignupCheckout(session) {
   if (!session || typeof session !== "object") return false;
-  if (session.mode && session.mode !== "subscription") return false;
+  if (session.mode && session.mode !== "setup" && session.mode !== "subscription") return false;
   const meta = session.metadata || {};
   return meta.purpose === "signup" && !!meta.signup_id;
 }
 
 export function signupSessionProblem(session, signup) {
   if (!session || session.object !== "checkout.session") return "Stripe did not return the checkout session.";
-  if (session.mode !== "subscription") return "That Stripe page was not a signup payment.";
-  if (!isSignupCheckout(session)) return "That Stripe page was not a signup payment.";
+  if (session.mode !== "setup") return "That Stripe page was not a signup card page.";
+  if (!isSignupCheckout(session)) return "That Stripe page was not a signup card page.";
   if (signup && session.metadata && session.metadata.signup_id && session.metadata.signup_id !== signup.id) {
-    return "That payment belongs to a different signup.";
+    return "That card belongs to a different signup.";
   }
-  if (session.status !== "complete") return "The payment was not finished. Try again.";
-  const paid = session.payment_status;
-  if (paid && paid !== "paid" && paid !== "no_payment_required") return "The payment was not completed. Try again.";
+  if (session.status !== "complete") return "The card was not saved. Try again.";
+  const si = session.setup_intent;
+  if (si && typeof si === "object" && si.status && si.status !== "succeeded") return "The card was not saved. Try again.";
   return "";
 }
 

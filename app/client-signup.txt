@@ -24,10 +24,10 @@ async function runComplete() {
   const box = $("#signup-main");
   const sessionId = sessionIdFromUrl();
   if (!sessionId) {
-    box.innerHTML = `<section class="card"><h1>Payment not finished</h1><p class="note">We couldn't find a completed payment. If you were charged, email <a href="mailto:nudgedispatch@gmail.com">nudgedispatch@gmail.com</a>.</p><p><a class="btn full linkbtn-block" href="/signup">Back to sign up</a></p></section>`;
+    box.innerHTML = `<section class="card"><h1>Card not added</h1><p class="note">We couldn't find a saved card. Your card was not charged. Questions? Email <a href="mailto:nudgedispatch@gmail.com">nudgedispatch@gmail.com</a>.</p><p><a class="btn full linkbtn-block" href="/signup">Back to sign up</a></p></section>`;
     return;
   }
-  box.innerHTML = `<section class="card"><h1>Setting up your account</h1><p class="note">This only takes a moment.</p><p class="muted" id="signup-status">Saving your payment and creating your booking page…</p></section>`;
+  box.innerHTML = `<section class="card"><h1>Setting up your account</h1><p class="note">This only takes a moment.</p><p class="muted" id="signup-status">Saving your card and creating your booking page…</p></section>`;
   const result = await api("/api/signup/complete", { method: "POST", body: { sessionId } });
   if (!result.data.ok) {
     $("#signup-status").textContent = result.data.error || "Could not finish setting up your account.";
@@ -192,9 +192,9 @@ function renderForm(cfg) {
   const canceled = new URLSearchParams(location.search).get("canceled") === "1";
   const box = $("#signup-main");
   box.innerHTML = `<section class="card signup-card">
-    <h1>Create your Nudge Dispatch account</h1>
-    <p class="note">You'll pick a company code, agree to the terms, and pay on Stripe's secure card page. After that you're signed in, and your booking page is ready.</p>
-    ${canceled ? `<p class="err" id="top-err">Payment was canceled. You can review your details and try again.</p>` : `<p class="err" id="top-err" hidden></p>`}
+    <h1>Start your free trial</h1>
+    <p class="note">${esc(cfg.trialHeadline || "15 rides free")}. You'll pick a company code, agree to the terms, and add a card on Stripe's secure page. Your card isn't charged during the trial. After that you're signed in, and your booking page is ready.</p>
+    ${canceled ? `<p class="err" id="top-err">Adding your card was canceled. Nothing was charged. You can review your details and try again.</p>` : `<p class="err" id="top-err" hidden></p>`}
     <form id="signup-form">
       <div class="signup-step" data-step="1">
         <p class="sub">Step 1 of 3 · Account</p>
@@ -219,7 +219,9 @@ function renderForm(cfg) {
           <label>Website (optional)<input id="website" name="website" type="url" maxlength="120" autocomplete="url" inputmode="url" placeholder="https://"></label>
           <fieldset class="full plan-card">
             <legend>Your plan</legend>
-            <p class="plan-name">Solo · ${esc(cfg.monthly)}/mo</p>
+            <p class="plan-name trial-headline" id="trial-headline">Solo · ${esc(cfg.trialHeadline || "15 rides free")}</p>
+            <p class="sub plan-then">Then ${esc(cfg.monthly)}/mo. No setup fee.</p>
+            <p class="plan-trial-line" id="plan-trial-line">${esc(cfg.trialPlanLine || "")}</p>
             <p class="sub">1 driver (owner-operator).</p>
             <p class="setup-self" id="setup-self"><strong>${esc(cfg.selfSetupLabel || "Self setup (you're doing it now): setup fee waived")}</strong></p>
             <p class="note setup-assisted" id="setup-assisted">${esc(cfg.assistedSetupText || "")} <a href="${esc(cfg.assistedSetupMailto || "mailto:nudgedispatch@gmail.com")}">Email us</a> and we'll set it up for you.</p>
@@ -261,19 +263,20 @@ function renderForm(cfg) {
       </div>
 
       <div class="signup-step hidden" data-step="3">
-        <p class="sub">Step 3 of 3 · Confirm and pay</p>
-        <p class="note">You'll pay on Stripe's secure card page. After that you're signed in, and your booking page is ready.</p>
+        <p class="sub">Step 3 of 3 · Confirm and add card</p>
+        <p class="note">You'll add your card on Stripe's secure page. It isn't charged during your free trial. After that you're signed in, and your booking page is ready.</p>
+        <p class="trial-small-print" id="trial-small-print">${esc(cfg.trialSmallPrint || "")}</p>
         <label class="full terms-check"><input id="slugPermanentConfirmed" type="checkbox" required> <span>I understand my company code can't be changed.</span></label>
         <label class="full terms-check"><input id="termsAccepted" type="checkbox" required> <span>I agree to the <a href="${esc(cfg.termsUrl)}" target="_blank" rel="noopener">Terms of Service</a> and <a href="${esc(cfg.privacyUrl)}" target="_blank" rel="noopener">Privacy Policy</a>.</span></label>
         ${cfg.turnstileSiteKey ? `<div class="full" id="turnstile"></div>` : ""}
         <p class="err full" id="err"></p>
         <div class="signup-actions">
-          <button class="btn full" type="submit" id="signup-submit">Continue to payment</button>
+          <button class="btn full" type="submit" id="signup-submit">Continue to add card</button>
           <button class="btn ghost full" type="button" id="back-branding">Back</button>
         </div>
       </div>
     </form>
-    <p class="muted signup-foot">Cards only. You'll enter your card on Stripe's secure page. Already have an account? <a class="signup-signin" href="/">Sign in</a>.</p>
+    <p class="muted signup-foot">Cards only. You'll add your card on Stripe's secure page. Already have an account? <a class="signup-signin" href="/">Sign in</a>.</p>
   </section>`;
 
   let step = 1;
@@ -448,16 +451,16 @@ function renderForm(cfg) {
     try {
       const result = await api("/api/signup", { method: "POST", body });
       if (!result.data.ok || !result.data.url) {
-        err.textContent = result.data.error || "Could not start checkout. Try again.";
+        err.textContent = result.data.error || "Could not open the card page. Try again.";
         btn.disabled = false;
-        btn.textContent = "Continue to payment";
+        btn.textContent = "Continue to add card";
         return;
       }
       location.href = result.data.url;
     } catch {
-      err.textContent = "Could not start checkout. Try again.";
+      err.textContent = "Could not open the card page. Try again.";
       btn.disabled = false;
-      btn.textContent = "Continue to payment";
+      btn.textContent = "Continue to add card";
     }
   });
 }

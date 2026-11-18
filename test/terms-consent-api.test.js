@@ -40,7 +40,7 @@ async function sql(persistTo, text) {
 }
 
 test("terms version is the Nov 17, 2026 terms", () => {
-  assert.equal(SIGNUP_TERMS_VERSION, "nudgedispatch.com/terms.html#2026-11-17");
+  assert.equal(SIGNUP_TERMS_VERSION, "nudgedispatch.com/terms.html#2026-11-17-trial");
   assert.equal(TERMS_CONSENT_ERROR, "Please agree to the Terms of Service and Privacy Policy.");
 });
 
