@@ -1505,8 +1505,9 @@ async function convertTrial(env, companyId, now = Date.now()) {
   ).bind(now, companyId, now - TRIAL_CONVERT_RETRY_MS).run();
   if (!claim.meta.changes) return false;
   const row = await env.DB.prepare("SELECT stripe_subscription_id FROM companies WHERE id = ?").bind(companyId).first();
+  let sub;
   try {
-    await stripe(env, "POST", "/v1/subscriptions/" + encodeURIComponent(row.stripe_subscription_id), { trial_end: "now", proration_behavior: "none" }, "nudge-trial-convert-" + companyId);
+    sub = await stripe(env, "POST", "/v1/subscriptions/" + encodeURIComponent(row.stripe_subscription_id), { trial_end: "now", proration_behavior: "none" }, "nudge-trial-convert-" + companyId);
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 300) : "error";
     await env.DB.prepare("UPDATE companies SET trial_convert_claimed_at = NULL, trial_convert_error = ? WHERE id = ? AND trial_converted_at IS NULL").bind(message, companyId).run();
@@ -1514,12 +1515,20 @@ async function convertTrial(env, companyId, now = Date.now()) {
     return false;
   }
   const done = await env.DB.prepare(
-    "UPDATE companies SET trial_converted_at = ?, trial_status = 'active', trial_ended_at = NULL, trial_end_reason = '', trial_convert_error = '' WHERE id = ? AND trial_converted_at IS NULL"
-  ).bind(Date.now(), companyId).run();
+    `UPDATE companies SET trial_converted_at = ?, trial_status = 'active', trial_ended_at = NULL, trial_end_reason = '', trial_convert_error = '',
+       billing_paid_through = COALESCE(?, billing_paid_through) WHERE id = ? AND trial_converted_at IS NULL`
+  ).bind(Date.now(), subPeriodEndMs(sub), companyId).run();
   if (done.meta.changes) await writeAudit(env, "system", "trial.converted", "company", companyId, { rides: TRIAL_RIDE_LIMIT });
   return true;
 }
 __name(convertTrial, "convertTrial");
+// End of the first paid month after conversion. Replaces any paid-through date recorded from the trial period.
+function subPeriodEndMs(sub) {
+  const item = sub && sub.items && Array.isArray(sub.items.data) ? sub.items.data[0] : null;
+  const end = Number(item && item.current_period_end || sub && sub.current_period_end || 0);
+  return end > 0 ? end * 1000 : null;
+}
+__name(subPeriodEndMs, "subPeriodEndMs");
 function trialBlocked() {
   return json({ ok: false, error: trialBlockedMessage(), trialEnded: true }, 403);
 }
@@ -3603,6 +3612,15 @@ async function applyStripeEvent(env, event) {
   const stale = company.billing_event_at && createdMs && createdMs < company.billing_event_at;
   const now = Date.now();
   if (event.type === "invoice.paid" || event.type === "invoice.payment_succeeded") {
+    const autoTrialOpen = isAutoTrial(company) && !company.trial_converted_at;
+    const amount = Number(obj && (obj.amount_paid ?? obj.total) || 0);
+    if (autoTrialOpen && amount <= 0) {
+      // The $0 invoice Stripe issues when a trialing subscription starts. Still on the free trial.
+      // Its period runs to the far-off Stripe trial_end, so it must not set a paid-through date.
+      if (stale) return { companyId: company.id, result: "ignored: older event" };
+      await env.DB.prepare("UPDATE companies SET billing_status = 'active', billing_past_due_at = NULL, billing_event_at = ? WHERE id = ?").bind(createdMs || now, company.id).run();
+      return { companyId: company.id, result: "trial started ($0 invoice)" };
+    }
     const through = paidThroughMs(obj);
     // Paid dates always move forward; status only if this event is not older than the last applied one.
     await env.DB.prepare(
@@ -3611,13 +3629,6 @@ async function applyStripeEvent(env, event) {
          billing_updated_at = ? WHERE id = ?`
     ).bind(createdMs || now, through, through, now, company.id).run();
     if (stale) return { companyId: company.id, result: "paid recorded (older event, status kept)" };
-    const autoTrialOpen = isAutoTrial(company) && !company.trial_converted_at;
-    const amount = Number(obj && (obj.amount_paid ?? obj.total) || 0);
-    if (autoTrialOpen && amount <= 0) {
-      // The $0 invoice Stripe issues when a trialing subscription starts. Still on the free trial.
-      await env.DB.prepare("UPDATE companies SET billing_status = 'active', billing_past_due_at = NULL, billing_event_at = ? WHERE id = ?").bind(createdMs || now, company.id).run();
-      return { companyId: company.id, result: "trial started ($0 invoice)" };
-    }
     // A real payment. For a self-serve trial this also records the conversion if Stripe ended the trial itself.
     await env.DB.prepare(
       `UPDATE companies SET billing_status = 'active', billing_past_due_at = NULL, billing_event_at = ?, trial_status = 'active',

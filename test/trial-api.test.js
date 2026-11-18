@@ -142,10 +142,11 @@ test("15-ride trial: only completed rides count, heads-up at 12, converts automa
   assert.equal(tr.data.banner.cancelNote, undefined);
 
   // $0 invoice when the trialing subscription starts: still on the trial.
-  const zero = await postWebhook(worker, { id: "evt_zero", type: "invoice.paid", data: { object: { id: "in_zero", object: "invoice", customer: "cus_signup", subscription: "sub_signup", amount_paid: 0, total: 0, lines: { data: [] } } } });
+  const zero = await postWebhook(worker, { id: "evt_zero", type: "invoice.paid", data: { object: { id: "in_zero", object: "invoice", customer: "cus_signup", subscription: "sub_signup", amount_paid: 0, total: 0, lines: { data: [{ period: { end: Math.floor(Date.now() / 1000) + 730 * 86400 } }] } } } });
   assert.equal(zero.status, 200);
   assert.match(zero.data.result, /trial started/);
   assert.equal((await companyRow(persistTo)).trial_status, "trial");
+  assert.equal((await companyRow(persistTo)).billing_paid_through, null, "the $0 trial invoice's far-off period is not a paid-through date");
 
   // Ride 12: heads-up with one plain line about cancelling (no button).
   await addRides(persistTo, company.id, 1, "completed");
@@ -168,6 +169,7 @@ test("15-ride trial: only completed rides count, heads-up at 12, converts automa
   let row = await companyRow(persistTo);
   assert.equal(row.trial_status, "active");
   assert.ok(row.trial_converted_at > 0);
+  assert.ok(row.billing_paid_through > Date.now() + 25 * 86400000 && row.billing_paid_through < Date.now() + 35 * 86400000, "paid through the first paid month");
 
   tr = await call(worker, "/api/trial", { session: owner });
   assert.equal(tr.data.trial.state, "converted");

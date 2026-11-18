@@ -37,7 +37,7 @@ export function startTrialStripeMock() {
       if (p === "/v1/subscriptions" && req.method === "POST") return send({ id: "sub_signup", object: "subscription", livemode: false, status: "trialing", customer: "cus_signup" });
       if (p === "/v1/subscriptions/sub_signup" && req.method === "POST") {
         if (st.failUpdate) return send({ error: { message: "mock: Stripe is down" } }, 500);
-        return send({ id: "sub_signup", object: "subscription", livemode: false, status: "active", customer: "cus_signup" });
+        return send({ id: "sub_signup", object: "subscription", livemode: false, status: "active", customer: "cus_signup", items: { data: [{ current_period_end: Math.floor(Date.now() / 1000) + 30 * 86400 }] } });
       }
       if (p === "/v1/subscriptions/sub_signup" && req.method === "DELETE") return send({ id: "sub_signup", object: "subscription", livemode: false, status: "canceled", customer: "cus_signup" });
       if (p === "/v1/subscriptions/sub_signup") return send({ id: "sub_signup", object: "subscription", livemode: false, status: st.subStatus, customer: "cus_signup" });
