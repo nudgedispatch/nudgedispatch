@@ -6,6 +6,7 @@
 //   Cash App  https://cash.app/$cashtag/125.00          (amount prefilled, no note field)
 //   Venmo     https://venmo.com/user?txn=pay&amount=125.00&note=Invoice%20TGS-1001
 //   PayPal    https://paypal.me/user/125.00USD          (paypal.me names: letters/numbers, max 20)
+//             https://www.paypal.com/biz/profile/user   (business profiles: no amount prefill)
 //   Zelle     no public pay link, so the handle is shown with a copy button.
 
 export const PAY_KINDS = ["cash", "cashapp", "zelle", "venmo", "paypal"];
@@ -15,6 +16,8 @@ export const CASH_LINE = "Pay your driver in cash";
 const CASHTAG_RE = /^(?=.*[A-Za-z])[A-Za-z0-9_]{1,20}$/;
 const VENMO_RE = /^[A-Za-z0-9_-]{1,30}$/;
 const PAYPAL_RE = /^[A-Za-z0-9]{1,20}$/;
+const PAYPAL_BIZ_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const PAYPAL_ERROR = "Enter your PayPal.Me name or your paypal.com/biz/profile link.";
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function emptyPaymentMethods() {
@@ -52,8 +55,19 @@ export function normalizeHandle(kind, raw) {
     return { handle: user, error: "" };
   }
   if (kind === "paypal") {
-    const user = value.replace(/^(https?:\/\/)?(www\.)?paypal\.me\//i, "").replace(/[/?#].*$/, "").replace(/^@/, "");
-    if (!PAYPAL_RE.test(user)) return { handle: "", error: "Enter your PayPal.Me name (letters and numbers; up to 20)." };
+    const bizStored = /^biz:(.*)$/i.exec(value);
+    const bizUrl = /^(?:https?:\/\/)?(?:www\.)?paypal\.com\/biz\/profile\/([^/?#]+)\/?(?:[?#].*)?$/i.exec(value);
+    if (bizStored || bizUrl) {
+      const user = bizStored ? bizStored[1] : bizUrl[1];
+      if (!PAYPAL_BIZ_RE.test(user)) return { handle: "", error: PAYPAL_ERROR };
+      return { handle: "biz:" + user, error: "" };
+    }
+    const user = value
+      .replace(/^(https?:\/\/)?(www\.)?paypal\.me\//i, "")
+      .replace(/^(https?:\/\/)?(www\.)?paypal\.com\/paypalme\//i, "")
+      .replace(/[/?#].*$/, "")
+      .replace(/^@/, "");
+    if (!PAYPAL_RE.test(user)) return { handle: "", error: PAYPAL_ERROR };
     return { handle: user, error: "" };
   }
   if (kind === "zelle") {
@@ -83,7 +97,7 @@ export function validatePaymentMethods(input) {
     const { handle, error } = normalizeHandle(kind, entry.handle);
     if (error) return { methods: null, error };
     if (on && kind !== "cash" && !handle) {
-      const what = { cashapp: "$cashtag", zelle: "Zelle phone or email", venmo: "Venmo @username", paypal: "PayPal.Me name" }[kind];
+      const what = { cashapp: "$cashtag", zelle: "Zelle phone or email", venmo: "Venmo @username", paypal: "PayPal.Me name or paypal.com/biz/profile link" }[kind];
       return { methods: null, error: `Enter your ${what}, or turn ${PAY_LABELS[kind]} off.` };
     }
     methods[kind] = { on, handle };
@@ -122,7 +136,10 @@ export function amountString(cents) {
 function displayHandle(kind, handle) {
   if (kind === "cashapp") return "$" + handle;
   if (kind === "venmo") return "@" + handle;
-  if (kind === "paypal") return "paypal.me/" + handle;
+  if (kind === "paypal") {
+    if (handle.startsWith("biz:")) return "paypal.com/biz/profile/" + handle.slice(4);
+    return "paypal.me/" + handle;
+  }
   if (kind === "cash") return CASH_LINE;
   return handle;
 }
@@ -136,7 +153,10 @@ export function payUrl(kind, handle, amountCents, invoiceNumber) {
     if (invoiceNumber) params.push("note=" + encodeURIComponent("Invoice " + invoiceNumber));
     return `https://venmo.com/${encodeURIComponent(handle)}?${params.join("&")}`;
   }
-  if (kind === "paypal") return `https://paypal.me/${encodeURIComponent(handle)}${amt ? "/" + amt + "USD" : ""}`;
+  if (kind === "paypal") {
+    if (handle.startsWith("biz:")) return `https://www.paypal.com/biz/profile/${encodeURIComponent(handle.slice(4))}`;
+    return `https://paypal.me/${encodeURIComponent(handle)}${amt ? "/" + amt + "USD" : ""}`;
+  }
   return "";
 }
 
