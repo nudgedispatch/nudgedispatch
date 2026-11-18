@@ -19,6 +19,9 @@ export const WARN_AT_RIDES = 12;                // heads-up at 12 of 15 used
 export const WARN_RIDES_LEFT = TRIAL_RIDE_LIMIT - WARN_AT_RIDES;
 export const WARN_DAYS_LEFT = 5;                 // only used if a time limit is configured
 export const TRIAL_STATUSES = ["trial", "active", "ended"];
+// Statuses a platform admin may set. "active" (paying) is set only from Stripe.
+export const ADMIN_TRIAL_STATUSES = ["trial", "ended"];
+export const PAYING_FROM_STRIPE = "Paying status comes from Stripe (trial conversion or a paid subscription) and can't be set by hand.";
 // Self-serve auto-converting trial.
 export const AUTO_TRIAL = "auto";
 export const TRIAL_PRICE_TEXT = "$39/month";
@@ -43,8 +46,6 @@ export const CANCEL_DETAILS_MAX = 1000;
 // Who an operator contacts. Shown to operators only, never on the public booking page.
 export const TRIAL_CONTACT_NAME = "Jesse";
 export const TRIAL_CONTACT_EMAIL = "nudgedispatch@gmail.com";
-// Kept so older admin code paths still import; the beta box is retired in favor of the 15-ride trial.
-export const BETA_SPOTS = 0;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -265,15 +266,14 @@ export function applyTrialChange(company, body, now = Date.now()) {
   if (!Number.isInteger(addRides) || addRides < 0 || addRides > 1000) return { error: "addRides must be a whole number from 0 to 1000." };
   if (!Number.isInteger(addDays) || addDays < 0 || addDays > 3650) return { error: "addDays must be a whole number from 0 to 3650." };
   const status = body.status === undefined ? "" : String(body.status);
-  if (status && !TRIAL_STATUSES.includes(status)) return { error: "status must be trial, active, or ended." };
+  // No manual "paying" (Jesse, Nov 17, 2026): paying status comes only from Stripe (trial conversion or subscription webhooks).
+  // trial_status = 'active' is still read everywhere; admins just can't set it by hand.
+  if (status === "active") return { error: PAYING_FROM_STRIPE };
+  if (status && !ADMIN_TRIAL_STATUSES.includes(status)) return { error: "status must be trial or ended." };
   if (!addRides && !addDays && !status) return { error: "Send addRides, addDays, or status." };
   next.trial_ride_limit += addRides;
   next.trial_days += addDays;
-  if (status === "active") {
-    next.trial_status = "active";
-    next.trial_ended_at = null;
-    next.trial_end_reason = "";
-  } else if (status === "ended") {
+  if (status === "ended") {
     next.trial_status = "ended";
     next.trial_ended_at = now;
     next.trial_end_reason = "admin";

@@ -346,6 +346,18 @@ test("cancel mid-trial: auth required, exit survey saved, Stripe sub canceled wi
   assert.equal(listFb.data.feedback[0].companyName, "Peach State Cars");
   assert.deepEqual(listFb.data.feedback[0].reasonLabels, ["Too expensive", "Other"]);
   assert.equal(listFb.data.feedback[0].ridesUsed, 5);
+
+  // No manual "Mark as paying": neither the platform admin nor the admin-token route can set paying status.
+  const before = await companyRow(persistTo);
+  for (const opts of [{ session: platform }, { admin: true }]) {
+    const prefix = opts.admin ? "/api/admin/companies/" : "/api/platform/companies/";
+    const markPaying = await call(worker, prefix + before.id + "/trial", { method: "POST", ...opts, body: { status: "active" } });
+    assert.equal(markPaying.status, 400, JSON.stringify(markPaying.data));
+    assert.match(markPaying.data.error, /comes from Stripe/);
+  }
+  const after = await companyRow(persistTo);
+  assert.equal(after.trial_status, before.trial_status, "status unchanged");
+  assert.equal(after.billing_status, before.billing_status);
 });
 
 test("Skip and cancel stores a row with null reasons; Stripe-side cancel during the trial counts as a cancel", { timeout: 180000 }, async (t) => {

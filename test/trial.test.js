@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { trialState, trialBanner, trialCancelColumns, cancelFeedback, canCancelTrial, stripeTrialEnd, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, CANCEL_REASON_KEYS } from "../app/trial.js";
+import { applyTrialChange, PAYING_FROM_STRIPE, trialState, trialBanner, trialCancelColumns, cancelFeedback, canCancelTrial, stripeTrialEnd, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, CANCEL_REASON_KEYS } from "../app/trial.js";
 
 const DAY = 86400000;
 const now = Date.UTC(2026, 10, 17);
@@ -66,4 +66,14 @@ test("Stripe trial_end stays inside Stripe's 730-day limit", () => {
   const end = stripeTrialEnd(now);
   assert.ok(end < now / 1000 + 730 * 86400);
   assert.ok(end > now / 1000 + 729 * 86400);
+});
+
+test("admins can't mark a company as paying; paying (active) rows are still read and kept", () => {
+  assert.deepEqual(applyTrialChange(auto, { status: "active" }, now), { error: PAYING_FROM_STRIPE });
+  const paying = { ...auto, trial_status: "active", trial_converted_at: now };
+  assert.equal(trialState(paying, 20, now).plan, "active");
+  // Adding rides to a paying company leaves it paying.
+  assert.equal(applyTrialChange(paying, { addRides: 5 }, now).next.trial_status, "active");
+  assert.equal(applyTrialChange(auto, { status: "ended" }, now).next.trial_status, "ended");
+  assert.equal(applyTrialChange(paying, { status: "trial" }, now).next.trial_status, "trial");
 });

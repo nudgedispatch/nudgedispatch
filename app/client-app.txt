@@ -1732,8 +1732,7 @@ function adminTrialHtml(c) {
       ${paying
         ? `<button class="btn ghost full" type="button" data-act="trial-back">Move back to free trial</button>
            <p class="sub">Uses the current trial limit (${esc(t.rideLimit)} completed rides, no time limit). If it is already used up, the trial shows as ended; add rides below.</p>`
-        : `<button class="btn approve full" type="button" data-act="trial-active">Mark as paying customer</button>
-           <p class="sub">Lifts all trial limits right away and reopens the booking page. Rides, clients, and invoices all stay.</p>`}
+        : `<p class="sub">Paying status comes from Stripe: the account becomes a paying customer automatically after its 15th completed ride, or when its Stripe subscription is paid.</p>`}
       <div class="trial-extend">
         <label>Add rides<input name="addRides" inputmode="numeric" placeholder="0"></label>
 ${t.timeLimited ? `        <label>Add days<input name="addDays" inputmode="numeric" placeholder="0"></label>` : ""}
@@ -1957,8 +1956,7 @@ async function renderAdmin(gen) {
       const box = card.querySelector(".trial-admin");
       const msg = box.querySelector(".trial-msg");
       let body = null;
-      if (act === "trial-active") body = { status: "active" };
-      else if (act === "trial-back") body = { status: "trial" };
+      if (act === "trial-back") body = { status: "trial" };
       else if (act === "trial-end") body = { status: "ended" };
       else if (act === "trial-extend") {
         const addRides = box.querySelector("[name=addRides]").value.trim();
