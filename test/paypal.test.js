@@ -145,3 +145,17 @@ test("mock PayPal (preview) needs no network and is deterministic", async () => 
   assert.equal(a.data.id, b.data.id);
   assert.equal(mockPayPal("GET", "/v2/invoicing/invoices/X", {}).status, 401);
 });
+
+test("PayPal status mapping: paid only when fully paid, refunds flag only, cancelled changes nothing", async () => {
+  const { payPalOutcome, eventInvoice } = await import("../app/paypal.js");
+  assert.deepEqual(payPalOutcome({ status: "PAID" }), { status: "PAID", paid: true, refunded: false });
+  assert.equal(payPalOutcome({ status: "MARKED_AS_PAID" }).paid, true);
+  assert.equal(payPalOutcome({ status: "PAID", due_amount: { value: "10.00" } }).paid, false);
+  assert.equal(payPalOutcome({ status: "PARTIALLY_PAID" }).paid, false);
+  assert.deepEqual(payPalOutcome({ status: "CANCELLED" }), { status: "CANCELLED", paid: false, refunded: false });
+  assert.deepEqual(payPalOutcome({ status: "REFUNDED" }), { status: "REFUNDED", paid: false, refunded: true });
+  assert.equal(payPalOutcome({ status: "PARTIALLY_REFUNDED" }).refunded, true);
+  assert.equal(eventInvoice({ event_type: "INVOICING.INVOICE.CANCELLED", resource: { id: "INV2-AAAA-BBBB" } }).status, "CANCELLED");
+  assert.equal(eventInvoice({ event_type: "INVOICING.INVOICE.PAID", resource: { invoice: { id: "INV2-AAAA-BBBB", status: "PAID" } } }).id, "INV2-AAAA-BBBB");
+  assert.equal(eventInvoice({ event_type: "INVOICING.INVOICE.PAID", resource: { id: "bad id" } }), null);
+});

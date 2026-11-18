@@ -2355,6 +2355,13 @@ async function handleApi(request, env) {
       return fail(500, "Webhook error.");
     }
   }
+  // PayPal calls this directly; each delivery is checked with PayPal's verify-webhook-signature for the fleet's app.
+  if (path === "/api/paypal/webhook" && method === "POST") {
+    try { return await paypalWebhook(request, env); } catch (error) {
+      console.log(JSON.stringify({ level: "error", msg: "paypal webhook", name: error instanceof Error ? error.name : "Error" }));
+      return fail(500, "Webhook error.");
+    }
+  }
   if (method !== "GET" && method !== "HEAD" && !clientHeader(request)) return fail(403, "Blocked.");
   try {
     if (path === "/api/admin/invites" && method === "POST") return adminInvite(request, env);
@@ -2437,6 +2444,8 @@ async function handleApi(request, env) {
     if (invoiceGet && method === "GET") return getInvoice(request, env, invoiceGet[1]);
     const invoicePayPal = /^\/api\/invoices\/([0-9a-f-]{36})\/paypal$/.exec(path);
     if (invoicePayPal && method === "POST") return sendPayPalInvoice(request, env, invoicePayPal[1]);
+    const invoicePayPalSync = /^\/api\/invoices\/([0-9a-f-]{36})\/paypal\/sync$/.exec(path);
+    if (invoicePayPalSync && method === "POST") return syncPayPalInvoice(request, env, invoicePayPalSync[1]);
     if (path === "/api/location" && method === "GET") return getLocation(request, env);
     if (path === "/api/location/sharing" && method === "POST") return setSharing(request, env);
     if (path === "/api/location" && method === "POST") return postLocation(request, env);
@@ -4622,6 +4631,105 @@ async function sendPayPalInvoice(request, env, id) {
   return getInvoice(request, env, id);
 }
 __name(sendPayPalInvoice, "sendPayPalInvoice");
+// Records PayPal's status on the Nudge invoice. Fully paid marks the ride paid; nothing here ever un-pays a ride.
+async function applyPayPalStatus(env, companyId, invoiceId, rideId, paypalInvoice, now) {
+  const outcome = payPalOutcome(paypalInvoice);
+  if (!outcome.status) return "ignored: no status";
+  await env.DB.prepare(
+    "UPDATE invoices SET paypal_status = ?, paypal_checked_at = ?, paypal_refunded = CASE WHEN ? = 1 THEN 1 ELSE paypal_refunded END WHERE company_id = ? AND id = ?"
+  ).bind(outcome.status, now, outcome.refunded ? 1 : 0, companyId, invoiceId).run();
+  if (outcome.paid) {
+    await env.DB.prepare("UPDATE rides SET payment = 'paid', updated_at = ? WHERE company_id = ? AND id = ? AND payment <> 'paid'").bind(now, companyId, rideId).run();
+    return "paid";
+  }
+  if (outcome.refunded) return "refunded flag set";
+  return "status " + outcome.status;
+}
+__name(applyPayPalStatus, "applyPayPalStatus");
+async function paypalWebhook(request, env) {
+  const raw = await request.text();
+  if (raw.length > 5e5) return fail(413, "Too large.");
+  if (paypalServerProblem(env)) return json({ received: true, ignored: "paypal invoicing off" });
+  let event;
+  try { event = JSON.parse(raw); } catch { return fail(400, "Bad payload."); }
+  if (!event || typeof event.id !== "string" || !event.id || typeof event.event_type !== "string") return fail(400, "Bad payload.");
+  if (!PAYPAL_WEBHOOK_EVENTS.includes(event.event_type)) return json({ received: true, ignored: "event type not handled" });
+  const pp = eventInvoice(event);
+  if (!pp) return json({ received: true, ignored: "no invoice" });
+  const inv = await env.DB.prepare("SELECT id, company_id, ride_id FROM invoices WHERE paypal_invoice_id = ?").bind(pp.id).first();
+  if (!inv) return json({ received: true, ignored: "unknown invoice" });
+  const creds = await loadPayPalCredentials(env, inv.company_id);
+  if (!creds || !creds.webhookId) return fail(400, "Webhook not set up for this account.");
+  const verified = await verifyWebhook(env, creds, request.headers, event);
+  if (!verified) return fail(400, "Invalid signature.");
+  const now = Date.now();
+  const claimed = await env.DB.prepare("INSERT OR IGNORE INTO paypal_events (id, event_type, resource_id, company_id, result, received_at) VALUES (?, ?, ?, ?, '', ?)").bind(event.id, event.event_type, pp.id, inv.company_id, now).run();
+  if (!claimed.meta.changes) return json({ received: true, duplicate: true });
+  let result;
+  try {
+    result = await applyPayPalStatus(env, inv.company_id, inv.id, inv.ride_id, pp, now);
+  } catch (error) {
+    await env.DB.prepare("DELETE FROM paypal_events WHERE id = ? AND result = ''").bind(event.id).run(); // let PayPal retry
+    throw error;
+  }
+  await env.DB.prepare("UPDATE paypal_events SET result = ? WHERE id = ?").bind(result, event.id).run();
+  return json({ received: true, result });
+}
+__name(paypalWebhook, "paypalWebhook");
+// Owner taps "Check PayPal status": one GET from PayPal, same mapping as the webhook.
+async function syncPayPalInvoice(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  const inv = await env.DB.prepare("SELECT id, ride_id, paypal_invoice_id FROM invoices WHERE company_id = ? AND id = ?").bind(user.companyId, id).first();
+  if (!inv) return fail(404, "Invoice not found.");
+  if (!inv.paypal_invoice_id) return fail(409, "This invoice hasn't been sent with PayPal.");
+  try {
+    const creds = await loadPayPalCredentials(env, user.companyId);
+    if (!creds) return fail(400, "Connect your PayPal app in More first.");
+    const pp = await fetchPayPalInvoice(env, creds, inv.paypal_invoice_id);
+    await applyPayPalStatus(env, user.companyId, inv.id, inv.ride_id, pp, Date.now());
+  } catch (error) {
+    return paypalFail(error);
+  }
+  return getInvoice(request, env, id);
+}
+__name(syncPayPalInvoice, "syncPayPalInvoice");
+// Backup for missed webhooks, on the existing 5-minute cron: re-check a few open PayPal invoices, each at most every 30 minutes.
+async function runPayPalChecks(env, nowMs) {
+  if (paypalServerProblem(env)) return { checked: 0, skipped: "off" };
+  const now = nowMs || Date.now();
+  const marks = PAYPAL_OPEN_STATUSES.map(() => "?").join(", ");
+  const rows = await env.DB.prepare(
+    `SELECT id, company_id, ride_id, paypal_invoice_id FROM invoices
+     WHERE paypal_invoice_id IS NOT NULL AND paypal_status IN (${marks}) AND (paypal_checked_at IS NULL OR paypal_checked_at < ?)
+     ORDER BY paypal_checked_at LIMIT 10`
+  ).bind(...PAYPAL_OPEN_STATUSES, now - 30 * 60 * 1e3).all();
+  const credsByCompany = new Map();
+  let checked = 0, paid = 0, errors = 0;
+  for (const row of rows.results || []) {
+    try {
+      if (!credsByCompany.has(row.company_id)) credsByCompany.set(row.company_id, await loadPayPalCredentials(env, row.company_id));
+      const creds = credsByCompany.get(row.company_id);
+      if (!creds) {
+        await env.DB.prepare("UPDATE invoices SET paypal_checked_at = ? WHERE id = ?").bind(now, row.id).run();
+        continue;
+      }
+      const pp = await fetchPayPalInvoice(env, creds, row.paypal_invoice_id);
+      const result = await applyPayPalStatus(env, row.company_id, row.id, row.ride_id, pp, now);
+      checked++;
+      if (result === "paid") paid++;
+    } catch {
+      errors++;
+      await env.DB.prepare("UPDATE invoices SET paypal_checked_at = ? WHERE id = ?").bind(now, row.id).run();
+    }
+  }
+  return { checked, paid, errors };
+}
+__name(runPayPalChecks, "runPayPalChecks");
 const DRIVER_ROWS = `SELECT u.id, u.email, m.role,
   d.name AS driver_name, d.vehicle, d.plate, d.login AS driver_login,
   CASE WHEN d.login = 'passcode' AND d.passcode_hash <> '' THEN 1 ELSE 0 END AS passcode_set
@@ -5078,7 +5186,7 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
-import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS } from "./paypal.js";
+import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS, PAYPAL_OPEN_STATUSES, payPalOutcome, eventInvoice, verifyWebhook, fetchPayPalInvoice } from "./paypal.js";
 import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
@@ -5284,6 +5392,7 @@ var index_default = {
   },
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runFlightChecks(env).then((r) => console.log(JSON.stringify({ level: "info", msg: "flight checks", ...r }))).catch((error) => console.log(JSON.stringify({ level: "error", msg: "flight checks", name: error instanceof Error ? error.name : "Error" }))));
+    ctx.waitUntil(runPayPalChecks(env).then((r) => console.log(JSON.stringify({ level: "info", msg: "paypal checks", ...r }))).catch((error) => console.log(JSON.stringify({ level: "error", msg: "paypal checks", name: error instanceof Error ? error.name : "Error" }))));
   }
 };
 export {
