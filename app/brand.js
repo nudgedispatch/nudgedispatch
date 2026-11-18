@@ -105,7 +105,7 @@ export function brandCss(brand, selector) {
     + `${s} .card .title{font-size:22px;}`
     + `${s} label{color:${t.inkSoft};font-weight:500;}`
     + `${s} .muted,${s} .fine,${s} .sub{color:${t.muted};}`
-    + `${s} input,${s} select,${s} textarea{background:#ffffff;border-color:#bfb193;color:${t.ink};}`
+    + `${s} input,${s} select,${s} textarea{background:#ffffff;border-color:#bfb193;border-radius:4px;color:${t.ink};}`
     + `${s} input::placeholder,${s} textarea::placeholder{color:${t.muted};opacity:1;}`
     + `${s} input:focus,${s} select:focus,${s} textarea:focus{border-color:${t.accent};box-shadow:0 0 0 3px ${t.accentLight}66;}`
     + `${s} .btn{background:${t.accent};border-color:${t.accent};color:${t.onAccent};border-radius:2px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;font-size:15px;}`
@@ -120,11 +120,11 @@ export function brandCss(brand, selector) {
     + `${s} .qconfirm,${s} .airport-line{color:${t.accentDark};}`
     + `${s} .quote-box{background:${t.paper};border-color:${t.line};}`
     + `${s} .quote-box .qlines td{border-top-color:${t.line};}`
-    + `${s} .sugg{background:#ffffff;border-color:${t.line};}`
+    + `${s} .sugg{background:#ffffff;border-color:${t.line};border-radius:4px;}`
     + `${s} .sugg button{color:${t.ink};}`
     + `${s} .sugg button:hover,${s} .sugg button:focus{background:${t.bg};}`
     + `${s} .install-hint{background:${t.paper};border-color:${t.accent};color:${t.ink};}`
-    + `${s} .install-dismiss,${s} .stoprow .stop-remove{color:${t.inkSoft};}`
+    + `${s} .install-dismiss,${s} .stoprow .stop-remove{color:${t.inkSoft};border-radius:4px;}`
     + `${s} table.review th{color:${t.muted};}`
     + `${s} a{color:${t.ink};text-decoration-color:${t.accent};}`
     + `${s} .err{color:#a1281a;}`;
