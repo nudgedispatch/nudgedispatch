@@ -2429,6 +2429,10 @@ async function handleApi(request, env) {
     if (cancelMatch && method === "POST") return setRideStatus(request, env, cancelMatch[1], "cancelled");
     const invoiceMatch = /^\/api\/rides\/([0-9a-f-]{36})\/invoice$/.exec(path);
     if (invoiceMatch && method === "POST") return createInvoice(request, env, invoiceMatch[1]);
+    if (path === "/api/paypal/credentials" && method === "GET") return getPayPalCredentials(request, env);
+    if (path === "/api/paypal/credentials" && method === "PUT") return putPayPalCredentials(request, env);
+    if (path === "/api/paypal/credentials" && method === "DELETE") return deletePayPalCredentials(request, env);
+    if (path === "/api/paypal/credentials/test" && method === "POST") return testPayPalCredentials(request, env);
     const invoiceGet = /^\/api\/invoices\/([0-9a-f-]{36})$/.exec(path);
     if (invoiceGet && method === "GET") return getInvoice(request, env, invoiceGet[1]);
     if (path === "/api/location" && method === "GET") return getLocation(request, env);
@@ -4460,6 +4464,81 @@ async function getInvoice(request, env, id) {
   });
 }
 __name(getInvoice, "getInvoice");
+// PayPal invoicing settings (owner only). The secret is write-only: responses carry only its last 4.
+function paypalSettingsJson(env, summary, request) {
+  return {
+    enabled: paypalServerMode(env) !== "off",
+    problem: paypalServerProblem(env),
+    serverMode: paypalServerMode(env),
+    allowedModes: allowedAppModes(env),
+    webhookUrl: new URL("/api/paypal/webhook", request.url).toString(),
+    webhookEvents: PAYPAL_WEBHOOK_EVENTS,
+    ...summary
+  };
+}
+__name(paypalSettingsJson, "paypalSettingsJson");
+function paypalFail(error) {
+  if (error instanceof PayPalError) return fail(error.status >= 400 && error.status < 600 ? error.status : 502, error.message);
+  throw error;
+}
+__name(paypalFail, "paypalFail");
+async function getPayPalCredentials(request, env) {
+  const user = await authed(request, env, false);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  return json({ ok: true, paypal: paypalSettingsJson(env, await credentialsSummary(env, user.companyId), request) });
+}
+__name(getPayPalCredentials, "getPayPalCredentials");
+async function putPayPalCredentials(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const before = await credentialsSummary(env, user.companyId);
+  const input = validateCredentialsInput(env, body, before.configured);
+  if (input.error) return fail(400, input.error);
+  try {
+    await saveCredentials(env, user.companyId, input, Date.now());
+  } catch (error) {
+    return paypalFail(error);
+  }
+  const after = await credentialsSummary(env, user.companyId);
+  await writeAudit(env, user.userId, "paypal.credentials_saved", "company", user.companyId, { mode: after.mode, secretChanged: !!input.secret, webhookId: !!after.webhookId });
+  return json({ ok: true, paypal: paypalSettingsJson(env, after, request) });
+}
+__name(putPayPalCredentials, "putPayPalCredentials");
+async function deletePayPalCredentials(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  await removeCredentials(env, user.companyId);
+  await writeAudit(env, user.userId, "paypal.credentials_removed", "company", user.companyId, {});
+  return json({ ok: true, paypal: paypalSettingsJson(env, await credentialsSummary(env, user.companyId), request) });
+}
+__name(deletePayPalCredentials, "deletePayPalCredentials");
+async function testPayPalCredentials(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  try {
+    const creds = await loadPayPalCredentials(env, user.companyId);
+    if (!creds) return fail(400, "Save your PayPal Client ID and Secret first.");
+    await testConnection(env, creds);
+  } catch (error) {
+    return paypalFail(error);
+  }
+  return json({ ok: true, connected: true, mock: paypalServerMode(env) === "mock" });
+}
+__name(testPayPalCredentials, "testPayPalCredentials");
 const DRIVER_ROWS = `SELECT u.id, u.email, m.role,
   d.name AS driver_name, d.vehicle, d.plate, d.login AS driver_login,
   CASE WHEN d.login = 'passcode' AND d.passcode_hash <> '' THEN 1 ELSE 0 END AS passcode_set
@@ -4916,6 +4995,7 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
+import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS } from "./paypal.js";
 import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
