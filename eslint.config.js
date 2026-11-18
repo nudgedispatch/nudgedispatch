@@ -20,6 +20,8 @@ export default [
       "app/signup.js",
       "app/slug.js",
       "app/theme.js",
+      "app/paypal.js",
+      "app/paypal-mock.js",
       "test/**/*.js",
       "scripts/**/*.js",
     ],
@@ -36,6 +38,8 @@ export default [
         TextEncoder: "readonly",
         setTimeout: "readonly",
         atob: "readonly",
+        btoa: "readonly",
+        TextDecoder: "readonly",
       },
     },
     rules: {
