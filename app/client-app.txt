@@ -2841,7 +2841,7 @@ async function loadPhoneBookingCard(gen) {
     <p class="sub">Booking number: <strong>${esc(t.display)}</strong></p>
     <p class="sub">Texts to this number: ${t.enabled ? "become draft rides" : "off"}</p>
     <label class="check"><input type="checkbox" id="voice-on" ${t.voiceEnabled ? "checked" : ""}> Answer calls with the AI booking agent</label>
-    <p class="note">The agent asks for pickup, drop-off, date, time, name and a callback number, reads them back, and tells the caller you will confirm. Each call becomes a draft in Rides with the summary, transcript and a suggested driver. It never quotes a price you have not set, never takes payment, and never books on its own.${t.voiceReady ? "" : " (Call answering is not connected on this server yet.)"}</p>
+    <p class="note">The agent asks for pickup, drop-off, date, time, name and a callback number, reads them back, and tells the caller you will confirm. Each call becomes a draft in Rides with the summary, transcript and a suggested driver. It never quotes a price, never takes payment, and never books on its own.${t.voiceReady ? "" : " (Call answering is not connected on this server yet.)"}</p>
     <p class="err" id="voice-err"></p>`;
   card.hidden = false;
   const box = card.querySelector("#voice-on");
