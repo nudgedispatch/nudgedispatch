@@ -1725,6 +1725,11 @@ async function renderBrandSettings(gen, companyId) {
       <p class="sub" id="brand-status">${esc(status)}</p>
     </section>
     <form id="brandform" class="fields" novalidate>
+      <fieldset class="full brand-fs" id="brand-suggest"><legend>Match your website</legend>
+        <p class="sub">Paste your website address. We read its colors, fonts, and logo and suggest a look. Nothing changes until you press Save.</p>
+        <div class="brand-suggest-row"><input id="b-url" type="url" inputmode="url" placeholder="https://yourcompany.com" autocomplete="url" autocapitalize="none" spellcheck="false"><button type="button" class="btn ghost" id="b-suggest">Get suggestions</button></div>
+        <div id="b-suggest-out" aria-live="polite"></div>
+      </fieldset>
       <fieldset class="full brand-fs"><legend>Start from</legend><div class="brand-presets" id="brand-presets"></div></fieldset>
       <fieldset class="full brand-fs"><legend>Look</legend>
         <label class="check"><input type="radio" name="base" value="light" ${start.base !== "dark" ? "checked" : ""}> Light background</label>
@@ -1872,6 +1877,46 @@ async function renderBrandSettings(gen, companyId) {
     const r = await api(apiPath, { method: "DELETE", body: {} });
     if (!r.data.ok) { $("#brand-err").textContent = r.data.error || "Could not reset."; return; }
     route();
+  });
+  const suggestOut = $("#b-suggest-out");
+  $("#b-suggest").addEventListener("click", async () => {
+    const url = $("#b-url").value.trim();
+    if (!url) { suggestOut.innerHTML = `<p class="err">Paste your website address first.</p>`; return; }
+    $("#b-suggest").disabled = true;
+    suggestOut.innerHTML = `<p class="muted">Reading your website\u2026</p>`;
+    const path = admin ? apiPath + "/suggest" : "/api/brand/suggest";
+    const r = await api(path, { method: "POST", body: { url } });
+    $("#b-suggest").disabled = false;
+    if (gen !== renderGen) return;
+    if (!r.data.ok) { suggestOut.innerHTML = `<p class="err">${esc(r.data.error || "We couldn't read that website.")}</p>`; return; }
+    const sg = r.data.suggestion;
+    const sm = sg.simple;
+    const pairName = (d.fontPairs.find((p) => p.id === sm.pair) || {}).name || "Standard";
+    suggestOut.innerHTML = `<div class="card brand-suggestion">
+        <p class="sub">Suggested from ${esc(sg.url)}</p>
+        <div class="brand-swatches">${["primary", "accent", "background", "text"].map((k) => `<span class="brand-swatch" data-hex="${esc(sm[k])}"></span><span class="sub">${esc(k)} ${esc(sm[k])}</span>`).join("")}</div>
+        <p class="sub">${esc(sm.base === "dark" ? "Dark" : "Light")} background \u00b7 Fonts: ${esc(pairName)}${sg.found && sg.found.fonts && sg.found.fonts.length ? ` (site uses ${esc(sg.found.fonts.join(", "))})` : ""}</p>
+        ${sg.logoDataUrl ? `<p class="sub">Logo found.</p><img class="brand-logo-thumb" alt="Suggested logo" src="${esc(sg.logoDataUrl)}">` : `<p class="sub">No logo we could use. Upload one below.</p>`}
+        ${(r.data.problems || []).length ? `<p class="err">Some of these colors are hard to read. Use them, then adjust until the check passes.</p>` : ""}
+        <div class="admin-actions"><button type="button" class="btn" id="b-suggest-use">Use these</button><button type="button" class="btn ghost" id="b-suggest-dismiss">Dismiss</button></div>
+      </div>`;
+    suggestOut.querySelectorAll(".brand-swatch").forEach((el) => { el.style.background = el.dataset.hex; });
+    $("#b-suggest-dismiss").onclick = () => { suggestOut.innerHTML = ""; };
+    $("#b-suggest-use").onclick = async () => {
+      setSimple({ base: sm.base, primary: sm.primary, accent: sm.accent, background: sm.background, text: sm.text }, sm.pair);
+      if (sg.logoDataUrl) {
+        try {
+          const [head, b64] = sg.logoDataUrl.split(",");
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const blob = new Blob([bytes], { type: (/^data:([^;]+)/.exec(head) || [])[1] || "image/png" });
+          logoChange = await compressBrandLogo(blob);
+          setLogo(logoChange);
+        } catch { $("#brand-err").textContent = "We couldn't use the logo from your website. Upload one below."; }
+      }
+      suggestOut.innerHTML = `<p class="sub">Suggestions applied below. Review the preview, then press Save.</p>`;
+    };
   });
   drawAdv();
   refresh();
