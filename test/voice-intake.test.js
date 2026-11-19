@@ -129,7 +129,7 @@ test("parseCall: transcript-only fallback uses the text parser and flags it", ()
 test("parseCall: callback request and hidden caller ID", () => {
   const call = readBlandCall(inboundCall({
     from: "anonymous", summary: "Caller wants the owner to call about a lost bag.",
-    transcripts: [{ user: "user", text: "I left a bag in the car yesterday, can the owner call me" }],
+    transcripts: [{ user: "user", text: "I left a bag in the car yesterday, I want the owner to call me about it" }],
     analysis: { needs_callback: true, callback_number: "404 555 0177", rider_name: "Pat" },
   }), ours);
   const p = parseCall(call, { now: NOW });
@@ -138,6 +138,8 @@ test("parseCall: callback request and hidden caller ID", () => {
   assert.equal(p.warnings[0], "The caller may not have asked for a ride. Listen to the call.");
   assert.ok(p.warnings.includes("Caller asked for a call back from the owner."));
   assert.ok(p.warnings.some((w) => /Caller ID was hidden/.test(w)));
+  assert.equal(p.dropoff, "", "\"call me\" is not a drop-off");
+  assert.equal(p.name, "Pat");
   assert.equal(emptyCall(call, p), false);
 });
 

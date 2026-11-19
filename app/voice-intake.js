@@ -237,7 +237,11 @@ export function parseCall(call, options = {}) {
   const s = call.structured || {};
   const rb = readBack(call.turns);
   const callerSaid = call.turns.filter((t) => t.who === "caller").map((t) => t.text).join("\n");
-  const fb = parseRideText(callerSaid, { now, airports: options.airports });
+  const parsedSaid = parseRideText(callerSaid, { now, airports: options.airports });
+  // The free-text parser only fills gaps when the caller's words look like a ride request and the caller
+  // did not ask for a call back instead (so "can the owner call me" never becomes a drop-off).
+  const useFallback = parsedSaid.looksLikeRide && !s.needsCallback;
+  const fb = useFallback ? parsedSaid : { ...parsedSaid, pickup: "", dropoff: "", flight: "", airport: null, direction: "", passengers: null, luggage: null, name: "", time: "", timeAssumed: false };
   const fieldSource = {};
   const take = (f) => {
     if (s[f] !== undefined && s[f] !== "") { fieldSource[f] = "bland"; return s[f]; }
