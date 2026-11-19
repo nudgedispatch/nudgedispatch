@@ -1,0 +1,16 @@
+{
+  "_comment": "PREVIEW ONLY. Body for POST https://api.bland.ai/v1/inbound/{phone_number} (legacy inbound number) once Jesse picks a number. Never apply to +1 440-644-2454 (Iron Gate live). Replace <VOICE_INTAKE_TOKEN> from the Worker secret; never commit it.",
+  "prompt": "See docs/voice-booking/agent-prompt.md, section Prompt.",
+  "first_sentence": "Thanks for calling {{company_name}}. This is the booking assistant. I can take your ride request and the owner will confirm it. Where should we pick you up?",
+  "voice": "maya",
+  "language": "en-US",
+  "timezone": "America/New_York",
+  "max_duration": 6,
+  "record": true,
+  "background_track": "none",
+  "request_data": { "company_name": "Gold Standard Limo", "price_rule": "Say the owner confirms the final price; do not quote a number." },
+  "summary_prompt": "In 2-3 sentences: what ride was requested (pickup, drop-off, date, time, rider), whether the caller confirmed the read-back, and anything the owner must follow up on. Do not include payment details.",
+  "keywords": ["Hartsfield", "Peachtree", "Buckhead", "Domestic", "International"],
+  "webhook": "https://<worker-host>/api/inbound/bland/voice/<VOICE_INTAKE_TOKEN>",
+  "metadata": { "app": "nudge", "flow": "voice-to-ride" }
+}

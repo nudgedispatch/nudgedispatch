@@ -26,6 +26,8 @@ export interface NudgeEnv {
   BLAND_API_BASE?: string;
   /** Text-to-ride webhook path token (secret). Empty means /api/inbound/bland/sms/* returns 404. */
   TEXT_INTAKE_TOKEN?: string;
+  /** Voice-to-ride post-call webhook path token (secret). Empty means /api/inbound/bland/voice/* returns 404. */
+  VOICE_INTAKE_TOKEN?: string;
   /** Bland webhook signing secret (Dev Portal > Keys). When set, X-Webhook-Signature is required. */
   BLAND_WEBHOOK_SECRET?: string;
   /** Google Routes API for distance quotes. Absent means distance quotes are skipped. */
