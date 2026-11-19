@@ -145,7 +145,7 @@ export async function qrPng(text, { logoDataUrl = "", target = 1024 } = {}) {
   return encodePng(rgba, px, px);
 }
 
-export function qrManifest(slug, companyName, themeColor) {
+export function qrManifest(slug, companyName, themeColor, brandChrome = null) {
   const base = "/book/" + slug + "/";
   const qr = base + "qr/";
   const name = String(companyName || "").trim() || "Booking";
@@ -158,8 +158,8 @@ export function qrManifest(slug, companyName, themeColor) {
     start_url: qr,
     scope: qr,
     display: "standalone",
-    background_color: theme.background,
-    theme_color: theme.background,
+    background_color: brandChrome ? brandChrome.background : theme.background,
+    theme_color: brandChrome ? brandChrome.header : theme.background,
     icons: [
       { src: base + "icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
       { src: base + "icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
@@ -169,7 +169,7 @@ export function qrManifest(slug, companyName, themeColor) {
   };
 }
 
-export function qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl = "", themeColor = "", assetTag = "" }) {
+export function qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl = "", themeColor = "", assetTag = "", brandChrome = null }) {
   const name = String(companyName || "").trim() || "Booking page";
   const e = escapeHtml;
   const base = "/book/" + slug + "/";
@@ -183,7 +183,7 @@ export function qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl = "", th
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="${e(theme.background)}">
+<meta name="theme-color" content="${e(brandChrome ? brandChrome.background : theme.background)}">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -195,9 +195,9 @@ export function qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl = "", th
 <link rel="icon" href="${e(base)}icon-192.png" type="image/png">
 <link rel="apple-touch-icon" href="${e(base)}apple-touch-icon.png">
 <link rel="stylesheet" href="/book-qr.css${v}">
-${themeStyle}
+${brandChrome ? `<link rel="stylesheet" href="${e(base)}qr/theme.css">` : themeStyle}
 </head>
-<body class="qrpage${theme.custom ? " themed" : ""}" data-url="${e(bookingUrl)}" data-name="${e(name)}" data-file="${e(file)}" data-png="${e(base)}qr.png" data-sw="${e(base)}qr/sw.js">
+<body class="qrpage${theme.custom || brandChrome ? " themed" : ""}" data-url="${e(bookingUrl)}" data-name="${e(name)}" data-file="${e(file)}" data-png="${e(base)}qr.png" data-sw="${e(base)}qr/sw.js">
 <main>
   <header class="qr-head">
     <img class="qr-logo" src="${e(headLogo)}" alt="" width="56" height="56">

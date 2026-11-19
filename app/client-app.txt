@@ -709,14 +709,35 @@ function trialBannerHtml() {
       <p class="sub"><a href="#/settings">Export your rides and clients</a> any time from More.</p>
     </section>`;
   }
+  if (b.state === "converted" || b.state === "converting") {
+    // Informational only: no choices, never blocks booking.
+    return `<section class="card trial trial-${esc(b.state)}" id="trial-card" data-state="${esc(b.state)}" role="status">
+      ${b.dismissible ? `<button class="trial-dismiss" type="button" id="trial-dismiss" aria-label="Dismiss">×</button>` : ""}
+      <p class="trial-line"><strong>${esc(b.title)}</strong></p>
+      <p class="sub">${esc(b.line)}</p>
+      <p class="sub">${esc(b.detail)}</p>
+    </section>`;
+  }
   const t = state.trial;
   const pct = t && t.rideLimit ? Math.min(100, Math.round((t.ridesUsed / t.rideLimit) * 100)) : 0;
   return `<section class="card trial trial-${esc(b.state)}" id="trial-card" data-state="${esc(b.state)}">
       <p class="trial-line">${esc(b.line)}</p>
       <div class="trial-bar" aria-hidden="true"><span class="trial-fill w${Math.round(pct / 5) * 5}"></span></div>
       <p class="sub">${esc(b.detail)}</p>
+      ${b.cancelNote ? `<p class="sub trial-cancel-note">${esc(b.cancelNote)}</p>` : ""}
       ${contact}
     </section>`;
+}
+function wireTrialDismiss() {
+  const btn = document.querySelector("#trial-dismiss");
+  if (!btn) return;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    const card = document.querySelector("#trial-card");
+    if (card) card.remove();
+    state.trialBanner = null;
+    await api("/api/trial/notice/dismiss", { method: "POST", body: {} });
+  };
 }
 function trialPausedHtml() {
   return `<p class="sub trial-paused">Approving new requests is paused because the free trial has ended. You can still decline.</p>`;
@@ -787,7 +808,7 @@ async function renderRides(gen) {
   const [result, , regular] = await Promise.all([api("/api/rides"), loadTrial(), isOwnerView() ? api("/api/schedules/upcoming") : Promise.resolve(null)]);
   if (gen !== renderGen) return;
   const trialBox = document.querySelector("#trial");
-  if (trialBox) trialBox.innerHTML = billingBannerHtml() + trialBannerHtml();
+  if (trialBox) { trialBox.innerHTML = billingBannerHtml() + trialBannerHtml(); wireTrialDismiss(); }
   const list = document.querySelector("#list");
   const regularItems = regular && regular.data.ok ? regular.data.occurrences || [] : [];
   if (regular && regular.data.ok) paintScheduleBadge(regular.data.count);
@@ -1210,6 +1231,7 @@ async function renderInvoice(id, gen) {
       <button class="btn ghost" id="txt" type="button">Download text</button>
       <button class="btn ghost" id="html" type="button">Download page</button>
     </div>
+    ${payPalInvoiceHtml(invoice)}
     ${invoice.payment ? `<div class="row paid-row noprint"><span id="paid-state" class="${paid ? "paid-yes" : "muted"}">${paid ? "Paid" : "Not paid yet"}</span><button class="btn ghost" id="mark-paid" type="button" data-paid="${paid ? "1" : "0"}">${paid ? "Mark not paid" : "Mark paid"}</button></div><p class="err noprint" id="paid-err"></p>` : ""}
     <article class="sheet" id="sheet">
       <div class="who">${logo}<div><h2>INVOICE</h2><strong>${esc(business.name)}</strong><div>${esc([business.address, business.phone, business.email, business.website].filter(Boolean).join(" · "))}</div></div></div>
@@ -1241,6 +1263,27 @@ async function renderInvoice(id, gen) {
       setTimeout(() => { button.textContent = "Copy"; }, 2000);
     };
   });
+  const ppSend = document.querySelector("#pp-send");
+  if (ppSend) ppSend.onclick = async () => {
+    const pp = invoice.paypal || {};
+    if (!confirm(pp.mock ? "Preview: simulate sending a PayPal invoice? Nothing reaches PayPal." : "Send PayPal invoice " + invoice.number + " for " + invoice.fare + " to " + (invoice.billTo.email || "the client's email") + "? PayPal emails it to the rider.")) return;
+    ppSend.disabled = true;
+    const msg = document.querySelector("#pp-send-msg");
+    if (msg) { msg.style.color = ""; msg.textContent = "Sending to PayPal…"; }
+    const sent = await api("/api/invoices/" + invoice.id + "/paypal", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    if (!sent.data.ok) { ppSend.disabled = false; if (msg) msg.textContent = sent.data.error || "Could not send the PayPal invoice."; return; }
+    renderInvoice(invoice.id, gen);
+  };
+  const ppSync = document.querySelector("#pp-sync");
+  if (ppSync) ppSync.onclick = async () => {
+    ppSync.disabled = true;
+    const synced = await api("/api/invoices/" + invoice.id + "/paypal/sync", { method: "POST", body: {} });
+    if (gen !== renderGen) return;
+    ppSync.disabled = false;
+    if (!synced.data.ok) { const msg = document.querySelector("#pp-send-msg"); if (msg) msg.textContent = synced.data.error || "Could not check PayPal."; return; }
+    renderInvoice(invoice.id, gen);
+  };
   const markPaid = document.querySelector("#mark-paid");
   if (markPaid) markPaid.onclick = async () => {
     const nowPaid = markPaid.getAttribute("data-paid") === "1";
@@ -1259,6 +1302,25 @@ async function renderInvoice(id, gen) {
   };
   document.querySelector("#txt").onclick = () => download(`invoice-${invoice.number}.txt`, invoice.snapshotText, "text/plain");
   document.querySelector("#html").onclick = () => download(`invoice-${invoice.number}.html`, `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Invoice ${esc(invoice.number)}</title></head><body><pre>${esc(invoice.snapshotText)}</pre></body></html>`, "text/html");
+}
+
+// "Send PayPal invoice" (explicit tap) or, once sent, the PayPal invoice status and payer link.
+function payPalInvoiceHtml(invoice) {
+  const pp = invoice.paypal || {};
+  if (pp.sent) {
+    return `<div class="card noprint" id="pp-invoice"><p><strong>PayPal invoice</strong> · <span id="pp-status">${esc(pp.statusLabel || pp.status)}</span>${pp.refunded ? ` · <span class="err">Refunded</span>` : ""}</p>
+      <p class="sub">${esc(pp.invoiceId)}${pp.mode === "sandbox" ? " · sandbox" : ""}${pp.mock ? " · simulated on this preview" : ""}. The plain PayPal link is hidden on this invoice; the rider pays the PayPal invoice.</p>
+      <div class="actions">${pp.payerUrl ? `<a class="btn ghost" id="pp-open" href="${esc(pp.payerUrl)}" target="_blank" rel="noopener noreferrer">Open PayPal invoice</a>` : ""}<button class="btn ghost" id="pp-sync" type="button">Check PayPal status</button></div>
+      <p class="err" id="pp-send-msg"></p></div>`;
+  }
+  if (!pp.available) return "";
+  const email = String((invoice.billTo && invoice.billTo.email) || "").trim();
+  const paid = invoice.payment === "paid";
+  const hasEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  return `<div class="card noprint" id="pp-invoice">
+      <button class="btn full" id="pp-send" type="button"${paid ? " disabled" : ""}>Send PayPal invoice</button>
+      <p class="sub">${paid ? "This ride is already marked paid." : `PayPal emails the invoice to ${hasEmail ? esc(email) : "the rider's email on this client (needed)"}. The rider can pay by card or PayPal and add a tip. It's marked paid here when PayPal says it's fully paid.`}${pp.mock ? " Preview: simulated, nothing reaches PayPal." : ""}${pp.status === "DRAFT" ? " A PayPal draft exists; tapping again sends that same invoice." : ""}</p>
+      <p class="err" id="pp-send-msg"></p></div>`;
 }
 
 function payOptionHtml(option, fare) {
@@ -1468,14 +1530,14 @@ const PAY_FIELDS = [
   { kind: "cashapp", label: "Cash App", what: "$cashtag", placeholder: "$cashtag" },
   { kind: "zelle", label: "Zelle", what: "phone or email", placeholder: "Zelle phone or email" },
   { kind: "venmo", label: "Venmo", what: "@username", placeholder: "@username" },
-  { kind: "paypal", label: "PayPal", what: "PayPal.Me name", placeholder: "paypal.me/name" },
+  { kind: "paypal", label: "PayPal", what: "PayPal.Me name or paypal.com/biz/profile link", placeholder: "paypal.me/name or paypal.com/biz/profile/name" },
 ];
 
 function paymentMethodsFieldset(methods) {
   const pm = methods || {};
-  const shown = (kind, handle) => !handle ? "" : kind === "cashapp" ? "$" + handle : kind === "venmo" ? "@" + handle : handle;
+  const shown = (kind, handle) => !handle ? "" : kind === "cashapp" ? "$" + handle : kind === "venmo" ? "@" + handle : kind === "paypal" && handle.startsWith("biz:") ? "paypal.com/biz/profile/" + handle.slice(4) : handle;
   return `<fieldset class="full paymeth" id="paymeth"><legend>How clients can pay you</legend>
-    <p class="sub">Turn on each way you take payment. Invoices get a Pay with section, and Cash App, Venmo, and PayPal open with the amount filled in. Money goes straight to you, so mark the ride paid yourself.</p>
+    <p class="sub">Turn on each way you take payment. Invoices get a Pay with section, and Cash App, Venmo, and PayPal.Me open with the amount filled in. A PayPal business profile link opens the profile without an amount. Money goes straight to you, so mark the ride paid yourself.</p>
     ${PAY_FIELDS.map((f) => {
       const m = pm[f.kind] || {};
       return `<div class="paymeth-row"><label class="check"><input type="checkbox" data-pay-on="${f.kind}"${m.on ? " checked" : ""}> ${esc(f.label)}</label>${f.placeholder ? `<input data-pay-handle="${f.kind}" aria-label="${esc(f.label + " " + f.what)}" placeholder="${esc(f.placeholder)}" value="${esc(shown(f.kind, m.handle))}" maxlength="120" autocomplete="off" autocapitalize="off" spellcheck="false">` : `<span class="muted">${"Pay your driver in cash"}</span>`}</div>`;
@@ -1493,6 +1555,60 @@ function readPaymentMethods() {
   return out;
 }
 
+// PayPal invoices (Pay with): the fleet's own PayPal REST app. The secret is write-only; only its last 4 come back.
+function payPalCardHtml(p) {
+  const modes = Array.isArray(p.allowedModes) ? p.allowedModes : [];
+  const label = { sandbox: "Sandbox (testing)", live: "Live" };
+  const saved = p.configured ? `<p class="sub" id="pp-saved">Saved: ${esc(label[p.mode] || p.mode)} app · Client ID ${esc(String(p.clientId).slice(0, 6))}… · Secret ending ${esc(p.secretLast4)}${p.webhookId ? " · webhook set" : " · no webhook yet"}</p>` : `<p class="sub" id="pp-saved">Not connected.</p>`;
+  return `<h2>PayPal invoices</h2>
+    <p class="sub">Optional. Connect your own PayPal business account so an invoice can be sent as a real PayPal invoice (card or PayPal, tips allowed) and marked paid when PayPal says it's paid. Money goes straight to your PayPal.</p>
+    ${p.serverMode === "mock" ? `<p class="note" id="pp-mock">Preview: PayPal is simulated here. Nothing reaches PayPal and no email goes out.</p>` : ""}
+    ${p.problem ? `<p class="note">${esc(p.problem)}</p>` : ""}
+    ${saved}
+    <form id="pp-form" class="stack" autocomplete="off">
+      <label>PayPal app<select id="pp-mode">${modes.map((m) => `<option value="${esc(m)}"${(p.mode || modes[0]) === m ? " selected" : ""}>${esc(label[m] || m)}</option>`).join("")}</select></label>
+      <label>Client ID<input id="pp-client" value="${esc(p.clientId || "")}" maxlength="128" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label>Secret<input id="pp-secret" type="password" value="" maxlength="128" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="${p.configured ? "Saved (ends " + esc(p.secretLast4) + "). Leave blank to keep." : "Paste your app Secret"}"></label>
+      <label>Webhook ID (optional)<input id="pp-webhook" value="${esc(p.webhookId || "")}" maxlength="64" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <p class="sub">In your PayPal app, add a webhook for <span class="handle" id="pp-webhook-url">${esc(p.webhookUrl)}</span> with ${esc((p.webhookEvents || []).join(", "))}, then paste its Webhook ID here. Your Secret is encrypted and never shown again.</p>
+      <p class="err" id="pp-msg"></p>
+      <button class="btn full" type="submit"${p.problem ? " disabled" : ""}>Save PayPal app</button>
+      ${p.configured ? `<button class="btn ghost full" id="pp-test" type="button">Test connection</button><button class="btn ghost full" id="pp-remove" type="button">Disconnect PayPal</button>` : ""}
+    </form>`;
+}
+
+async function loadPayPalCard(gen, note, ok) {
+  const card = document.querySelector("#paypal-card");
+  if (!card) return;
+  const r = await api("/api/paypal/credentials");
+  if (gen !== undefined && gen !== renderGen) return;
+  if (!r.data.ok || !r.data.paypal || !r.data.paypal.enabled) { card.hidden = true; return; }
+  card.innerHTML = payPalCardHtml(r.data.paypal);
+  card.hidden = false;
+  const msg = card.querySelector("#pp-msg");
+  if (note) setMsg(msg, note, ok);
+  card.querySelector("#pp-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const body = { mode: card.querySelector("#pp-mode").value, clientId: card.querySelector("#pp-client").value, secret: card.querySelector("#pp-secret").value, webhookId: card.querySelector("#pp-webhook").value };
+    const saved = await api("/api/paypal/credentials", { method: "PUT", body });
+    if (!saved.data.ok) return setMsg(msg, saved.data.error || "Could not save.", false);
+    loadPayPalCard(gen, "PayPal app saved.", true);
+  };
+  const test = card.querySelector("#pp-test");
+  if (test) test.onclick = async () => {
+    test.disabled = true;
+    const t = await api("/api/paypal/credentials/test", { method: "POST", body: {} });
+    test.disabled = false;
+    setMsg(msg, t.data.ok ? (t.data.mock ? "Connected (simulated on this preview)." : "Connected to PayPal.") : t.data.error || "Could not connect.", !!t.data.ok);
+  };
+  const remove = card.querySelector("#pp-remove");
+  if (remove) remove.onclick = async () => {
+    if (!confirm("Disconnect PayPal? Invoices already sent stay on PayPal.")) return;
+    const d = await api("/api/paypal/credentials", { method: "DELETE", body: {} });
+    if (!d.data.ok) return setMsg(msg, d.data.error || "Could not disconnect.", false);
+    loadPayPalCard(gen, "PayPal disconnected.", true);
+  };
+}
 
 const LOGO_MAX_EDGE = 384;
 const LOGO_MAX_DATA_URL = 180000;
@@ -1558,6 +1674,315 @@ function contrastText(bg) {
   return (1.05 / (L + 0.05)) >= ((L + 0.05) / 0.05) ? "#f5f5f5" : "#111111";
 }
 
+// ---- Booking page brand ("Match your website") ----
+// Owner (paid plans) at #/settings/brand; platform admin for any company at #/admin/brand/<companyId>.
+const BRAND_PRESETS = [
+  ["Ivory & gold", { base: "light", primary: "#a8842f", accent: "#8a6d24", background: "#f5f0e6", text: "#111111" }, "classic"],
+  ["Black & gold", { base: "dark", primary: "#e8d060", accent: "#e8d060", background: "#0b0b0b", text: "#f5f0e6" }, "classic"],
+  ["White & navy", { base: "light", primary: "#1f3a5f", accent: "#1f3a5f", background: "#ffffff", text: "#111111" }, "modern"],
+  ["Charcoal & teal", { base: "dark", primary: "#5fd6c4", accent: "#8ee6d8", background: "#121417", text: "#f2efe8" }, "clean"],
+  ["Forest", { base: "light", primary: "#1d5c47", accent: "#1d5c47", background: "#f4f1ea", text: "#132018" }, "warm"],
+];
+const BRAND_LOGO_EDGES = [400, 320, 240];
+const BRAND_LOGO_MAX = 120000;
+async function compressBrandLogo(file) {
+  if (file.size > 15 * 1024 * 1024) throw new Error("too-large");
+  const img = await loadImageFromFile(file);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("canvas");
+  try {
+    for (const edge of BRAND_LOGO_EDGES) {
+      const w = img.naturalWidth || img.width;
+      const h = img.naturalHeight || img.height;
+      const scale = Math.min(1, edge / Math.max(w, h, 1));
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const webp = canvas.toDataURL("image/webp", 0.86);
+      if (webp.startsWith("data:image/webp") && webp.length <= BRAND_LOGO_MAX) return webp;
+      const png = canvas.toDataURL("image/png");
+      if (png.length <= BRAND_LOGO_MAX) return png;
+    }
+  } finally {
+    if (img && typeof img.close === "function") try { img.close(); } catch { /* ignore */ }
+  }
+  throw new Error("too-large");
+}
+function brandLum(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || "").trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const ch = (c) => { const s = c / 255; return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); };
+  return 0.2126 * ch((n >> 16) & 255) + 0.7152 * ch((n >> 8) & 255) + 0.0722 * ch(n & 255);
+}
+function brandRatio(a, b) {
+  const x = brandLum(a); const y = brandLum(b);
+  if (x === null || y === null) return 0;
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+// Instant client-side check on the four main colors (the server re-checks every derived color on save).
+function brandQuickProblems(simple) {
+  const out = [];
+  const keys = ["primary", "accent", "background", "text"];
+  for (const k of keys) if (brandLum(simple[k]) === null) out.push(`Enter ${k} as a 6-digit hex color, like #a8842f.`);
+  if (out.length) return out;
+  const dark = simple.base === "dark";
+  const textOnButton = Math.max(...(dark ? [simple.background, "#111111", simple.text, "#ffffff"] : [simple.text, "#ffffff"]).map((c) => brandRatio(simple.primary, c)));
+  const checks = [
+    ["Body text on the page background", brandRatio(simple.text, simple.background), 4.5],
+    ["Large headings", brandRatio(simple.accent, simple.background), 3],
+    ["Button against the page", brandRatio(simple.primary, simple.background), 3],
+    ["Button text", textOnButton, 4.5],
+  ];
+  for (const [label, r, need] of checks) if (r < need) out.push(`${label} is hard to read (${r.toFixed(2)}:1, needs ${need}:1).`);
+  return out;
+}
+function brandMockHtml(name, logo) {
+  return `<div class="bookpage-mock" aria-hidden="true">
+    <header class="top"><img class="logo" alt="" src="${esc(logo || "/icons/icon-192.png")}"><div class="brand"><span class="coname">${esc(name || "Your company")}</span><small>Request a ride</small></div></header>
+    <div class="mock-body">
+      <h1>Book a ride</h1>
+      <h2 class="steph">Your trip</h2>
+      <label>Pickup address<input tabindex="-1" value="100 Peachtree St, Atlanta" readonly></label>
+      <div class="two"><label>Pickup date<input tabindex="-1" type="date" value="2026-12-04" readonly></label><label>Vehicle<select tabindex="-1"><option>SUV (up to 6)</option></select></label></div>
+      <div class="card quote"><div class="sub">Instant estimate</div><div class="qprice">$125</div><p class="fine qconfirm">Final price confirmed when they approve.</p></div>
+      <button class="btn" type="button" tabindex="-1">Continue</button>
+      <button class="btn ghost" type="button" tabindex="-1">+ Add stop</button>
+      <p class="fine">Your request goes to the operator for approval.</p>
+    </div>
+  </div>`;
+}
+function brandColorField(id, label, value, hint) {
+  return `<div class="brand-color"><label for="${id}">${esc(label)}</label><div class="brand-color-row"><input type="color" id="${id}-pick" value="${esc(value)}" aria-label="${esc(label)} picker"><input id="${id}" value="${esc(value)}" maxlength="7" autocapitalize="none" autocomplete="off" spellcheck="false"></div>${hint ? `<span class="sub">${esc(hint)}</span>` : ""}</div>`;
+}
+const BRAND_ADV_KEYS = [["accent", "Button"], ["accentDark", "Button pressed"], ["accentLight", "Highlight / focus"], ["ink", "Text"], ["inkSoft", "Labels"], ["muted", "Small print"], ["bg", "Page"], ["paper", "Header and cards"], ["line", "Lines"], ["field", "Field borders"]];
+async function renderBrandSettings(gen, companyId) {
+  const admin = !!companyId;
+  const apiPath = admin ? "/api/platform/companies/" + encodeURIComponent(companyId) + "/brand" : "/api/brand";
+  setTabs(!admin);
+  shell(`<p class="muted"><a href="${admin ? "#/admin" : "#/settings"}">${admin ? "Admin" : "More"}</a></p><h1>Booking page brand</h1><div id="brandbox" class="muted">Loading\u2026</div>`);
+  const loaded = await api(apiPath);
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#brandbox");
+  if (!loaded.data.ok) { box.textContent = loaded.data.error || "Could not load your brand."; return; }
+  let d = loaded.data;
+  box.classList.remove("muted");
+  const start = d.simple || { base: "light", primary: "#a8842f", accent: "#8a6d24", background: "#f5f0e6", text: "#111111" };
+  const pairOpts = (sel) => d.fontPairs.map((p) => `<option value="${esc(p.id)}" ${p.id === sel ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+  const status = d.brand ? (d.renders ? "Live on your booking page." : "Saved, but not shown: free trials use the standard look.") : "Your booking page uses the standard Nudge look.";
+  if (d.locked) {
+    box.innerHTML = `<section class="card brand-locked" id="brand-locked">
+        <div class="row"><span class="title">Match your website</span><span class="badge">Paid plans</span></div>
+        <p class="sub">${esc(d.lockedText)}</p>
+        <p class="sub">${esc(status)}</p>
+      </section>
+      <section class="card"><h2>What clients see now</h2><div id="brand-live" class="brand-live-standard">${brandMockHtml(d.companyName, d.logoDataUrl)}</div></section>`;
+    return;
+  }
+  box.innerHTML = `<section class="card">
+      <p class="sub">${admin ? `Assisted setup for <strong>${esc(d.companyName)}</strong>. A brand you save here shows on their booking page on any plan.` : "Make your booking page match your website: logo, colors, and fonts. Clients see it on your booking link and QR page."}</p>
+      <p class="sub" id="brand-status">${esc(status)}</p>
+    </section>
+    <form id="brandform" class="fields" novalidate>
+      <fieldset class="full brand-fs" id="brand-suggest"><legend>Match your website</legend>
+        <p class="sub">Paste your website address. We read its colors, fonts, and logo and suggest a look. Nothing changes until you press Save.</p>
+        <div class="brand-suggest-row"><input id="b-url" type="url" inputmode="url" placeholder="https://yourcompany.com" autocomplete="url" autocapitalize="none" spellcheck="false"><button type="button" class="btn ghost" id="b-suggest">Get suggestions</button></div>
+        <div id="b-suggest-out" aria-live="polite"></div>
+      </fieldset>
+      <fieldset class="full brand-fs"><legend>Start from</legend><div class="brand-presets" id="brand-presets"></div></fieldset>
+      <fieldset class="full brand-fs"><legend>Look</legend>
+        <label class="check"><input type="radio" name="base" value="light" ${start.base !== "dark" ? "checked" : ""}> Light background</label>
+        <label class="check"><input type="radio" name="base" value="dark" ${start.base === "dark" ? "checked" : ""}> Dark background</label>
+      </fieldset>
+      ${brandColorField("b-primary", "Primary (buttons)", start.primary, "")}
+      ${brandColorField("b-accent", "Accent (big headings)", start.accent, "")}
+      ${brandColorField("b-background", "Background", start.background, "")}
+      ${brandColorField("b-text", "Text", start.text, "")}
+      <label class="full">Fonts<select id="b-pair">${pairOpts(d.pair === "custom" ? "standard" : d.pair)}</select><span class="sub">Open-licence fonts we host for you. Nothing loads from other sites.</span></label>
+      <details class="full brand-adv" id="brand-adv"><summary>Advanced: every color</summary>
+        <p class="sub">Change any of these to fine-tune. Editing here overrides the four colors above until you change one of them again.</p>
+        <div class="brand-adv-grid" id="brand-adv-grid"></div>
+      </details>
+      <label class="full">Logo<input id="b-logo" type="file" accept="image/png,image/jpeg,image/webp,image/*">
+        <span class="sub">We shrink it to 400px or less and save a small WebP or PNG.</span></label>
+      <div class="full brand-logo-row"><img id="b-logo-img" alt="Current logo" class="brand-logo-thumb ${d.logoDataUrl ? "" : "hidden"}" src="${esc(d.logoDataUrl || "")}"><button type="button" class="btn ghost ${d.logoDataUrl ? "" : "hidden"}" id="b-logo-remove">Remove logo</button></div>
+      <div class="full"><h2>Live preview</h2><div id="brand-live">${brandMockHtml(d.companyName, d.logoDataUrl)}</div></div>
+      <div class="full brand-checks" id="brand-checks" aria-live="polite"></div>
+      <p class="err full" id="brand-err"></p>
+      <button class="btn full" type="submit" id="brand-save">Save brand</button>
+      <button class="btn ghost full" type="button" id="brand-reset" ${d.brand ? "" : "disabled"}>Reset to standard look</button>
+    </form>`;
+  let mode = "simple";
+  let adv = d.brand ? { ...d.brand.colors } : null;
+  let advBase = d.brand && d.brand.base === "dark" ? "dark" : "light";
+  let logoChange; // undefined = unchanged, "" = remove, data URL = new
+  let serverProblems = [];
+  let serverBrand = d.brand;
+  let seq = 0;
+  let link = document.querySelector("#brand-preview-css");
+  if (!link) { link = document.createElement("link"); link.rel = "stylesheet"; link.id = "brand-preview-css"; document.head.appendChild(link); }
+  const $ = (sel) => box.querySelector(sel);
+  const readSimple = () => ({
+    base: (box.querySelector("input[name=base]:checked") || {}).value === "dark" ? "dark" : "light",
+    primary: $("#b-primary").value.trim().toLowerCase(),
+    accent: $("#b-accent").value.trim().toLowerCase(),
+    background: $("#b-background").value.trim().toLowerCase(),
+    text: $("#b-text").value.trim().toLowerCase(),
+  });
+  const drawAdv = () => {
+    const grid = $("#brand-adv-grid");
+    const colors = adv || (serverBrand && serverBrand.colors) || {};
+    grid.innerHTML = BRAND_ADV_KEYS.map(([k, label]) => brandColorField("adv-" + k, label, colors[k] || "#000000", "")).join("");
+    BRAND_ADV_KEYS.forEach(([k]) => wireColor("adv-" + k, () => { mode = "advanced"; adv = adv || { ...(serverBrand ? serverBrand.colors : {}) }; adv[k] = $("#adv-" + k).value.trim().toLowerCase(); advBase = readSimple().base; refresh(); }));
+  };
+  const drawChecks = () => {
+    const quick = mode === "simple" ? brandQuickProblems(readSimple()) : [];
+    const all = [...new Set([...quick, ...serverProblems.map((p) => p.message)])];
+    const el = $("#brand-checks");
+    el.innerHTML = all.length
+      ? `<div class="card brand-bad"><strong>Fix before saving</strong><ul>${all.map((m) => `<li>${esc(m)}</li>`).join("")}</ul></div>`
+      : `<p class="brand-ok">\u2713 Readable: text, headings, and buttons pass the WCAG contrast check.</p>`;
+    $("#brand-save").disabled = all.length > 0;
+  };
+  const payload = () => {
+    const pair = $("#b-pair").value;
+    if (mode === "advanced" && adv) return { mode: "advanced", base: advBase, colors: adv, pair };
+    return { mode: "simple", simple: readSimple(), pair };
+  };
+  const refresh = () => {
+    drawChecks();
+    const mine = ++seq;
+    clearTimeout(refresh.t);
+    refresh.t = setTimeout(async () => {
+      const r = await api("/api/brand/check", { method: "POST", body: payload() });
+      if (mine !== seq || gen !== renderGen) return;
+      if (!r.data.ok) { serverProblems = [{ message: r.data.error || "Could not check these colors." }]; drawChecks(); return; }
+      serverProblems = r.data.problems || [];
+      serverBrand = r.data.brand;
+      if (serverBrand) link.href = "/api/brand/preview.css?b=" + encodeURIComponent(JSON.stringify(serverBrand));
+      if (mode === "simple") drawAdv();
+      drawChecks();
+    }, 200);
+  };
+  function wireColor(id, onChange) {
+    const text = $("#" + id);
+    const pick = $("#" + id + "-pick");
+    if (!text || !pick) return;
+    pick.addEventListener("input", () => { text.value = pick.value; onChange(); });
+    text.addEventListener("input", () => { if (/^#[0-9a-f]{6}$/i.test(text.value.trim())) pick.value = text.value.trim().toLowerCase(); onChange(); });
+  }
+  const setSimple = (simple, pair) => {
+    ["primary", "accent", "background", "text"].forEach((k) => { $("#b-" + k).value = simple[k]; $("#b-" + k + "-pick").value = simple[k]; });
+    box.querySelectorAll("input[name=base]").forEach((r) => { r.checked = r.value === simple.base; });
+    if (pair) $("#b-pair").value = pair;
+    mode = "simple"; adv = null;
+    refresh();
+  };
+  const presets = $("#brand-presets");
+  BRAND_PRESETS.forEach(([name, simple, pair]) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "brand-preset";
+    b.textContent = name;
+    b.style.background = simple.background;
+    b.style.color = simple.text;
+    b.style.borderColor = simple.primary;
+    b.addEventListener("click", () => setSimple(simple, pair));
+    presets.appendChild(b);
+  });
+  ["b-primary", "b-accent", "b-background", "b-text"].forEach((id) => wireColor(id, () => { mode = "simple"; adv = null; refresh(); }));
+  box.querySelectorAll("input[name=base]").forEach((r) => r.addEventListener("change", () => { if (mode === "advanced") advBase = readSimple().base; refresh(); }));
+  $("#b-pair").addEventListener("change", refresh);
+  const setLogo = (url) => {
+    const img = $("#b-logo-img");
+    img.src = url || "";
+    img.classList.toggle("hidden", !url);
+    $("#b-logo-remove").classList.toggle("hidden", !url);
+    const mockLogo = box.querySelector("#brand-live .logo");
+    if (mockLogo) mockLogo.src = url || "/icons/icon-192.png";
+  };
+  $("#b-logo").addEventListener("change", async () => {
+    const file = $("#b-logo").files[0];
+    if (!file) return;
+    try { logoChange = await compressBrandLogo(file); setLogo(logoChange); $("#brand-err").textContent = ""; }
+    catch { $("#brand-err").textContent = "We couldn't use that image. Try a PNG, JPG, or WebP."; }
+  });
+  $("#b-logo-remove").addEventListener("click", () => { logoChange = ""; $("#b-logo").value = ""; setLogo(""); });
+  $("#brandform").onsubmit = async (event) => {
+    event.preventDefault();
+    const err = $("#brand-err");
+    err.style.color = "";
+    const body = payload();
+    if (logoChange !== undefined) body.logoDataUrl = logoChange;
+    $("#brand-save").disabled = true;
+    const saved = await api(apiPath, { method: "PUT", body });
+    if (gen !== renderGen) return;
+    if (!saved.data.ok) {
+      serverProblems = saved.data.problems || [];
+      drawChecks();
+      err.textContent = saved.data.error || "Could not save.";
+      return;
+    }
+    d = saved.data;
+    logoChange = undefined;
+    $("#brand-status").textContent = d.renders ? "Saved. Live on the booking page." : "Saved.";
+    $("#brand-reset").disabled = false;
+    err.style.color = "var(--green)";
+    err.textContent = "Saved.";
+    drawChecks();
+  };
+  $("#brand-reset").addEventListener("click", async () => {
+    if (!confirm("Go back to the standard Nudge look? Your colors and fonts are cleared. Your logo stays.")) return;
+    const r = await api(apiPath, { method: "DELETE", body: {} });
+    if (!r.data.ok) { $("#brand-err").textContent = r.data.error || "Could not reset."; return; }
+    route();
+  });
+  const suggestOut = $("#b-suggest-out");
+  $("#b-suggest").addEventListener("click", async () => {
+    const url = $("#b-url").value.trim();
+    if (!url) { suggestOut.innerHTML = `<p class="err">Paste your website address first.</p>`; return; }
+    $("#b-suggest").disabled = true;
+    suggestOut.innerHTML = `<p class="muted">Reading your website\u2026</p>`;
+    const path = admin ? apiPath + "/suggest" : "/api/brand/suggest";
+    const r = await api(path, { method: "POST", body: { url } });
+    $("#b-suggest").disabled = false;
+    if (gen !== renderGen) return;
+    if (!r.data.ok) { suggestOut.innerHTML = `<p class="err">${esc(r.data.error || "We couldn't read that website.")}</p>`; return; }
+    const sg = r.data.suggestion;
+    const sm = sg.simple;
+    const pairName = (d.fontPairs.find((p) => p.id === sm.pair) || {}).name || "Standard";
+    suggestOut.innerHTML = `<div class="card brand-suggestion">
+        <p class="sub">Suggested from ${esc(sg.url)}</p>
+        <div class="brand-swatches">${["primary", "accent", "background", "text"].map((k) => `<span class="brand-swatch" data-hex="${esc(sm[k])}"></span><span class="sub">${esc(k)} ${esc(sm[k])}</span>`).join("")}</div>
+        <p class="sub">${esc(sm.base === "dark" ? "Dark" : "Light")} background \u00b7 Fonts: ${esc(pairName)}${sg.found && sg.found.fonts && sg.found.fonts.length ? ` (site uses ${esc(sg.found.fonts.join(", "))})` : ""}</p>
+        ${sg.logoDataUrl ? `<p class="sub">Logo found.</p><img class="brand-logo-thumb" alt="Suggested logo" src="${esc(sg.logoDataUrl)}">` : `<p class="sub">No logo we could use. Upload one below.</p>`}
+        ${(r.data.problems || []).length ? `<p class="err">Some of these colors are hard to read. Use them, then adjust until the check passes.</p>` : ""}
+        <div class="admin-actions"><button type="button" class="btn" id="b-suggest-use">Use these</button><button type="button" class="btn ghost" id="b-suggest-dismiss">Dismiss</button></div>
+      </div>`;
+    suggestOut.querySelectorAll(".brand-swatch").forEach((el) => { el.style.background = el.dataset.hex; });
+    $("#b-suggest-dismiss").onclick = () => { suggestOut.innerHTML = ""; };
+    $("#b-suggest-use").onclick = async () => {
+      setSimple({ base: sm.base, primary: sm.primary, accent: sm.accent, background: sm.background, text: sm.text }, sm.pair);
+      if (sg.logoDataUrl) {
+        try {
+          const [head, b64] = sg.logoDataUrl.split(",");
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const blob = new Blob([bytes], { type: (/^data:([^;]+)/.exec(head) || [])[1] || "image/png" });
+          logoChange = await compressBrandLogo(blob);
+          setLogo(logoChange);
+        } catch { $("#brand-err").textContent = "We couldn't use the logo from your website. Upload one below."; }
+      }
+      suggestOut.innerHTML = `<p class="sub">Suggestions applied below. Review the preview, then press Save.</p>`;
+    };
+  });
+  drawAdv();
+  refresh();
+}
+
 async function renderSettings(gen) {
   setTabs(true);
   shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card" id="drivers-card"><h2>Drivers</h2><p class="note">Add a driver by name. Type of vehicle and plate are optional. Then set that driver's sign-in passcode here. Drivers sign in with the company code, their name, and the passcode. Nothing is texted or emailed. Remove a driver to take them off the roster: they cannot sign in, upcoming rides become unassigned, and completed rides keep their name.</p><p class="sub" id="driver-code">Company code: loading…</p><form id="add-driver"><label>Name<input id="driver-name" maxlength="80" required autocomplete="off"></label><label>Type of vehicle<input id="driver-vehicle" maxlength="40" placeholder="SUV" autocomplete="off"></label><label>Plate number<input id="driver-plate" maxlength="12" placeholder="ABC1234" autocomplete="off" autocapitalize="characters"></label><p class="err" id="driver-err"></p><button class="btn full" type="submit">Add driver</button></form><div id="driver-list" class="muted">Loading drivers…</div></section>` : ""}<div id="box" class="muted">Loading…</div>`);
@@ -1568,11 +1993,16 @@ async function renderSettings(gen) {
   const s = result.data.settings;
   const bookingUrl = location.origin + (s.bookingPath || (s.bookingSlug ? "/book/" + s.bookingSlug : ""));
   const qrUrl = s.bookingSlug ? location.origin + "/book/" + encodeURIComponent(s.bookingSlug) + "/qr/" : "";
-  if (state.me.role === "owner") api("/api/billing").then((b) => {
+  if (state.me.role === "owner") Promise.all([api("/api/billing"), api("/api/trial")]).then(([b, tr]) => {
     const card = document.querySelector("#plan-card");
     if (!card || !b.data.ok) return;
     const x = b.data.billing;
-    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">See past invoices on Stripe's secure billing page (${x.livemode ? "live" : "test"} mode).</p>${portalButtonHtml(true)}` : ""}`;
+    const t = tr && tr.data.ok ? tr.data.trial : null;
+    const trialLine = t && t.auto && t.plan === "trial" && !t.canceledAt
+      ? `<p class="sub plan-trial" data-trial="open">Free trial: ${esc(t.ridesUsed)} of ${esc(t.rideLimit)} free rides used. After your ${esc(t.rideLimit)}th completed ride, Solo is ${esc(t.priceText)}, charged automatically to your card. No setup fee.</p>`
+      : t && t.auto && t.convertedAt ? `<p class="sub plan-trial" data-trial="converted">Solo · ${esc(t.priceText)}. Your free trial ended after ${esc(t.rideLimit)} rides.</p>`
+        : t && t.auto && t.canceledAt ? `<p class="sub plan-trial" data-trial="canceled">Free trial canceled. You were not charged.</p>` : "";
+    card.innerHTML = `<h2>Your plan</h2><p class="sub">${esc(x.planLabel)} · texting add-on ${x.smsAddon ? "on" : "off"}</p>${trialLine}${x.smsAddon ? `<p class="note">${esc(x.smsNote)}</p>` : ""}<p class="sub">To change your plan or texting, contact your Nudge Dispatch contact.</p>${x.canManageBilling ? `<p class="sub">See past invoices on Stripe's secure billing page (${x.livemode ? "live" : "test"} mode).</p>${portalButtonHtml(true)}` : ""}`;
     card.hidden = false;
   }).catch(() => {});
   box.innerHTML = `<section class="card" id="booking-card">
@@ -1588,9 +2018,14 @@ async function renderSettings(gen) {
     ${state.me.role === "owner" ? `<section class="card" id="card-card"><h2>Payment method</h2><p class="sub">Loading…</p></section>` : ""}
     <section class="card" id="export-card">
       <h2>Export</h2>
-      <p class="sub">Download your rides and clients as spreadsheet files (CSV). This works any time, including after a trial ends.</p>
+      <p class="sub">Download your rides and clients as spreadsheet files (CSV). This works any time, including after a trial ends or is canceled.</p>
       <div class="export-actions"><a class="btn ghost" href="/api/export/rides.csv" download>Rides (CSV)</a><a class="btn ghost" href="/api/export/clients.csv" download>Clients (CSV)</a></div>
     </section>
+    ${state.me.role === "owner" ? `<section class="card" id="brand-card">
+      <h2>Booking page brand</h2>
+      <p class="sub">Match your booking page to your website: logo, colors, and fonts.</p>
+      <a class="btn ghost full" id="brand-link" href="#/settings/brand">Edit brand</a>
+    </section>` : ""}
     <section class="card" id="rates-card">
       <h2>Rates &amp; instant quotes</h2>
       <p class="sub">Set your vehicles, per-mile and hourly rates, airport flat fares, and fees. Clients see an estimate on your booking page; you confirm the final price when you approve.</p>
@@ -1627,10 +2062,12 @@ async function renderSettings(gen) {
       <p class="err full" id="err"></p>
       <button class="btn full" type="submit">Save business details</button>
     </form>
+    ${state.me.role === "owner" ? `<section class="card" id="paypal-card" hidden></section>` : ""}
     <p class="note">Invoices are never sent by the app. Email and Text on an invoice open your own mail or messages app so you send it yourself.</p>
     <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
     <button class="btn ghost full" id="out" type="button">Sign out</button>`;
   if (state.me.role === "owner") loadPaymentCard(gen);
+  if (state.me.role === "owner") loadPayPalCard(gen);
   const presets = document.querySelector("#theme-presets");
   const themeInput = document.querySelector("#themeColor");
   const paintSettingsTheme = () => {
@@ -1747,12 +2184,14 @@ function blobToDataUrl(file) {
 
 function adminTrialText(t) {
   if (!t) return "";
-  if (t.state === "active") return "Paying customer · no trial limits";
+  if (t.state === "active" || t.state === "converted") return t.auto && t.convertedAt ? "Paying customer · converted from the 15-ride trial" : "Paying customer · no trial limits";
   if (t.state === "ended") {
-    const why = t.endedReason === "rides" ? t.ridesUsed + " rides completed" : t.endedReason === "days" ? "30 days passed" : "ended by you";
+    const why = t.endedReason === "rides" ? t.ridesUsed + " rides completed" : t.endedReason === "days" ? "time limit passed" : t.endedReason === "canceled" ? "canceled by the owner" : "ended by you";
     return "Free trial ended (" + why + ") · " + t.ridesUsed + " of " + t.rideLimit + " rides used";
   }
-  return "Free trial · " + t.ridesUsed + " of " + t.rideLimit + " rides used, " + (t.daysLeft <= 1 ? "last day" : t.daysLeft + " days left") + " (ends " + t.endsOn + ")";
+  const kind = t.auto ? "15-ride trial, card on file" : "Free trial";
+  const extra = t.state === "converting" ? " · converting to Solo" : "";
+  return kind + " · " + t.ridesUsed + " of " + t.rideLimit + " rides used" + (t.timeLimited ? ", " + (t.daysLeft <= 1 ? "last day" : t.daysLeft + " days left") + " (ends " + t.endsOn + ")" : "") + extra;
 }
 function adminTrialHtml(c) {
   if (!c) return "";
@@ -1762,14 +2201,16 @@ function adminTrialHtml(c) {
       <h3>Trial status</h3>
       <p class="trial-line">${esc(adminTrialText(t))}</p>
       <p class="sub">Booking page: ${t.open ? "open" : "paused (shows a call or email message)"}${c.waitingRequests ? " · " + esc(c.waitingRequests) + " waiting request" + (c.waitingRequests === 1 ? "" : "s") : ""}</p>
-      ${paying
+      ${paying || !t.open
         ? `<button class="btn ghost full" type="button" data-act="trial-back">Move back to free trial</button>
-           <p class="sub">Uses the current trial limits (${esc(t.rideLimit)} rides, ${esc(t.days)} days from the start). If they are already used up, the trial shows as ended; add rides or days below.</p>`
-        : `<button class="btn approve full" type="button" data-act="trial-active">Mark as paying customer</button>
-           <p class="sub">Lifts all trial limits right away and reopens the booking page. Rides, clients, and invoices all stay.</p>`}
+           <p class="sub">${paying
+             ? "Has paid before: goes back to a free trial with the current limit (" + esc(t.rideLimit) + " completed rides). If that is used up it shows as ended; add rides below. Never charges on its own after this. A live Stripe subscription must be canceled in Stripe first."
+             : "Never paid: starts a fresh free trial with 15 completed rides left from today. Nothing is charged."}</p>`
+        : ""}
+      <p class="sub">Paying status comes from Stripe: the account becomes a paying customer automatically after its 15th completed ride, or when its Stripe subscription is paid.</p>
       <div class="trial-extend">
         <label>Add rides<input name="addRides" inputmode="numeric" placeholder="0"></label>
-        <label>Add days<input name="addDays" inputmode="numeric" placeholder="0"></label>
+${t.timeLimited ? `        <label>Add days<input name="addDays" inputmode="numeric" placeholder="0"></label>` : ""}
       </div>
       <button class="btn ghost full" type="button" data-act="trial-extend">${paying ? "Save trial limits" : "Extend free trial"}</button>
       ${!paying && t.state !== "ended" ? `<button class="btn danger full" type="button" data-act="trial-end">End free trial now</button>` : ""}
@@ -1847,9 +2288,21 @@ async function renderAdmin(gen) {
     <section class="card" id="billing-status"><h2 id="billing-title">Billing (Stripe test mode)</h2><p class="sub" id="billing-line">Checking…</p>
       <button class="btn ghost full" type="button" id="sms-meter">Set up texting meter (one time)</button><p class="err" id="billing-msg"></p></section>
     <div id="accounts" class="muted">Loading…</div>
+    <section class="card" id="cancel-feedback"><h2>Cancellation feedback</h2><div id="cancel-feedback-list" class="muted">Loading…</div></section>
     <h2>Audit</h2>
     <div id="audit" class="muted">Loading…</div>`);
   document.querySelector("#out").onclick = () => signOut();
+  api("/api/platform/cancellation-feedback").then((f) => {
+    const list = document.querySelector("#cancel-feedback-list");
+    if (!list) return;
+    list.className = "";
+    if (!f.data.ok) { list.innerHTML = `<p class="err">${esc(f.data.error || "Could not load feedback.")}</p>`; return; }
+    list.innerHTML = f.data.feedback.length ? f.data.feedback.map((x) => `<div class="feedback-row" data-feedback="${esc(x.id)}">
+        <p class="sub"><strong>${esc(x.companyName || x.companyId)}</strong> · ${esc(when(x.createdAt))} · ${esc(x.ridesUsed)} rides used · ${esc(x.plan)}</p>
+        <p class="sub">${x.reasonLabels.length ? esc(x.reasonLabels.join(", ")) : "Skipped the survey"}</p>
+        ${x.details ? `<p class="note">“${esc(x.details)}”</p>` : ""}
+      </div>`).join("") : `<p class="sub">No cancellations yet.</p>`;
+  }).catch(() => {});
   api("/api/platform/billing").then((b) => {
     const line = document.querySelector("#billing-line");
     const title = document.querySelector("#billing-title");
@@ -1891,12 +2344,13 @@ async function renderAdmin(gen) {
         <button class="btn ghost" type="button" data-act="edit">Edit name and plan</button>
         <button class="btn ${account.status === "suspended" ? "" : "danger"}" type="button" data-act="${account.status === "suspended" ? "reactivate" : "suspend"}">${account.status === "suspended" ? "Reactivate" : "Suspend"}</button>
         <button class="btn ghost" type="button" data-act="reset">Password reset link</button>
+        <a class="btn ghost" href="#/admin/brand/${esc(account.id)}">Booking page brand</a>
       </div>
       <div class="once" aria-live="polite"></div>
       ${adminTrialHtml(trialById[account.id])}
       ${adminBillingHtml(account.billing, listed.data.stripeTestMode)}
     </article>`).join("") : `<p>No customer accounts yet.</p>`;
-  if (trials.data.ok) accounts.insertAdjacentHTML("afterbegin", `<p class="sub" id="beta-spots">Beta spots: ${esc(trials.data.betaSpots.onTrial)} of ${esc(trials.data.betaSpots.limit)} on a free trial now.</p>`);
+  if (trials.data.ok) accounts.insertAdjacentHTML("afterbegin", `<p class="sub" id="trial-count">Free trials: ${esc(trials.data.trials.onTrial)} on a ${esc(trials.data.trials.rideLimit)}-ride trial now.</p>`);
   auditBox.innerHTML = audit.data.ok && audit.data.audit.length ? audit.data.audit.map((row) => {
     let detail = "";
     try { detail = Object.entries(JSON.parse(row.detail || "{}")).map(([key, value]) => `${key} ${value}`).join(" · "); } catch { detail = ""; }
@@ -1978,12 +2432,12 @@ async function renderAdmin(gen) {
       const box = card.querySelector(".trial-admin");
       const msg = box.querySelector(".trial-msg");
       let body = null;
-      if (act === "trial-active") body = { status: "active" };
-      else if (act === "trial-back") body = { status: "trial" };
+      if (act === "trial-back") { if (!confirm("Move this account back to the free trial?")) return; body = { moveBack: true }; }
       else if (act === "trial-end") body = { status: "ended" };
       else if (act === "trial-extend") {
         const addRides = box.querySelector("[name=addRides]").value.trim();
-        const addDays = box.querySelector("[name=addDays]").value.trim();
+        const daysInput = box.querySelector("[name=addDays]");
+        const addDays = daysInput ? daysInput.value.trim() : "";
         body = { addRides: addRides ? Number(addRides) : 0, addDays: addDays ? Number(addDays) : 0 };
       }
       const result = await api("/api/platform/companies/" + id + "/trial", { method: "POST", body });
@@ -2712,6 +3166,125 @@ async function renderOccurrenceEdit(scheduleId, date, gen) {
   };
 }
 
+// Profile & account (gear icon in the header). Owners only. Reuses GET/PUT /api/settings for business details.
+// It holds the only cancel entry point: a quiet "Cancel" link.
+const TERMS_URL = "https://nudgedispatch.com/terms.html";
+const PRIVACY_URL = "https://nudgedispatch.com/privacy.html";
+function paintGear() {
+  const gear = document.querySelector("#gear");
+  if (!gear) return;
+  const show = !!(state.me && state.me.role === "owner" && !state.me.platformAdmin && !billingLocked());
+  gear.classList.toggle("hidden", !show);
+  gear.classList.toggle("on", show && routeName().name === "profile");
+}
+async function renderProfile(gen) {
+  if (!state.me || state.me.role !== "owner") { location.hash = "#/rides"; return; }
+  setTabs(true);
+  shell(`<h1>Profile &amp; account</h1><div id="profile-box" class="muted">Loading…</div>`);
+  const [settings, trial] = await Promise.all([api("/api/settings"), api("/api/trial")]);
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#profile-box");
+  if (!box) return;
+  box.className = "";
+  if (!settings.data.ok) { box.innerHTML = `<p class="err">${esc(settings.data.error || "Could not load your account.")}</p>`; return; }
+  const s = settings.data.settings;
+  const t = trial.data.ok ? trial.data.trial : null;
+  const planLine = !t ? "" : t.auto && t.plan === "trial" && !t.canceledAt
+    ? `Solo free trial · ${esc(t.ridesUsed)} of ${esc(t.rideLimit)} free rides used. Then ${esc(t.priceText)}, charged automatically to your card.`
+    : t.auto && t.convertedAt ? `Solo · ${esc(t.priceText)}` : "";
+  box.innerHTML = `<section class="card" id="profile-account">
+      <h2>Account</h2>
+      <p class="sub">Sign-in email</p><p class="profile-value" id="profile-email">${esc(state.me.email || "")}</p>
+      <p class="sub">Company code</p><p class="profile-value">${esc(s.bookingSlug || "")}</p>
+      ${planLine ? `<p class="sub">Plan</p><p class="profile-value" id="profile-plan">${planLine}</p>` : ""}
+      <p class="sub">To change your sign-in email, email <a href="mailto:nudgedispatch@gmail.com">nudgedispatch@gmail.com</a>.</p>
+    </section>
+    <form class="card" id="profile-form">
+      <h2>Business details</h2>
+      <p class="sub">Shown on your booking page and invoices.</p>
+      <label>Company name<input id="pf-name" maxlength="80" autocomplete="organization" value="${esc(s.businessName || "")}"></label>
+      <label>Phone<input id="pf-phone" type="tel" maxlength="40" autocomplete="tel" inputmode="tel" value="${esc(s.phone || "")}"></label>
+      <label>Email<input id="pf-email" type="email" maxlength="120" autocomplete="email" inputmode="email" value="${esc(s.email || "")}"></label>
+      <label>Address<input id="pf-address" maxlength="200" autocomplete="street-address" value="${esc(s.address || "")}"></label>
+      <label>Website<input id="pf-website" type="url" maxlength="120" inputmode="url" value="${esc(s.website || "")}"></label>
+      <p class="err" id="pf-msg"></p>
+      <button class="btn full" type="submit">Save</button>
+    </form>
+    <p class="profile-legal"><a href="${TERMS_URL}" target="_blank" rel="noopener">Terms of Service</a> · <a href="${PRIVACY_URL}" target="_blank" rel="noopener">Privacy Policy</a></p>
+    ${t && t.canCancelAccount ? `<p class="profile-cancel"><a href="#/profile/cancel" id="profile-cancel-link">Cancel</a></p>` : ""}`;
+  document.querySelector("#profile-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const msg = document.querySelector("#pf-msg");
+    const body = {
+      businessName: document.querySelector("#pf-name").value,
+      phone: document.querySelector("#pf-phone").value,
+      email: document.querySelector("#pf-email").value,
+      address: document.querySelector("#pf-address").value,
+      website: document.querySelector("#pf-website").value
+    };
+    const r = await api("/api/settings", { method: "PUT", body });
+    if (!r.data.ok) { msg.style.color = ""; msg.textContent = r.data.error || "Could not save."; return; }
+    msg.style.color = "var(--green)";
+    msg.textContent = "Saved.";
+  };
+}
+
+// Cancel (Profile & account > Cancel). Reason questionnaire first; nothing is final until Submit or Skip.
+async function renderCancelTrial(gen) {
+  if (!state.me || state.me.role !== "owner") { location.hash = "#/rides"; return; }
+  setTabs(true);
+  shell(`<h1>Cancel your account</h1><div id="cancel-box" class="muted">Loading…</div>`);
+  const r = await api("/api/trial");
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#cancel-box");
+  if (!box) return;
+  const t = r.data.ok ? r.data.trial : null;
+  box.className = "";
+  if (!t || !t.canCancelAccount) {
+    box.innerHTML = `<section class="card"><p class="sub">There is nothing to cancel on this account.</p><a class="btn ghost full linkbtn-block" href="#/profile">Back to Profile &amp; account</a></section>`;
+    return;
+  }
+  const paid = t.cancelKind === "paid";
+  const reasons = r.data.cancelReasons || [];
+  const what = paid
+    ? `<p class="sub">Your Solo subscription is canceled right away and you won't be charged again. There's no refund for the current month.</p>`
+    : `<p class="sub">You've used ${esc(t.ridesUsed)} of ${esc(t.rideLimit)} free rides. If you cancel now, your card won't be charged.</p>
+       <p class="sub">Your account closes right away: your booking page and new rides stop, and any free rides you haven't used are lost. Your rides, clients, and invoices stay readable, and you can export them.</p>`;
+  box.innerHTML = `<section class="card cancel-trial" id="cancel-card">
+      ${what}
+      <fieldset class="cancel-reasons"><legend>Why are you canceling?</legend>
+        ${reasons.map(([k, label]) => `<label class="terms-check"><input type="checkbox" name="reason" value="${esc(k)}"> <span>${esc(label)}</span></label>`).join("")}
+      </fieldset>
+      <label class="full">Tell us more (optional)<textarea id="cancel-details" maxlength="1000" rows="3"></textarea></label>
+      <p class="err" id="cancel-err"></p>
+      <div class="cancel-actions">
+        <button class="btn danger full" type="button" id="cancel-submit">Submit and cancel</button>
+        <button class="btn ghost full" type="button" id="cancel-skip">Skip and cancel</button>
+      </div>
+      <p class="sub"><a href="#/profile">Keep my account</a></p>
+    </section>`;
+  const go = async (skip) => {
+    const err = document.querySelector("#cancel-err");
+    const buttons = box.querySelectorAll("button");
+    buttons.forEach((b) => { b.disabled = true; });
+    const chosen = skip ? [] : [...box.querySelectorAll('input[name="reason"]:checked')].map((i) => i.value);
+    const details = skip ? "" : (document.querySelector("#cancel-details").value || "");
+    const res = await api("/api/account/cancel", { method: "POST", body: { confirm: true, skip, reasons: chosen, details } });
+    if (!res.data.ok) { if (err) err.textContent = res.data.error || "Could not cancel. Try again."; buttons.forEach((b) => { b.disabled = false; }); return; }
+    const until = res.data.accessUntil ? new Date(res.data.accessUntil).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric" }) : "";
+    shell(`<h1>Your account is cancelled</h1>
+      <section class="card" id="cancel-done">
+        <p class="sub">${res.data.kind === "paid" ? `Your Solo subscription is cancelled. You won't be charged again.${until ? ` You can keep using Nudge until ${esc(until)}.` : ""}` : "Your free trial is cancelled and your card was not charged. Your booking page is off."}</p>
+        <p class="sub">Your rides, clients, and invoices are kept. You can export them from More.</p>
+        <p class="sub">To come back, email <a href="mailto:nudgedispatch@gmail.com">nudgedispatch@gmail.com</a>.</p>
+        <a class="btn ghost full linkbtn-block" href="#/settings">Export my data</a>
+      </section>`);
+    window.scrollTo(0, 0);
+  };
+  document.querySelector("#cancel-submit").onclick = () => go(false);
+  document.querySelector("#cancel-skip").onclick = () => go(true);
+}
+
 async function renderWelcome(gen) {
   if (!state.me || state.me.role !== "owner") {
     location.hash = state.me ? "#/rides" : "#/login";
@@ -2763,6 +3336,7 @@ async function route() {
   const gen = ++renderGen;
   const { name, id } = routeName();
   setTag();
+  paintGear();
   if (name === "where" && id) return renderWhere(id, gen);
   if (state.me && state.me.platformAdmin && name !== "admin" && name !== "login" && name !== "start") {
     location.hash = "#/admin";
@@ -2773,6 +3347,8 @@ async function route() {
       location.hash = state.me ? "#/rides" : "#/login";
       return;
     }
+    const adminParts = routeName().parts;
+    if (id === "brand" && /^[0-9a-f-]{36}$/.test(adminParts[2] || "")) return renderBrandSettings(gen, adminParts[2]);
     return renderAdmin(gen);
   }
   if (billingLocked() && name !== "login" && name !== "start" && name !== "welcome") return renderLocked();
@@ -2795,6 +3371,9 @@ async function route() {
   if (name === "rides" && id) return renderRide(id, gen);
   if (name === "invoices" && id) return renderInvoice(id, gen);
   if (name === "settings" && id === "rates") return renderRateSheet(gen);
+  if (name === "settings" && id === "brand") return renderBrandSettings(gen);
+  if (name === "profile" && id === "cancel") return renderCancelTrial(gen);
+  if (name === "profile") return renderProfile(gen);
   if (name === "settings") return renderSettings(gen);
   return renderRides(gen);
 }

@@ -1471,7 +1471,7 @@ async function publicBookingCompany(env, slug) {
   if (typeof slug !== "string" || !BOOKING_SLUG_RE.test(slug)) return null;
   const row = await env.DB.prepare(
     `SELECT c.id, c.status, c.name, c.booking_slug, c.created_at, c.trial_status, c.trial_started_at, c.trial_ride_limit,
-            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.theme_color, s.phone AS contact_phone, s.email AS contact_email
+            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.theme_color, s.brand_json, s.phone AS contact_phone, s.email AS contact_email
      FROM companies c
      LEFT JOIN invoice_settings s ON s.company_id = c.id
      WHERE c.booking_slug = ?`
@@ -1485,21 +1485,70 @@ function publicCompanyName(row) {
 }
 __name(publicCompanyName, "publicCompanyName");
 
-// ---- Free trial (draft, Nov 10, 2026): 15 completed rides or 30 days, whichever comes first ----
-var TRIAL_COLS = "c.id, c.created_at, c.trial_status, c.trial_started_at, c.trial_ride_limit, c.trial_days, c.trial_ended_at, c.trial_end_reason";
+// ---- Free trial: 15 completed rides, no time expiry (Jesse, Nov 17, 2026) ----
+// Self-serve signups (trial_billing = 'auto') convert to paid Solo automatically at the 15th completed ride.
+var TRIAL_COLS = "c.id, c.created_at, c.trial_status, c.trial_started_at, c.trial_ride_limit, c.trial_days, c.trial_ended_at, c.trial_end_reason, c.trial_billing, c.trial_converted_at, c.trial_canceled_at, c.trial_notice_dismissed_at, c.stripe_subscription_id, c.billing_plan, c.billing_status, c.billing_paid_through";
+var TRIAL_CONVERT_RETRY_MS = 5 * 60 * 1000;
+async function completedRides(env, companyId) {
+  // A "ride" = status 'completed'. Requests, drafts, declined and cancelled rides never count.
+  return count(env, "SELECT COUNT(*) AS n FROM rides WHERE company_id = ? AND status = 'completed'", companyId);
+}
+__name(completedRides, "completedRides");
 async function companyTrial(env, companyId, row) {
-  const company = row && row.trial_status !== void 0 ? row : await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(companyId).first();
+  const company = row && row.trial_billing !== void 0 ? row : await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(companyId).first();
   if (!company) return null;
-  const completed = await count(env, "SELECT COUNT(*) AS n FROM rides WHERE company_id = ? AND status = 'completed'", companyId);
+  const completed = await completedRides(env, companyId);
   const now = Date.now();
-  const t = trialState(company, completed, now);
+  let t = trialState(company, completed, now);
   if (t.newlyEnded) {
     // Record the end once, so undoing a drop-off later does not quietly reopen the trial.
     await env.DB.prepare("UPDATE companies SET trial_status = 'ended', trial_ended_at = ?, trial_end_reason = ? WHERE id = ? AND trial_status = 'trial'").bind(now, t.endedReason, companyId).run();
   }
+  if (t.needsConversion) {
+    const converted = await convertTrial(env, companyId, now);
+    if (converted) {
+      const fresh = await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(companyId).first();
+      if (fresh) t = trialState(fresh, completed, Date.now());
+    }
+  }
   return t;
 }
 __name(companyTrial, "companyTrial");
+// Ends the Stripe trial (trial_end=now) exactly once: a conditional claim in D1 plus a Stripe idempotency key.
+// No prompt, no opt-in. If Stripe is unreachable the claim is released and the next check retries.
+// If the card is declined, Stripe marks the subscription past_due and invoice.payment_failed starts the grace period.
+async function convertTrial(env, companyId, now = Date.now()) {
+  const claim = await env.DB.prepare(
+    `UPDATE companies SET trial_convert_claimed_at = ?
+     WHERE id = ? AND trial_billing = 'auto' AND trial_status = 'trial' AND trial_converted_at IS NULL AND trial_canceled_at IS NULL
+       AND stripe_subscription_id IS NOT NULL AND (trial_convert_claimed_at IS NULL OR trial_convert_claimed_at < ?)`
+  ).bind(now, companyId, now - TRIAL_CONVERT_RETRY_MS).run();
+  if (!claim.meta.changes) return false;
+  const row = await env.DB.prepare("SELECT stripe_subscription_id FROM companies WHERE id = ?").bind(companyId).first();
+  let sub;
+  try {
+    sub = await stripe(env, "POST", "/v1/subscriptions/" + encodeURIComponent(row.stripe_subscription_id), { trial_end: "now", proration_behavior: "none" }, "nudge-trial-convert-" + companyId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 300) : "error";
+    await env.DB.prepare("UPDATE companies SET trial_convert_claimed_at = NULL, trial_convert_error = ? WHERE id = ? AND trial_converted_at IS NULL").bind(message, companyId).run();
+    console.log(JSON.stringify({ level: "warn", msg: "trial conversion failed", companyId, error: message }));
+    return false;
+  }
+  const done = await env.DB.prepare(
+    `UPDATE companies SET trial_converted_at = ?, trial_status = 'active', trial_ended_at = NULL, trial_end_reason = '', trial_convert_error = '',
+       billing_paid_through = COALESCE(?, billing_paid_through) WHERE id = ? AND trial_converted_at IS NULL`
+  ).bind(Date.now(), subPeriodEndMs(sub), companyId).run();
+  if (done.meta.changes) await writeAudit(env, "system", "trial.converted", "company", companyId, { rides: TRIAL_RIDE_LIMIT });
+  return true;
+}
+__name(convertTrial, "convertTrial");
+// End of the first paid month after conversion. Replaces any paid-through date recorded from the trial period.
+function subPeriodEndMs(sub) {
+  const item = sub && sub.items && Array.isArray(sub.items.data) ? sub.items.data[0] : null;
+  const end = Number(item && item.current_period_end || sub && sub.current_period_end || 0);
+  return end > 0 ? end * 1000 : null;
+}
+__name(subPeriodEndMs, "subPeriodEndMs");
 function trialBlocked() {
   return json({ ok: false, error: trialBlockedMessage(), trialEnded: true }, 403);
 }
@@ -1529,11 +1578,146 @@ async function getTrial(request, env) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;
   if (user.role !== "owner") return json({ ok: true, trial: null, banner: null });
-  const t = await companyTrial(env, user.companyId);
-  if (!t) return fail(404, "Company not found.");
-  return json({ ok: true, trial: trialJson(t), banner: trialBanner(t) });
+  const company = await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(user.companyId).first();
+  if (!company) return fail(404, "Company not found.");
+  const t = await companyTrial(env, user.companyId, company);
+  const fresh = await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(user.companyId).first();
+  return json({ ok: true, trial: trialJson(t, fresh || company), banner: trialBanner(t), cancelReasons: CANCEL_REASONS });
 }
 __name(getTrial, "getTrial");
+// Informational ride-15 notice: dismiss only, no choices.
+async function dismissTrialNotice(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  await env.DB.prepare("UPDATE companies SET trial_notice_dismissed_at = COALESCE(trial_notice_dismissed_at, ?) WHERE id = ? AND trial_converted_at IS NOT NULL").bind(Date.now(), user.companyId).run();
+  return json({ ok: true });
+}
+__name(dismissTrialNotice, "dismissTrialNotice");
+// Cancel a self-serve trial from More > Your plan (exit survey screen). Before the 15th ride: never charged.
+// The Stripe subscription is canceled immediately with no proration and no final invoice.
+async function cancelTrial(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  if (body.confirm !== true) return fail(400, "Confirm to cancel the trial.");
+  const feedback = cancelFeedback(body);
+  if (feedback.error) return fail(400, feedback.error);
+  const company = await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(user.companyId).first();
+  if (!company) return fail(404, "Company not found.");
+  // Refresh first: a 15th ride may have just converted the trial.
+  await companyTrial(env, user.companyId, company);
+  const current = await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(user.companyId).first();
+  if (current && canCancelPaid(current)) return cancelPaidSolo(env, user, current, feedback);
+  if (!canCancelTrial(current)) return fail(409, "There is nothing to cancel on this account.");
+  const now = Date.now();
+  // Claim the cancel first so a ride completed at the same moment cannot convert the trial.
+  const mode = TRIAL_CANCEL_MODE;
+  const cols = trialCancelColumns(now);
+  const claimed = await env.DB.prepare(
+    `UPDATE companies SET trial_canceled_at = ?, trial_status = ?, trial_ended_at = ?, trial_end_reason = ?
+     WHERE id = ? AND trial_billing = 'auto' AND trial_converted_at IS NULL AND trial_canceled_at IS NULL
+       AND (trial_convert_claimed_at IS NULL OR trial_convert_claimed_at < ?)`
+  ).bind(cols.trial_canceled_at, cols.trial_status, cols.trial_ended_at, cols.trial_end_reason, user.companyId, now - TRIAL_CONVERT_RETRY_MS).run();
+  if (!claimed.meta.changes) return fail(409, "Your Solo plan is starting right now. Refresh in a moment, or email nudgedispatch@gmail.com.");
+  try {
+    await stripe(env, "DELETE", "/v1/subscriptions/" + encodeURIComponent(current.stripe_subscription_id), { invoice_now: false, prorate: false });
+  } catch (error) {
+    const gone = error instanceof StripeError && error.status === 404;
+    if (!gone) {
+      // Put the trial back so nothing is half-done, and let the owner try again.
+      await env.DB.prepare("UPDATE companies SET trial_canceled_at = NULL, trial_status = 'trial', trial_ended_at = NULL, trial_end_reason = '' WHERE id = ? AND trial_canceled_at = ?").bind(user.companyId, now).run();
+      return stripeFail(env, error);
+    }
+  }
+  await env.DB.prepare("UPDATE companies SET billing_status = 'canceled', billing_event_at = ?, billing_updated_at = ? WHERE id = ?").bind(now, now, user.companyId).run();
+  const ridesUsed = await completedRides(env, user.companyId);
+  const feedbackId = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO cancellation_feedback (id, company_id, plan, rides_used, reasons, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).bind(feedbackId, user.companyId, (current.billing_plan || "solo") + "-trial", ridesUsed, feedback.reasons ? JSON.stringify(feedback.reasons) : null, feedback.details, now).run();
+  await writeAudit(env, user.userId, "trial.canceled", "company", user.companyId, { mode, ridesUsed, skipped: feedback.skipped });
+  try {
+    await notifyCancellation(env, { companyId: user.companyId, ridesUsed, reasons: feedback.reasons, details: feedback.details, mode });
+  } catch (error) {
+    console.log(JSON.stringify({ level: "warn", msg: "cancel notify", name: error instanceof Error ? error.name : "Error" }));
+  }
+  const t = await companyTrial(env, user.companyId);
+  return json({ ok: true, canceled: true, kind: "trial", charged: false, mode, trial: t ? trialJson(t) : null, banner: t ? trialBanner(t) : null });
+}
+__name(cancelTrial, "cancelTrial");
+// Paid Solo (after the 15th ride): cancel the Stripe subscription now with no proration and no final invoice,
+// so there are no further charges. No refund for the current month; access runs to the paid-through date
+// (the existing "ending" billing banner), then the account locks with data kept.
+async function cancelPaidSolo(env, user, current, feedback) {
+  const now = Date.now();
+  try {
+    await stripe(env, "DELETE", "/v1/subscriptions/" + encodeURIComponent(current.stripe_subscription_id), { invoice_now: false, prorate: false });
+  } catch (error) {
+    if (!(error instanceof StripeError && error.status === 404)) return stripeFail(env, error);
+  }
+  await env.DB.prepare("UPDATE companies SET billing_status = 'canceled', billing_event_at = ?, billing_updated_at = ? WHERE id = ?").bind(now, now, user.companyId).run();
+  const ridesUsed = await completedRides(env, user.companyId);
+  await env.DB.prepare(
+    "INSERT INTO cancellation_feedback (id, company_id, plan, rides_used, reasons, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).bind(crypto.randomUUID(), user.companyId, current.billing_plan || "solo", ridesUsed, feedback.reasons ? JSON.stringify(feedback.reasons) : null, feedback.details, now).run();
+  await writeAudit(env, user.userId, "plan.canceled", "company", user.companyId, { ridesUsed, skipped: feedback.skipped });
+  try {
+    await notifyCancellation(env, { companyId: user.companyId, ridesUsed, reasons: feedback.reasons, details: feedback.details, mode: "paid" });
+  } catch (error) {
+    console.log(JSON.stringify({ level: "warn", msg: "cancel notify", name: error instanceof Error ? error.name : "Error" }));
+  }
+  const until = Number(current.billing_paid_through) > now ? Number(current.billing_paid_through) : null;
+  return json({ ok: true, canceled: true, kind: "paid", charged: false, accessUntil: until });
+}
+__name(cancelPaidSolo, "cancelPaidSolo");
+// Email to nudgedispatch@gmail.com when an account is canceled (Jesse approved, Nov 17, 2026).
+// Sends only when CANCEL_NOTIFY = "on" AND the RESEND_API_KEY secret is set; otherwise a no-op.
+// From: CANCEL_NOTIFY_FROM, or Resend's shared test sender until nudgedispatch.com is verified in Resend
+// (that sender only delivers to the Resend account owner's own address, which is this notice's recipient).
+// Fails soft: a Resend error is logged (status only) and never breaks the cancel.
+var RESEND_TEST_FROM = "Nudge Dispatch <onboarding@resend.dev>";
+async function notifyCancellation(env, info) {
+  if (!env || env.CANCEL_NOTIFY !== "on" || !env.RESEND_API_KEY) return { sent: false };
+  const to = (env.CANCEL_NOTIFY_TO || "nudgedispatch@gmail.com").trim();
+  const from = (env.CANCEL_NOTIFY_FROM || "").trim() || RESEND_TEST_FROM;
+  const company = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(info.companyId).first();
+  const text = [
+    info.mode === "paid" ? "A paid Solo subscription was canceled." : "A free trial was canceled.",
+    "Company: " + (company && company.name || info.companyId),
+    "Rides used: " + info.ridesUsed + " of " + TRIAL_RIDE_LIMIT,
+    "Reasons: " + (info.reasons ? info.reasons.join(", ") : "(skipped)"),
+    "Comment: " + (info.details || "(none)")
+  ].join("\n");
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { authorization: "Bearer " + env.RESEND_API_KEY, "content-type": "application/json" },
+    body: JSON.stringify({ from, to: [to], subject: info.mode === "paid" ? "Nudge Dispatch subscription canceled" : "Nudge Dispatch trial canceled", text })
+  });
+  if (!res.ok) console.log(JSON.stringify({ level: "warn", msg: "cancel notify not sent", status: res.status, testSender: from === RESEND_TEST_FROM }));
+  return { sent: res.ok };
+}
+__name(notifyCancellation, "notifyCancellation");
+async function platformCancellationFeedback(request, env) {
+  const user = await platformUser(request, env, false);
+  if (isResponse(user)) return user;
+  const rows = await env.DB.prepare(
+    `SELECT f.id, f.company_id, f.plan, f.rides_used, f.reasons, f.details, f.created_at, c.name AS company_name
+     FROM cancellation_feedback f LEFT JOIN companies c ON c.id = f.company_id ORDER BY f.created_at DESC LIMIT 200`
+  ).all();
+  const labels = Object.fromEntries(CANCEL_REASONS);
+  const feedback = (rows.results || []).map((r) => {
+    let reasons = null;
+    try { reasons = r.reasons ? JSON.parse(r.reasons) : null; } catch { reasons = null; }
+    return { id: r.id, companyId: r.company_id, companyName: r.company_name || "", plan: r.plan, ridesUsed: r.rides_used, reasons, reasonLabels: reasons ? reasons.map((k) => labels[k] || k) : [], details: r.details || "", createdAt: r.created_at };
+  });
+  return json({ ok: true, feedback });
+}
+__name(platformCancellationFeedback, "platformCancellationFeedback");
 async function loadBookingSettings(env, companyId) {
   let row = null;
   try {
@@ -2500,27 +2684,34 @@ async function startSignup(request, env) {
   }
   try {
     const L = LOOKUP[PUBLIC_BILLING_PLAN];
+    // Check the Solo price exists before sending anyone to Stripe, so the trial can always convert.
     const prices = await pricesByLookup(env, [L.base]);
-    const { params, built } = checkoutParams({
+    if (!prices[L.base]) {
+      await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
+      return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing prices: " + L.base + ".");
+    }
+    const customer = await stripe(env, "POST", "/v1/customers", {
+      email, name: ownerName || companyName, phone: ownerPhone || void 0,
+      metadata: { app: "nudge-dispatch", purpose: "signup", signup_id: signupId, slug, company: companyName }
+    }, "nudge-signup-cus-" + signupId);
+    if (!customer || typeof customer.id !== "string") {
+      await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
+      return fail(502, "Stripe did not create the customer.");
+    }
+    const { params } = checkoutParams({
       origin: new URL(request.url).origin,
-      customerEmail: email,
+      customerId: customer.id,
       signupId,
       slug,
-      sms: false,
-      prices,
       pmc: env.STRIPE_CARD_PAYMENT_CONFIGURATION || "",
       excludedTypes: CARD_SETUP_EXCLUDED_TYPES
     });
-    if (built.missing.length) {
-      await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
-      return fail(409, "Stripe " + stripeModeWord(env) + " catalog is missing prices: " + built.missing.join(", ") + ".");
-    }
     const session = await stripe(env, "POST", "/v1/checkout/sessions", params, "nudge-signup-" + signupId);
     if (!session.url || !/^https:\/\/checkout\.stripe\.com\//.test(session.url)) {
       await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
-      return fail(502, "Stripe did not return a payment page.");
+      return fail(502, "Stripe did not return a card page.");
     }
-    await env.DB.prepare("UPDATE signups SET stripe_checkout_session_id = ? WHERE id = ?").bind(session.id, signupId).run();
+    await env.DB.prepare("UPDATE signups SET stripe_checkout_session_id = ?, stripe_customer_id = ? WHERE id = ?").bind(session.id, customer.id, signupId).run();
     return json({ ok: true, url: session.url }, 201);
   } catch (error) {
     await env.DB.prepare("UPDATE signups SET status = 'abandoned' WHERE id = ?").bind(signupId).run();
@@ -2534,10 +2725,24 @@ async function fulfillSignup(env, session, signup) {
   if (problem) return { companyId: signup.company_id || null, result: "ignored: " + problem, error: problem };
   const now = Date.now();
   const customerId = typeof session.customer === "string" ? session.customer : session.customer && session.customer.id;
-  const subRef = session.subscription;
-  const sub = subRef && typeof subRef === "object" ? subRef : (typeof subRef === "string" ? await stripe(env, "GET", "/v1/subscriptions/" + encodeURIComponent(subRef), { expand: ["default_payment_method"] }) : null);
-  const subscriptionId = sub && sub.id || (typeof subRef === "string" ? subRef : "");
-  if (!customerId || !subscriptionId) return { companyId: null, result: "ignored: missing customer or subscription", error: "Stripe did not finish the subscription. Try again." };
+  if (!customerId) return { companyId: null, result: "ignored: missing customer", error: "Stripe did not save the card. Try again." };
+  // Card saved in setup mode (not charged). Cards only.
+  const si = session.setup_intent && typeof session.setup_intent === "object"
+    ? session.setup_intent
+    : typeof session.setup_intent === "string" ? await stripe(env, "GET", "/v1/setup_intents/" + encodeURIComponent(session.setup_intent), { expand: ["payment_method"] }) : null;
+  const pmRef = si && si.payment_method;
+  const pm = pmRef && typeof pmRef === "object" ? pmRef : typeof pmRef === "string" ? await stripe(env, "GET", "/v1/payment_methods/" + encodeURIComponent(pmRef)) : null;
+  if (!pm || !isCardPaymentMethod(pm)) return { companyId: null, result: "ignored: not a card", error: NOT_A_CARD };
+  await stripe(env, "POST", "/v1/customers/" + encodeURIComponent(customerId), { invoice_settings: { default_payment_method: pm.id } }, "nudge-signup-cusdefault-" + signup.id);
+  const prices = await pricesByLookup(env, [LOOKUP[PUBLIC_BILLING_PLAN].base]);
+  const priceId = prices[LOOKUP[PUBLIC_BILLING_PLAN].base];
+  if (!priceId) return { companyId: null, result: "ignored: missing Solo price", error: "Billing is not available right now. Email nudgedispatch@gmail.com." };
+  // Idempotent per signup: the return page and the webhook may both get here.
+  const sub = await stripe(env, "POST", "/v1/subscriptions", trialSubscriptionParams({
+    customerId, priceId, paymentMethodId: pm.id, signupId: signup.id, slug: signup.booking_slug, nowMs: now
+  }), "nudge-signup-sub-" + signup.id);
+  const subscriptionId = sub && sub.id || "";
+  if (!subscriptionId) return { companyId: null, result: "ignored: missing subscription", error: "Stripe did not start the trial. Try again." };
   const companyId = crypto.randomUUID();
   const userId = crypto.randomUUID();
   const kind = kindForPlan(PUBLIC_BILLING_PLAN);
@@ -2546,11 +2751,11 @@ async function fulfillSignup(env, session, signup) {
   try {
     await env.DB.batch([
       env.DB.prepare(
-        `INSERT INTO companies (id, name, created_at, kind, status, booking_slug, trial_status, trial_started_at, billing_plan,
+        `INSERT INTO companies (id, name, created_at, kind, status, booking_slug, trial_status, trial_started_at, trial_ride_limit, trial_days, trial_billing, billing_plan,
            sms_addon_enabled, sms_addon_updated_at, setup_fee, signup_id, terms_accepted_at, terms_version,
            stripe_customer_id, stripe_subscription_id, stripe_livemode, billing_status, billing_updated_at, billing_past_due_at)
-         VALUES (?, ?, ?, ?, 'active', ?, 'active', ?, ?, 0, ?, 'charge', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
-      ).bind(companyId, signup.company_name || "My car service", now, kind, signup.booking_slug, now, PUBLIC_BILLING_PLAN, now,
+         VALUES (?, ?, ?, ?, 'active', ?, 'trial', ?, ?, ?, 'auto', ?, 0, ?, 'charge', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ).bind(companyId, signup.company_name || "My car service", now, kind, signup.booking_slug, now, TRIAL_RIDE_LIMIT, TRIAL_TIME_LIMIT_DAYS, PUBLIC_BILLING_PLAN, now,
         signup.id, signup.terms_accepted_at || now, signup.terms_version || SIGNUP_TERMS_VERSION,
         customerId, subscriptionId, liveFlag, billingStatus, now),
       env.DB.prepare(
@@ -2577,12 +2782,12 @@ async function fulfillSignup(env, session, signup) {
   await env.DB.prepare(
     "UPDATE signups SET status = 'complete', company_id = ?, stripe_customer_id = ?, stripe_subscription_id = ?, completed_at = ? WHERE id = ? AND status = 'pending'"
   ).bind(companyId, customerId, subscriptionId, now, signup.id).run();
-  const row = await billingRow(env, companyId);
-  const pm = sub && sub.default_payment_method;
-  if (row && pm) {
-    try { await useCardForCompany(env, row, pm); } catch { /* card summary is best-effort; subscription already started */ }
+  // Card summary (brand + last 4 only) for More > Payment method. Already the customer's default.
+  const summary = cardSummary(pm);
+  if (summary) {
+    try { await saveCardSummary(env, companyId, summary); } catch { /* best-effort; trial already started */ }
   }
-  return { companyId, userId, result: "signup fulfilled" };
+  return { companyId, userId, result: "signup fulfilled (15-ride trial)" };
 }
 __name(fulfillSignup, "fulfillSignup");
 async function completeSignup(request, env) {
@@ -2593,7 +2798,7 @@ async function completeSignup(request, env) {
   const problem = stripeKeyProblem(env);
   if (problem) return fail(503, "Billing is not available right now. Email nudgedispatch@gmail.com.");
   try {
-    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(sessionId), { expand: ["subscription.default_payment_method"] });
+    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(sessionId), { expand: ["setup_intent.payment_method"] });
     const signupId = session.metadata && session.metadata.signup_id || "";
     const signup = signupId
       ? await env.DB.prepare("SELECT * FROM signups WHERE id = ?").bind(signupId).first()
@@ -2643,6 +2848,13 @@ async function handleApi(request, env) {
       return fail(500, "Webhook error.");
     }
   }
+  // PayPal calls this directly; each delivery is checked with PayPal's verify-webhook-signature for the fleet's app.
+  if (path === "/api/paypal/webhook" && method === "POST") {
+    try { return await paypalWebhook(request, env); } catch (error) {
+      console.log(JSON.stringify({ level: "error", msg: "paypal webhook", name: error instanceof Error ? error.name : "Error" }));
+      return fail(500, "Webhook error.");
+    }
+  }
   if (method !== "GET" && method !== "HEAD" && !clientHeader(request)) return fail(403, "Blocked.");
   try {
     if (path === "/api/admin/invites" && method === "POST") return adminInvite(request, env);
@@ -2656,6 +2868,7 @@ async function handleApi(request, env) {
     if (path === "/api/platform/resets" && method === "POST") return platformReset(request, env);
     if (path === "/api/platform/audit" && method === "GET") return platformAudit(request, env);
     if (path === "/api/platform/trials" && method === "GET") return platformTrials(request, env);
+    if (path === "/api/platform/cancellation-feedback" && method === "GET") return platformCancellationFeedback(request, env);
     const platformTrial = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/trial$/.exec(path);
     if (platformTrial && method === "POST") return platformTrialChange(request, env, platformTrial[1]);
     const platformCompany = /^\/api\/platform\/companies\/([0-9a-f-]{36})$/.exec(path);
@@ -2687,6 +2900,9 @@ async function handleApi(request, env) {
     if (path === "/api/logout" && method === "POST") return logout(request, env);
     if (path === "/api/me" && method === "GET") return me(request, env);
     if (path === "/api/trial" && method === "GET") return getTrial(request, env);
+    if (path === "/api/trial/cancel" && method === "POST") return cancelTrial(request, env);
+    if (path === "/api/account/cancel" && method === "POST") return cancelTrial(request, env);
+    if (path === "/api/trial/notice/dismiss" && method === "POST") return dismissTrialNotice(request, env);
     if (path === "/api/export/rides.csv" && method === "GET") return exportRides(request, env);
     if (path === "/api/export/clients.csv" && method === "GET") return exportClients(request, env);
     if (path === "/api/drivers" && method === "GET") return listDrivers(request, env);
@@ -2717,8 +2933,16 @@ async function handleApi(request, env) {
     if (cancelMatch && method === "POST") return setRideStatus(request, env, cancelMatch[1], "cancelled");
     const invoiceMatch = /^\/api\/rides\/([0-9a-f-]{36})\/invoice$/.exec(path);
     if (invoiceMatch && method === "POST") return createInvoice(request, env, invoiceMatch[1]);
+    if (path === "/api/paypal/credentials" && method === "GET") return getPayPalCredentials(request, env);
+    if (path === "/api/paypal/credentials" && method === "PUT") return putPayPalCredentials(request, env);
+    if (path === "/api/paypal/credentials" && method === "DELETE") return deletePayPalCredentials(request, env);
+    if (path === "/api/paypal/credentials/test" && method === "POST") return testPayPalCredentials(request, env);
     const invoiceGet = /^\/api\/invoices\/([0-9a-f-]{36})$/.exec(path);
     if (invoiceGet && method === "GET") return getInvoice(request, env, invoiceGet[1]);
+    const invoicePayPal = /^\/api\/invoices\/([0-9a-f-]{36})\/paypal$/.exec(path);
+    if (invoicePayPal && method === "POST") return sendPayPalInvoice(request, env, invoicePayPal[1]);
+    const invoicePayPalSync = /^\/api\/invoices\/([0-9a-f-]{36})\/paypal\/sync$/.exec(path);
+    if (invoicePayPalSync && method === "POST") return syncPayPalInvoice(request, env, invoicePayPalSync[1]);
     if (path === "/api/location" && method === "GET") return getLocation(request, env);
     if (path === "/api/location/sharing" && method === "POST") return setSharing(request, env);
     if (path === "/api/location" && method === "POST") return postLocation(request, env);
@@ -2727,6 +2951,18 @@ async function handleApi(request, env) {
     if (revokeLink && method === "POST") return revokeLocationLink(request, env, revokeLink[1]);
     const viewLink = /^\/api\/location\/view\/([A-Za-z0-9_-]{20,})$/.exec(path);
     if (viewLink && method === "GET") return viewLocation(env, viewLink[1]);
+    if (path === "/api/brand" && method === "GET") return getBrand(request, env);
+    if (path === "/api/brand" && method === "PUT") return putBrand(request, env);
+    if (path === "/api/brand" && method === "DELETE") return deleteBrand(request, env);
+    if (path === "/api/brand/check" && method === "POST") return checkBrand(request, env);
+    if (path === "/api/brand/suggest" && method === "POST") return suggestBrandApi(request, env);
+    const platformBrandSuggest = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/brand\/suggest$/.exec(path);
+    if (platformBrandSuggest && method === "POST") return suggestBrandApi(request, env, platformBrandSuggest[1]);
+    if (path === "/api/brand/preview.css" && method === "GET") return brandPreviewCss(request, env);
+    const platformBrand = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/brand$/.exec(path);
+    if (platformBrand && method === "GET") return getBrand(request, env, platformBrand[1]);
+    if (platformBrand && method === "PUT") return putBrand(request, env, platformBrand[1]);
+    if (platformBrand && method === "DELETE") return deleteBrand(request, env, platformBrand[1]);
     if (path === "/api/settings" && method === "GET") return getSettings(request, env);
     if (path === "/api/settings" && method === "PUT") return putSettings(request, env);
     if (path === "/api/rate-sheet" && method === "GET") return getRateSheet(request, env);
@@ -2827,7 +3063,7 @@ async function adminReset(request, env) {
 __name(adminReset, "adminReset");
 async function adminTrialRow(env, id) {
   return env.DB.prepare(
-    `SELECT ${TRIAL_COLS}, c.name, c.status, c.booking_slug,
+    `SELECT ${TRIAL_COLS}, c.name, c.status, c.booking_slug, c.billing_last_paid_at,
             (SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id
               WHERE m.company_id = c.id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1) AS owner_email,
             (SELECT COUNT(*) FROM rides r WHERE r.company_id = c.id AND r.status = 'scheduled' AND r.approval IN ('none', 'approved')) AS scheduled,
@@ -2864,7 +3100,7 @@ async function trialsList(env) {
     if (row) companies.push(await adminTrialView(env, row));
   }
   const onTrial = companies.filter((c) => c.accountStatus === "active" && (c.trial.state === "normal" || c.trial.state === "warning")).length;
-  return json({ ok: true, betaSpots: { limit: BETA_SPOTS, onTrial }, companies });
+  return json({ ok: true, trials: { onTrial, rideLimit: TRIAL_RIDE_LIMIT }, companies });
 }
 __name(trialsList, "trialsList");
 async function adminTrialChange(request, env, id) {
@@ -2883,14 +3119,15 @@ __name(platformTrials, "platformTrials");
 async function platformTrialChange(request, env, id) {
   const user = await platformUser(request, env, true);
   if (isResponse(user)) return user;
-  return trialChange(request, env, id);
+  return trialChange(request, env, id, user.id);
 }
 __name(platformTrialChange, "platformTrialChange");
-async function trialChange(request, env, id) {
+async function trialChange(request, env, id, actorId = "admin-token") {
   const body = await readJson(request);
   if (isResponse(body)) return body;
   const row = await adminTrialRow(env, id);
   if (!row) return fail(404, "No company with that id.");
+  if (body.moveBack === true) return moveCompanyBackToTrial(env, row, actorId);
   const change = applyTrialChange(row, body, Date.now());
   if (change.error) return fail(400, change.error);
   const n = change.next;
@@ -2901,6 +3138,27 @@ async function trialChange(request, env, id) {
   return json({ ok: true, company: await adminTrialView(env, fresh) });
 }
 __name(trialChange, "trialChange");
+// Platform admin "Move back to free trial" (rules in trial.js moveBackToTrial). Never calls Stripe.
+async function moveCompanyBackToTrial(env, row, actorId) {
+  const completed = await completedRides(env, row.id);
+  const result = moveBackToTrial(row, completed, Date.now());
+  if (result.error) return fail(409, result.error);
+  const n = result.next;
+  await env.DB.prepare(
+    `UPDATE companies SET trial_status = ?, trial_ended_at = ?, trial_end_reason = ?, trial_started_at = ?, trial_ride_limit = ?, trial_days = ?,
+       trial_billing = ?, trial_converted_at = ?, trial_convert_claimed_at = ?, trial_convert_error = ?, trial_canceled_at = ?,
+       trial_notice_dismissed_at = ?, stripe_subscription_id = ? WHERE id = ?`
+  ).bind(n.trial_status, n.trial_ended_at, n.trial_end_reason, n.trial_started_at, n.trial_ride_limit, n.trial_days, n.trial_billing,
+    n.trial_converted_at, n.trial_convert_claimed_at, n.trial_convert_error, n.trial_canceled_at, n.trial_notice_dismissed_at,
+    n.stripe_subscription_id, row.id).run();
+  await writeAudit(env, actorId, "trial.moved_back", "company", row.id, {
+    fresh: result.fresh, ridesCompleted: completed, rideLimit: n.trial_ride_limit, autoConvert: n.trial_billing === "auto",
+    detachedSubscription: result.detachedSubscription ? row.stripe_subscription_id : null
+  });
+  const fresh = await adminTrialRow(env, row.id);
+  return json({ ok: true, movedBack: { fresh: result.fresh, autoConvert: n.trial_billing === "auto" }, company: await adminTrialView(env, fresh) });
+}
+__name(moveCompanyBackToTrial, "moveCompanyBackToTrial");
 function csvCell(value) {
   let text = value === null || value === void 0 ? "" : String(value);
   // Keep spreadsheet apps from treating a cell as a formula.
@@ -3667,8 +3925,8 @@ async function stripeWebhook(request, env) {
 __name(stripeWebhook, "stripeWebhook");
 async function applyStripeEvent(env, event) {
   const obj = event.data && event.data.object;
-  if (event.type === "checkout.session.completed" && obj && obj.mode === "subscription" && isSignupCheckout(obj)) {
-    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(obj.id), { expand: ["subscription.default_payment_method"] });
+  if (event.type === "checkout.session.completed" && obj && isSignupCheckout(obj)) {
+    const session = await stripe(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(obj.id), { expand: ["setup_intent.payment_method"] });
     const signupId = (session.metadata && session.metadata.signup_id) || (obj.metadata && obj.metadata.signup_id) || "";
     const signup = signupId ? await env.DB.prepare("SELECT * FROM signups WHERE id = ?").bind(signupId).first() : null;
     if (!signup) return { result: "ignored: unknown signup" };
@@ -3678,7 +3936,7 @@ async function applyStripeEvent(env, event) {
   const refs = refsOf(event.type, obj);
   if (!refs.customer && !refs.subscription) return { result: "ignored: no customer" };
   const company = await env.DB.prepare(
-    `SELECT id, name, stripe_customer_id, stripe_subscription_id, billing_event_at FROM companies
+    `SELECT id, name, stripe_customer_id, stripe_subscription_id, billing_event_at, trial_billing, trial_status, trial_converted_at, trial_canceled_at FROM companies
      WHERE (stripe_subscription_id IS NOT NULL AND stripe_subscription_id = ?) OR (stripe_customer_id IS NOT NULL AND stripe_customer_id = ?)
      ORDER BY CASE WHEN stripe_subscription_id = ? THEN 0 ELSE 1 END LIMIT 1`
   ).bind(refs.subscription || "", refs.customer || "", refs.subscription || "").first();
@@ -3702,6 +3960,15 @@ async function applyStripeEvent(env, event) {
   const stale = company.billing_event_at && createdMs && createdMs < company.billing_event_at;
   const now = Date.now();
   if (event.type === "invoice.paid" || event.type === "invoice.payment_succeeded") {
+    const autoTrialOpen = isAutoTrial(company) && !company.trial_converted_at;
+    const amount = Number(obj && (obj.amount_paid ?? obj.total) || 0);
+    if (autoTrialOpen && amount <= 0) {
+      // The $0 invoice Stripe issues when a trialing subscription starts. Still on the free trial.
+      // Its period runs to the far-off Stripe trial_end, so it must not set a paid-through date.
+      if (stale) return { companyId: company.id, result: "ignored: older event" };
+      await env.DB.prepare("UPDATE companies SET billing_status = 'active', billing_past_due_at = NULL, billing_event_at = ? WHERE id = ?").bind(createdMs || now, company.id).run();
+      return { companyId: company.id, result: "trial started ($0 invoice)" };
+    }
     const through = paidThroughMs(obj);
     // Paid dates always move forward; status only if this event is not older than the last applied one.
     await env.DB.prepare(
@@ -3710,7 +3977,11 @@ async function applyStripeEvent(env, event) {
          billing_updated_at = ? WHERE id = ?`
     ).bind(createdMs || now, through, through, now, company.id).run();
     if (stale) return { companyId: company.id, result: "paid recorded (older event, status kept)" };
-    await env.DB.prepare("UPDATE companies SET billing_status = 'active', billing_past_due_at = NULL, billing_event_at = ?, trial_status = 'active' WHERE id = ?").bind(createdMs || now, company.id).run();
+    // A real payment. For a self-serve trial this also records the conversion if Stripe ended the trial itself.
+    await env.DB.prepare(
+      `UPDATE companies SET billing_status = 'active', billing_past_due_at = NULL, billing_event_at = ?, trial_status = 'active',
+         trial_converted_at = CASE WHEN trial_billing = 'auto' THEN COALESCE(trial_converted_at, ?) ELSE trial_converted_at END WHERE id = ?`
+    ).bind(createdMs || now, now, company.id).run();
     return { companyId: company.id, result: "paying" };
   }
   if (stale) return { companyId: company.id, result: "ignored: older event" };
@@ -3721,7 +3992,20 @@ async function applyStripeEvent(env, event) {
   }
   if (event.type === "customer.subscription.deleted") {
     await env.DB.prepare("UPDATE companies SET billing_status = 'canceled', billing_event_at = ?, billing_updated_at = ? WHERE id = ?").bind(createdMs || now, now, company.id).run();
+    if (isAutoTrial(company) && !company.trial_converted_at && !company.trial_canceled_at) {
+      // Canceled outside the app (Stripe dashboard or portal) during the free trial: same as Cancel trial, never charged.
+      const cols = trialCancelColumns(now);
+      await env.DB.prepare("UPDATE companies SET trial_canceled_at = ?, trial_status = ?, trial_ended_at = ?, trial_end_reason = ? WHERE id = ? AND trial_converted_at IS NULL AND trial_canceled_at IS NULL")
+        .bind(cols.trial_canceled_at, cols.trial_status, cols.trial_ended_at, cols.trial_end_reason, company.id).run();
+      return { companyId: company.id, result: "trial canceled" };
+    }
     return { companyId: company.id, result: "canceled" };
+  }
+  if (event.type === "customer.subscription.trial_will_end") {
+    // No time expiry: if the 730-day Stripe trial horizon is near and the 15 rides aren't used, push it out again.
+    if (!isAutoTrial(company) || company.trial_converted_at || company.trial_canceled_at || company.trial_status !== "trial") return { companyId: company.id, result: "ignored: not an open ride trial" };
+    await stripe(env, "POST", "/v1/subscriptions/" + encodeURIComponent(company.stripe_subscription_id), { trial_end: stripeTrialEnd(now), proration_behavior: "none" }, "nudge-trial-extend-" + company.id + "-" + event.id);
+    return { companyId: company.id, result: "trial extended" };
   }
   if (event.type === "customer.subscription.updated") {
     const status = subStatusToBilling(obj && obj.status);
@@ -4548,6 +4832,14 @@ async function applyProgress(env, user, existing, step, from, undo) {
       console.log(JSON.stringify({ level: "warn", msg: "arrived text", name: error instanceof Error ? error.name : "Error" }));
     }
   }
+  if (!undo && step === "Completed") {
+    // Counts the ride toward the free trial; the 15th completed ride converts a self-serve trial to Solo.
+    try {
+      await companyTrial(env, companyId);
+    } catch (error) {
+      console.log(JSON.stringify({ level: "warn", msg: "trial check", name: error instanceof Error ? error.name : "Error" }));
+    }
+  }
   const fresh = !undo && step === "Arrived" ? await ownedRide(env, user, existing.id) : row;
   return json({ ok: true, ride: fresh ? rideJson(fresh, user.role) : null });
 }
@@ -4661,6 +4953,187 @@ function invoiceText(settings, ride, number, issuedOn) {
   ].join("\n");
 }
 __name(invoiceText, "invoiceText");
+
+// ---- Booking page brand ("Match your website") ----
+// Gating (Jesse, Nov 19, 2026): free trial uses standard stock. Owners on a paid plan edit their own brand;
+// a platform admin (assisted setup) can set one for any company, and an admin-set brand renders on any plan.
+async function companyPaid(env, companyId) {
+  const row = await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(companyId).first();
+  if (!row) return false;
+  return trialState(row, 0).plan === "active";
+}
+__name(companyPaid, "companyPaid");
+// The brand a public page should render for this company row (needs id + brand_json), or null.
+async function renderedBrand(env, company) {
+  if (!company) return null;
+  const brand = parseBrand(company.brand_json);
+  if (!brand) return null;
+  if (brand.source !== "owner") return brand;
+  return brandRenders(brand, await companyPaid(env, company.id)) ? brand : null;
+}
+__name(renderedBrand, "renderedBrand");
+async function brandActor(request, env, companyId, mutate) {
+  if (companyId) {
+    const user = await platformUser(request, env, mutate);
+    if (isResponse(user)) return user;
+    const row = await env.DB.prepare("SELECT id, name, booking_slug FROM companies WHERE id = ?").bind(companyId).first();
+    if (!row) return fail(404, "No company with that id.");
+    return { user, companyId, admin: true, company: row };
+  }
+  const user = await authed(request, env, mutate);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const row = await env.DB.prepare("SELECT id, name, booking_slug FROM companies WHERE id = ?").bind(user.companyId).first();
+  return { user, companyId: user.companyId, admin: false, company: row || { id: user.companyId } };
+}
+__name(brandActor, "brandActor");
+// Body: { mode: "simple", simple: { base, primary, accent, background, text }, pair } or
+//       { mode: "advanced", base, colors: {9 keys}, pair }
+function brandFromBody(body) {
+  const pair = typeof body.pair === "string" ? body.pair : "standard";
+  if (body.mode === "advanced") {
+    const fp = FONT_PAIRS.find((p) => p.id === pair) || FONT_PAIRS[0];
+    const fonts = {};
+    if (fp.heading) fonts.heading = fp.heading;
+    if (fp.body) fonts.body = fp.body;
+    return parseBrand({ v: 1, base: body.base === "dark" ? "dark" : "light", colors: body.colors || {}, fonts });
+  }
+  return parseBrand(deriveBrand(body.simple || {}, pair));
+}
+__name(brandFromBody, "brandFromBody");
+function brandLockText(paid, brand) {
+  if (paid) return "";
+  if (brand && brand.source !== "owner") return "Your booking page brand was set up for you by Nudge Dispatch. Custom branding you edit yourself comes with a paid plan.";
+  return "Your free trial uses the standard Nudge look. Matching your booking page to your website comes with a paid plan. Ask Jesse at nudgedispatch@gmail.com to upgrade or for assisted setup.";
+}
+__name(brandLockText, "brandLockText");
+async function getBrand(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, false);
+  if (isResponse(a)) return a;
+  const settings = await loadSettings(env, a.companyId);
+  const brand = parseBrand(settings && settings.brand_json);
+  const paid = await companyPaid(env, a.companyId);
+  const locked = !a.admin && !paid;
+  return json({
+    ok: true,
+    admin: a.admin,
+    companyName: (settings && settings.business_name) || (a.company && a.company.name) || "",
+    bookingSlug: (a.company && a.company.booking_slug) || "",
+    paid,
+    locked,
+    lockedText: locked ? brandLockText(paid, brand) : "",
+    brand,
+    simple: simpleOf(brand),
+    pair: pairOf(brand),
+    renders: !!brand && brandRenders(brand, paid),
+    logoDataUrl: (settings && settings.logo_data_url) || "",
+    fontPairs: FONT_PAIRS.map((p) => ({ id: p.id, name: p.name }))
+  });
+}
+__name(getBrand, "getBrand");
+async function checkBrand(request, env) {
+  const user = await requireUser(request, env);
+  if (isResponse(user)) return user;
+  const csrf = await requireCsrf(request, user);
+  if (csrf) return csrf;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const brand = brandFromBody(body);
+  if (!brand) return json({ ok: true, brand: null, problems: brandContrastProblems(null) });
+  return json({ ok: true, brand, simple: simpleOf(brand), problems: brandContrastProblems(brand) });
+}
+__name(checkBrand, "checkBrand");
+async function brandPreviewCss(request, env) {
+  const user = await requireUser(request, env);
+  if (isResponse(user)) return new Response("", { status: 401, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
+  const raw = new URL(request.url).searchParams.get("b") || "";
+  const brand = parseBrand(raw);
+  const css = brand ? brandCss(brand, "#brand-live .bookpage-mock", { scoped: true }) : "";
+  return new Response(css, { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
+}
+__name(brandPreviewCss, "brandPreviewCss");
+async function ensureSettingsRow(env, companyId, name) {
+  await env.DB.prepare("INSERT INTO invoice_settings (company_id, business_name, updated_at) VALUES (?, ?, ?) ON CONFLICT(company_id) DO NOTHING").bind(companyId, name || "", Date.now()).run();
+}
+__name(ensureSettingsRow, "ensureSettingsRow");
+async function putBrand(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, true);
+  if (isResponse(a)) return a;
+  const paid = await companyPaid(env, a.companyId);
+  if (!a.admin && !paid) return fail(403, brandLockText(paid, null));
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const brand = brandFromBody(body);
+  if (!brand) return fail(400, "Pick a color for every field.");
+  const problems = brandContrastProblems(brand);
+  if (problems.length) return json({ ok: false, error: "Some colors are hard to read. Adjust them before saving.", problems }, 400);
+  let logo;
+  if (body.logoDataUrl !== void 0) {
+    if (body.logoDataUrl === "") logo = "";
+    else if (typeof body.logoDataUrl !== "string" || body.logoDataUrl.length > 18e4 || !LOGO_RE.test(body.logoDataUrl)) {
+      return fail(400, "The logo must be a PNG, JPG, or WebP image under about 120 KB.");
+    } else logo = body.logoDataUrl;
+  }
+  const stored = brandJson(brand, a.admin ? "admin" : "owner");
+  await ensureSettingsRow(env, a.companyId, a.company && a.company.name);
+  const now = Date.now();
+  if (logo !== void 0) {
+    await env.DB.prepare("UPDATE invoice_settings SET brand_json = ?, logo_data_url = ?, updated_at = ? WHERE company_id = ?").bind(stored, logo, now, a.companyId).run();
+  } else {
+    await env.DB.prepare("UPDATE invoice_settings SET brand_json = ?, updated_at = ? WHERE company_id = ?").bind(stored, now, a.companyId).run();
+  }
+  if (a.admin) await writeAudit(env, a.user.userId, "brand.set", "company", a.companyId, { name: a.company && a.company.name, base: brand.base || "light", logo: logo !== void 0 });
+  return getBrand(new Request(request.url, { headers: request.headers }), env, companyId);
+}
+__name(putBrand, "putBrand");
+// "Paste your website URL" suggestions. Never saves anything; the owner reviews and presses Save.
+var BRAND_SUGGEST_MAX = 10;
+var BRAND_SUGGEST_WINDOW_MS = 60 * 60 * 1e3;
+async function brandSuggestAllowed(env, companyId) {
+  const bucket = "brand-suggest:" + companyId;
+  const now = Date.now();
+  const row = await env.DB.prepare("SELECT hits, window_started FROM booking_limits WHERE bucket = ?").bind(bucket).first();
+  if (!row || now - row.window_started > BRAND_SUGGEST_WINDOW_MS) {
+    await env.DB.prepare(
+      `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?, 1, ?)
+       ON CONFLICT(bucket) DO UPDATE SET hits = 1, window_started = excluded.window_started`
+    ).bind(bucket, now).run();
+    return true;
+  }
+  if (row.hits >= BRAND_SUGGEST_MAX) return false;
+  await env.DB.prepare("UPDATE booking_limits SET hits = hits + 1 WHERE bucket = ?").bind(bucket).run();
+  return true;
+}
+__name(brandSuggestAllowed, "brandSuggestAllowed");
+async function suggestBrandApi(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, true);
+  if (isResponse(a)) return a;
+  const paid = await companyPaid(env, a.companyId);
+  if (!a.admin && !paid) return fail(403, brandLockText(paid, null));
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  if (!await brandSuggestAllowed(env, a.companyId)) return fail(429, "That's a lot of lookups. Try again in an hour.");
+  try {
+    const out = await suggestBrand(typeof body.url === "string" ? body.url : "");
+    const brand = parseBrand(deriveBrand(out.simple, out.simple.pair));
+    return json({ ok: true, suggestion: out, problems: brandContrastProblems(brand) });
+  } catch (e) {
+    const known = e instanceof SuggestError;
+    return json({ ok: false, error: known ? e.message : "We couldn't read that website.", code: known ? e.code : "fetch" }, known && e.code === "url" ? 400 : 422);
+  }
+}
+__name(suggestBrandApi, "suggestBrandApi");
+async function deleteBrand(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, true);
+  if (isResponse(a)) return a;
+  const paid = await companyPaid(env, a.companyId);
+  if (!a.admin && !paid) return fail(403, brandLockText(paid, null));
+  await env.DB.prepare("UPDATE invoice_settings SET brand_json = '', updated_at = ? WHERE company_id = ?").bind(Date.now(), a.companyId).run();
+  if (a.admin) await writeAudit(env, a.user.userId, "brand.reset", "company", a.companyId, { name: a.company && a.company.name });
+  return getBrand(new Request(request.url, { headers: request.headers }), env, companyId);
+}
+__name(deleteBrand, "deleteBrand");
 async function loadSettings(env, companyId) {
   return env.DB.prepare("SELECT * FROM invoice_settings WHERE company_id = ?").bind(companyId).first();
 }
@@ -4718,13 +5191,23 @@ async function getInvoice(request, env, id) {
   const row = await env.DB.prepare(
     `SELECT i.id, i.ride_id, i.number, i.amount_cents, i.issued_on, i.snapshot_text, i.bill_name, i.bill_phone, i.bill_email, i.trip_json,
             s.business_name, s.address, s.phone, s.email, s.website, s.payment_instructions, s.gratuity_note, s.terms, s.logo_data_url,
-            s.payment_methods_json, r.payment AS ride_payment
+            s.payment_methods_json, r.payment AS ride_payment,
+            i.paypal_invoice_id, i.paypal_mode, i.paypal_status, i.paypal_payer_url, i.paypal_sent_at, i.paypal_refunded, pc.mode AS paypal_app_mode
      FROM invoices i JOIN invoice_settings s ON s.company_id = i.company_id
      LEFT JOIN rides r ON r.company_id = i.company_id AND r.id = i.ride_id
+     LEFT JOIN paypal_credentials pc ON pc.company_id = i.company_id
      WHERE i.company_id = ? AND i.id = ?`
   ).bind(user.companyId, id).first();
   if (!row) return fail(404, "Invoice not found.");
-  const payWith = payOptions(parseStoredPaymentMethods(row.payment_methods_json), Number(row.amount_cents), row.number);
+  const paypal = invoicePayPalJson(env, row);
+  let payWith = payOptions(parseStoredPaymentMethods(row.payment_methods_json), Number(row.amount_cents), row.number);
+  let snapshotText = row.snapshot_text;
+  if (paypal.sent) {
+    // A real PayPal invoice replaces the plain PayPal link on this invoice.
+    payWith = payWith.filter((o) => o.kind !== "paypal");
+    if (paypal.payerUrl) payWith.unshift({ kind: "paypal_invoice", label: "PayPal", handle: "", display: "PayPal invoice " + paypal.invoiceId, url: paypal.payerUrl, copy: "" });
+    snapshotText = String(snapshotText).split("\n").filter((line) => !/^PayPal: /.test(line)).join("\n");
+  }
   return json({
     ok: true,
     invoice: {
@@ -4734,11 +5217,12 @@ async function getInvoice(request, env, id) {
       amountCents: row.amount_cents,
       fare: money(Number(row.amount_cents)),
       issuedOn: row.issued_on,
-      snapshotText: row.snapshot_text,
+      snapshotText,
       billTo: { name: row.bill_name, phone: row.bill_phone, email: row.bill_email },
       payment: row.ride_payment || "",
       payWith,
       payLines: payLines(payWith),
+      paypal,
       trip: JSON.parse(String(row.trip_json)),
       business: {
         name: row.business_name,
@@ -4755,6 +5239,250 @@ async function getInvoice(request, env, id) {
   });
 }
 __name(getInvoice, "getInvoice");
+// PayPal invoicing settings (owner only). The secret is write-only: responses carry only its last 4.
+function paypalSettingsJson(env, summary, request) {
+  return {
+    enabled: paypalServerMode(env) !== "off",
+    problem: paypalServerProblem(env),
+    serverMode: paypalServerMode(env),
+    allowedModes: allowedAppModes(env),
+    webhookUrl: new URL("/api/paypal/webhook", request.url).toString(),
+    webhookEvents: PAYPAL_WEBHOOK_EVENTS,
+    ...summary
+  };
+}
+__name(paypalSettingsJson, "paypalSettingsJson");
+function paypalFail(error) {
+  if (error instanceof PayPalError) return fail(error.status >= 400 && error.status < 600 ? error.status : 502, error.message);
+  throw error;
+}
+__name(paypalFail, "paypalFail");
+async function getPayPalCredentials(request, env) {
+  const user = await authed(request, env, false);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  return json({ ok: true, paypal: paypalSettingsJson(env, await credentialsSummary(env, user.companyId), request) });
+}
+__name(getPayPalCredentials, "getPayPalCredentials");
+async function putPayPalCredentials(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const before = await credentialsSummary(env, user.companyId);
+  const input = validateCredentialsInput(env, body, before.configured);
+  if (input.error) return fail(400, input.error);
+  try {
+    await saveCredentials(env, user.companyId, input, Date.now());
+  } catch (error) {
+    return paypalFail(error);
+  }
+  const after = await credentialsSummary(env, user.companyId);
+  await writeAudit(env, user.userId, "paypal.credentials_saved", "company", user.companyId, { mode: after.mode, secretChanged: !!input.secret, webhookId: !!after.webhookId });
+  return json({ ok: true, paypal: paypalSettingsJson(env, after, request) });
+}
+__name(putPayPalCredentials, "putPayPalCredentials");
+async function deletePayPalCredentials(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  await removeCredentials(env, user.companyId);
+  await writeAudit(env, user.userId, "paypal.credentials_removed", "company", user.companyId, {});
+  return json({ ok: true, paypal: paypalSettingsJson(env, await credentialsSummary(env, user.companyId), request) });
+}
+__name(deletePayPalCredentials, "deletePayPalCredentials");
+async function testPayPalCredentials(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  try {
+    const creds = await loadPayPalCredentials(env, user.companyId);
+    if (!creds) return fail(400, "Save your PayPal Client ID and Secret first.");
+    await testConnection(env, creds);
+  } catch (error) {
+    return paypalFail(error);
+  }
+  return json({ ok: true, connected: true, mock: paypalServerMode(env) === "mock" });
+}
+__name(testPayPalCredentials, "testPayPalCredentials");
+var PAYPAL_SENT_STATUSES = new Set(["SENT", "SCHEDULED", "UNPAID", "PAYMENT_PENDING", "PARTIALLY_PAID", "PAID", "MARKED_AS_PAID", "CANCELLED", "REFUNDED", "PARTIALLY_REFUNDED", "MARKED_AS_REFUNDED"]);
+function invoicePayPalJson(env, row) {
+  const status = row.paypal_status || "";
+  return {
+    available: paypalServerMode(env) !== "off" && !paypalServerProblem(env) && !!row.paypal_app_mode,
+    mock: paypalServerMode(env) === "mock",
+    invoiceId: row.paypal_invoice_id || "",
+    mode: row.paypal_mode || "",
+    status,
+    statusLabel: PAYPAL_STATUS_LABELS[status] || status,
+    sent: !!row.paypal_invoice_id && PAYPAL_SENT_STATUSES.has(status),
+    payerUrl: safePayerUrl(row.paypal_payer_url),
+    sentAt: row.paypal_sent_at || null,
+    refunded: Number(row.paypal_refunded || 0) === 1
+  };
+}
+__name(invoicePayPalJson, "invoicePayPalJson");
+// Explicit owner tap: create a PayPal draft from this Nudge invoice and send it to the rider's email.
+async function sendPayPalInvoice(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  const row = await env.DB.prepare(
+    `SELECT i.id, i.ride_id, i.number, i.amount_cents, i.issued_on, i.bill_name, i.bill_email, i.trip_json, i.paypal_invoice_id, i.paypal_status,
+            s.business_name, s.terms, r.payment AS ride_payment, r.client_id
+     FROM invoices i JOIN invoice_settings s ON s.company_id = i.company_id
+     LEFT JOIN rides r ON r.company_id = i.company_id AND r.id = i.ride_id
+     WHERE i.company_id = ? AND i.id = ?`
+  ).bind(user.companyId, id).first();
+  if (!row) return fail(404, "Invoice not found.");
+  if (row.paypal_invoice_id && PAYPAL_SENT_STATUSES.has(row.paypal_status || "")) return getInvoice(request, env, id);
+  if (row.ride_payment === "paid") return fail(409, "This ride is already marked paid.");
+  let email = validRiderEmail(row.bill_email);
+  if (!email && row.client_id) {
+    const client = await ownedClient(env, user.companyId, row.client_id);
+    email = validRiderEmail(client && client.email);
+    if (email) await env.DB.prepare("UPDATE invoices SET bill_email = ? WHERE company_id = ? AND id = ?").bind(email, user.companyId, id).run();
+  }
+  if (!email) return fail(400, "Add the rider's email to this client to send a PayPal invoice.");
+  try {
+    const creds = await loadPayPalCredentials(env, user.companyId);
+    if (!creds) return fail(400, "Connect your PayPal app in More first.");
+    const draft = buildPayPalInvoice({
+      number: row.number,
+      amountCents: row.amount_cents,
+      issuedOn: row.issued_on,
+      billName: row.bill_name,
+      billEmail: email,
+      trip: JSON.parse(String(row.trip_json || "{}")),
+      businessName: row.business_name,
+      terms: row.terms
+    });
+    const onDraft = /* @__PURE__ */ __name(async (ppId, status) => {
+      await env.DB.prepare("UPDATE invoices SET paypal_invoice_id = ?, paypal_mode = ?, paypal_status = ? WHERE company_id = ? AND id = ?").bind(ppId, creds.mode, status, user.companyId, id).run();
+    }, "onDraft");
+    const sent = await createAndSendInvoice(env, creds, id, draft, { existingId: row.paypal_invoice_id || "", onDraft });
+    const now = Date.now();
+    await env.DB.prepare(
+      "UPDATE invoices SET paypal_invoice_id = ?, paypal_mode = ?, paypal_status = ?, paypal_payer_url = ?, paypal_sent_at = ?, paypal_checked_at = ? WHERE company_id = ? AND id = ?"
+    ).bind(sent.id, creds.mode, sent.status, sent.payerUrl, now, now, user.companyId, id).run();
+    await writeAudit(env, user.userId, "paypal.invoice_sent", "invoice", id, { paypalInvoiceId: sent.id, mode: creds.mode, mock: paypalServerMode(env) === "mock" });
+  } catch (error) {
+    return paypalFail(error);
+  }
+  return getInvoice(request, env, id);
+}
+__name(sendPayPalInvoice, "sendPayPalInvoice");
+// Records PayPal's status on the Nudge invoice. Fully paid marks the ride paid; nothing here ever un-pays a ride.
+async function applyPayPalStatus(env, companyId, invoiceId, rideId, paypalInvoice, now) {
+  const outcome = payPalOutcome(paypalInvoice);
+  if (!outcome.status) return "ignored: no status";
+  await env.DB.prepare(
+    "UPDATE invoices SET paypal_status = ?, paypal_checked_at = ?, paypal_refunded = CASE WHEN ? = 1 THEN 1 ELSE paypal_refunded END WHERE company_id = ? AND id = ?"
+  ).bind(outcome.status, now, outcome.refunded ? 1 : 0, companyId, invoiceId).run();
+  if (outcome.paid) {
+    await env.DB.prepare("UPDATE rides SET payment = 'paid', updated_at = ? WHERE company_id = ? AND id = ? AND payment <> 'paid'").bind(now, companyId, rideId).run();
+    return "paid";
+  }
+  if (outcome.refunded) return "refunded flag set";
+  return "status " + outcome.status;
+}
+__name(applyPayPalStatus, "applyPayPalStatus");
+async function paypalWebhook(request, env) {
+  const raw = await request.text();
+  if (raw.length > 5e5) return fail(413, "Too large.");
+  if (paypalServerProblem(env)) return json({ received: true, ignored: "paypal invoicing off" });
+  let event;
+  try { event = JSON.parse(raw); } catch { return fail(400, "Bad payload."); }
+  if (!event || typeof event.id !== "string" || !event.id || typeof event.event_type !== "string") return fail(400, "Bad payload.");
+  if (!PAYPAL_WEBHOOK_EVENTS.includes(event.event_type)) return json({ received: true, ignored: "event type not handled" });
+  const pp = eventInvoice(event);
+  if (!pp) return json({ received: true, ignored: "no invoice" });
+  const inv = await env.DB.prepare("SELECT id, company_id, ride_id FROM invoices WHERE paypal_invoice_id = ?").bind(pp.id).first();
+  if (!inv) return json({ received: true, ignored: "unknown invoice" });
+  const creds = await loadPayPalCredentials(env, inv.company_id);
+  if (!creds || !creds.webhookId) return fail(400, "Webhook not set up for this account.");
+  const verified = await verifyWebhook(env, creds, request.headers, event);
+  if (!verified) return fail(400, "Invalid signature.");
+  const now = Date.now();
+  const claimed = await env.DB.prepare("INSERT OR IGNORE INTO paypal_events (id, event_type, resource_id, company_id, result, received_at) VALUES (?, ?, ?, ?, '', ?)").bind(event.id, event.event_type, pp.id, inv.company_id, now).run();
+  if (!claimed.meta.changes) return json({ received: true, duplicate: true });
+  let result;
+  try {
+    result = await applyPayPalStatus(env, inv.company_id, inv.id, inv.ride_id, pp, now);
+  } catch (error) {
+    await env.DB.prepare("DELETE FROM paypal_events WHERE id = ? AND result = ''").bind(event.id).run(); // let PayPal retry
+    throw error;
+  }
+  await env.DB.prepare("UPDATE paypal_events SET result = ? WHERE id = ?").bind(result, event.id).run();
+  return json({ received: true, result });
+}
+__name(paypalWebhook, "paypalWebhook");
+// Owner taps "Check PayPal status": one GET from PayPal, same mapping as the webhook.
+async function syncPayPalInvoice(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const problem = paypalServerProblem(env);
+  if (problem) return fail(503, problem);
+  const inv = await env.DB.prepare("SELECT id, ride_id, paypal_invoice_id FROM invoices WHERE company_id = ? AND id = ?").bind(user.companyId, id).first();
+  if (!inv) return fail(404, "Invoice not found.");
+  if (!inv.paypal_invoice_id) return fail(409, "This invoice hasn't been sent with PayPal.");
+  try {
+    const creds = await loadPayPalCredentials(env, user.companyId);
+    if (!creds) return fail(400, "Connect your PayPal app in More first.");
+    const pp = await fetchPayPalInvoice(env, creds, inv.paypal_invoice_id);
+    await applyPayPalStatus(env, user.companyId, inv.id, inv.ride_id, pp, Date.now());
+  } catch (error) {
+    return paypalFail(error);
+  }
+  return getInvoice(request, env, id);
+}
+__name(syncPayPalInvoice, "syncPayPalInvoice");
+// Backup for missed webhooks, on the existing 5-minute cron: re-check a few open PayPal invoices, each at most every 30 minutes.
+async function runPayPalChecks(env, nowMs) {
+  if (paypalServerProblem(env)) return { checked: 0, skipped: "off" };
+  const now = nowMs || Date.now();
+  const marks = PAYPAL_OPEN_STATUSES.map(() => "?").join(", ");
+  const rows = await env.DB.prepare(
+    `SELECT id, company_id, ride_id, paypal_invoice_id FROM invoices
+     WHERE paypal_invoice_id IS NOT NULL AND paypal_status IN (${marks}) AND (paypal_checked_at IS NULL OR paypal_checked_at < ?)
+     ORDER BY paypal_checked_at LIMIT 10`
+  ).bind(...PAYPAL_OPEN_STATUSES, now - 30 * 60 * 1e3).all();
+  const credsByCompany = new Map();
+  let checked = 0, paid = 0, errors = 0;
+  for (const row of rows.results || []) {
+    try {
+      if (!credsByCompany.has(row.company_id)) credsByCompany.set(row.company_id, await loadPayPalCredentials(env, row.company_id));
+      const creds = credsByCompany.get(row.company_id);
+      if (!creds) {
+        await env.DB.prepare("UPDATE invoices SET paypal_checked_at = ? WHERE id = ?").bind(now, row.id).run();
+        continue;
+      }
+      const pp = await fetchPayPalInvoice(env, creds, row.paypal_invoice_id);
+      const result = await applyPayPalStatus(env, row.company_id, row.id, row.ride_id, pp, now);
+      checked++;
+      if (result === "paid") paid++;
+    } catch {
+      errors++;
+      await env.DB.prepare("UPDATE invoices SET paypal_checked_at = ? WHERE id = ?").bind(now, row.id).run();
+    }
+  }
+  return { checked, paid, errors };
+}
+__name(runPayPalChecks, "runPayPalChecks");
 const DRIVER_ROWS = `SELECT u.id, u.email, m.role,
   d.name AS driver_name, d.vehicle, d.plate, d.login AS driver_login,
   CASE WHEN d.login = 'passcode' AND d.passcode_hash <> '' THEN 1 ELSE 0 END AS passcode_set
@@ -5200,7 +5928,7 @@ import bookQrSwJs from "./client-book-qr-sw.txt";
 import bookQrCss from "./book-qr.css";
 import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml } from "./booking-qr.js";
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
-import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, BETA_SPOTS } from "./trial.js";
+import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, TRIAL_RIDE_LIMIT, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, TRIAL_STRIPE_HORIZON_DAYS, CANCEL_REASONS, canCancelTrial, canCancelPaid, trialCancelColumns, cancelFeedback, stripeTrialEnd, isAutoTrial, moveBackToTrial } from "./trial.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
 import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, smsSetupPromoCode, isCardPaymentMethod, cardOnlyPaymentConfig, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
@@ -5212,7 +5940,11 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
-import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
+import { parseBrand, brandCss, brandQrCss, brandChrome, brandRenders, brandJson, brandContrastProblems, deriveBrand, simpleOf, pairOf, FONT_PAIRS, BRAND_FONT_PATH } from "./brand.js";
+import { BRAND_FONT_FILES } from "./fonts/brand-fonts.js";
+import { suggestBrand, SuggestError } from "./brand-suggest.js";
+import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS, PAYPAL_OPEN_STATUSES, payPalOutcome, eventInvoice, verifyWebhook, fetchPayPalInvoice } from "./paypal.js";
+import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, trialSubscriptionParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
 import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirportChoice, airportSummary, riderMeetingNote, parseStoredAirport, fleetClasses, bookableVehicles, vehiclesForPassengers, vehicleForPassengers, seatsFor, vehicleClassOf, presetConfig, DEFAULT_CAPACITIES } from "./airport-booking.js";
 import { validatePaymentMethods, parseStoredPaymentMethods, payOptions, payLines } from "./payment-methods.js";
@@ -5269,6 +6001,8 @@ async function serveBookingManifest(env, slug) {
   if (!company) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
   const companyName = publicCompanyName(company);
   const base = "/book/" + slug + "/";
+  const brandNow = await renderedBrand(env, company);
+  const chrome = brandNow ? brandChrome(brandNow) : null;
   const body = JSON.stringify({
     id: base,
     name: companyName + " \u2014 Book a ride",
@@ -5277,8 +6011,8 @@ async function serveBookingManifest(env, slug) {
     start_url: base,
     scope: base,
     display: "standalone",
-    background_color: themeVars(company.theme_color || "").background,
-    theme_color: themeVars(company.theme_color || "").background,
+    background_color: chrome ? chrome.background : themeVars(company.theme_color || "").background,
+    theme_color: chrome ? chrome.header : themeVars(company.theme_color || "").background,
     icons: [
       { src: base + "icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
       { src: base + "icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
@@ -5319,7 +6053,8 @@ async function serveBookingQr(env, slug, rest, url) {
   const bookingUrl = bookingUrlFor(url.origin, slug);
   const logoDataUrl = company.logo_data_url || "";
   if (rest === "/qr/") {
-    const html = qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl, themeColor: company.theme_color || "", assetTag: BOOK_QR_TAG });
+    const qrBrand = await renderedBrand(env, company);
+    const html = qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl, themeColor: company.theme_color || "", assetTag: BOOK_QR_TAG, brandChrome: qrBrand ? brandChrome(qrBrand) : null });
     return new Response(html, { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/qr.svg") {
@@ -5329,8 +6064,13 @@ async function serveBookingQr(env, slug, rest, url) {
     const png = await qrPng(bookingUrl, { logoDataUrl });
     return new Response(png, { status: 200, headers: securityHeaders("image/png", "public, max-age=300") });
   }
+  if (rest === "/qr/theme.css") {
+    const qrBrand = await renderedBrand(env, company);
+    return new Response(qrBrand ? brandQrCss(qrBrand) : "", { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
+  }
   if (rest === "/qr/manifest.webmanifest") {
-    return new Response(JSON.stringify(qrManifest(slug, companyName, company.theme_color || "")), { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
+    const qrBrand = await renderedBrand(env, company);
+    return new Response(JSON.stringify(qrManifest(slug, companyName, company.theme_color || "", qrBrand ? brandChrome(qrBrand) : null)), { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
   }
   return new Response(bookQrSwJs, { status: 200, headers: securityHeaders("text/javascript; charset=utf-8", "no-store") });
 }
@@ -5347,15 +6087,17 @@ async function serveBookingAsset(request, env, slug, rest, url) {
   if (rest === "/") {
     const company = await publicBookingCompany(env, slug);
     const companyName = company ? publicCompanyName(company) : "";
-    return new Response(bookPageHtml(companyName, company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+    const brand = await renderedBrand(env, company);
+    return new Response(bookPageHtml(companyName, brand ? brandChrome(brand).header : company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/theme.css") {
     const company = await publicBookingCompany(env, slug);
-    const css = company ? themeCss(company.theme_color || "") : "";
+    const brand = await renderedBrand(env, company);
+    const css = company ? (brand ? brandCss(brand) : themeCss(company.theme_color || "")) : "";
     return new Response(css, { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
   }
   if (rest === "/manifest.webmanifest") return serveBookingManifest(env, slug);
-  if (rest === "/qr" || rest === "/qr/" || rest === "/qr.png" || rest === "/qr.svg" || rest === "/qr/manifest.webmanifest" || rest === "/qr/sw.js") {
+  if (rest === "/qr" || rest === "/qr/" || rest === "/qr.png" || rest === "/qr.svg" || rest === "/qr/manifest.webmanifest" || rest === "/qr/sw.js" || rest === "/qr/theme.css") {
     return serveBookingQr(env, slug, rest, url);
   }
   if (rest === "/sw.js") {
@@ -5378,6 +6120,7 @@ async function serveShell(request, env) {
   const url = new URL(request.url);
   const book = bookingPageMatch(url.pathname);
   if (book) return serveBookingAsset(request, env, book.slug, book.rest, url);
+  if (url.pathname.startsWith(BRAND_FONT_PATH)) return serveBrandFont(url.pathname.slice(BRAND_FONT_PATH.length));
   let path = url.pathname;
   if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
   if (path === "/signup" || path === "/signup/complete") {
@@ -5388,6 +6131,18 @@ async function serveShell(request, env) {
   return new Response(file.body, { status: 200, headers: securityHeaders(file.type, file.cache) });
 }
 __name(serveShell, "serveShell");
+var brandFontCache = new Map();
+function serveBrandFont(name) {
+  const b64 = Object.prototype.hasOwnProperty.call(BRAND_FONT_FILES, name) ? BRAND_FONT_FILES[name] : null;
+  if (!b64) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
+  let bytes = brandFontCache.get(name);
+  if (!bytes) {
+    bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+    brandFontCache.set(name, bytes);
+  }
+  return new Response(bytes, { status: 200, headers: securityHeaders("font/woff2", "public, max-age=31536000, immutable") });
+}
+__name(serveBrandFont, "serveBrandFont");
 function securityHeaders(type, cache, extra, csp) {
   const headers = new Headers({
     "content-type": type,
@@ -5417,6 +6172,7 @@ var index_default = {
   },
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runFlightChecks(env).then((r) => console.log(JSON.stringify({ level: "info", msg: "flight checks", ...r }))).catch((error) => console.log(JSON.stringify({ level: "error", msg: "flight checks", name: error instanceof Error ? error.name : "Error" }))));
+    ctx.waitUntil(runPayPalChecks(env).then((r) => console.log(JSON.stringify({ level: "info", msg: "paypal checks", ...r }))).catch((error) => console.log(JSON.stringify({ level: "error", msg: "paypal checks", name: error instanceof Error ? error.name : "Error" }))));
   }
 };
 export {

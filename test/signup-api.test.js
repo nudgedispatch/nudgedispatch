@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +7,7 @@ import test from "node:test";
 import { unstable_dev } from "wrangler";
 import { signForTest } from "../app/stripe_webhook.js";
 import { LOOKUP } from "../app/billing.js";
+import { startTrialStripeMock } from "./fixtures/stripe-trial-mock.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const WEBHOOK_SECRET = "whsec_signup_test";
@@ -46,64 +46,7 @@ async function sql(persistTo, text, json = false) {
   return JSON.parse(out.slice(out.indexOf("[")))[0].results;
 }
 
-function startStripeMock() {
-  const hits = [];
-  const st = {
-    sessionStatus: "complete",
-    paymentStatus: "paid",
-    subscriptionStatus: "active",
-  };
-  const card = { id: "pm_signup", object: "payment_method", livemode: false, type: "card", card: { brand: "visa", display_brand: "visa", last4: "4242", exp_month: 4, exp_year: 2030, fingerprint: "fp_s" } };
-  const server = createServer((req, res) => {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
-      const url = new URL(req.url, "http://x");
-      const body = decodeURIComponent(Buffer.concat(chunks).toString()).replace(/\+/g, " ");
-      hits.push({ method: req.method, path: url.pathname, query: decodeURIComponent(url.search), body });
-      const send = (obj, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
-      const p = url.pathname;
-      if (p === "/v1/prices") {
-        const keys = [...url.searchParams.entries()].filter(([k]) => k.startsWith("lookup_keys")).map(([, v]) => v);
-        return send({ object: "list", data: keys.map((k) => ({ id: "price_" + k, object: "price", livemode: false, lookup_key: k, product: "prod_" + k })) });
-      }
-      if (p === "/v1/checkout/sessions" && req.method === "POST") {
-        const signupId = /metadata\[signup_id\]=([^&]+)/.exec(body)?.[1] || "sig";
-        return send({
-          id: "cs_test_signupsession1",
-          object: "checkout.session",
-          livemode: false,
-          mode: "subscription",
-          url: "https://checkout.stripe.com/c/pay/cs_test_signupsession1",
-          metadata: { purpose: "signup", signup_id: signupId, plan: "solo", sms: "off" },
-        });
-      }
-      const cs = /^\/v1\/checkout\/sessions\/(cs_test_\w+)$/.exec(p);
-      if (cs) {
-        const signupId = new URLSearchParams(hits.find((h) => h.path === "/v1/checkout/sessions" && h.method === "POST")?.body || "").get("metadata[signup_id]") || "sig";
-        return send({
-          id: cs[1],
-          object: "checkout.session",
-          livemode: false,
-          mode: "subscription",
-          status: st.sessionStatus,
-          payment_status: st.paymentStatus,
-          customer: "cus_signup",
-          subscription: { id: "sub_signup", object: "subscription", livemode: false, status: st.subscriptionStatus, customer: "cus_signup", default_payment_method: card },
-          metadata: { purpose: "signup", signup_id: signupId, plan: "solo", sms: "off" },
-        });
-      }
-      if (p === "/v1/subscriptions/sub_signup") {
-        return send({ id: "sub_signup", object: "subscription", livemode: false, status: st.subscriptionStatus, customer: "cus_signup", default_payment_method: card });
-      }
-      if (p === "/v1/customers/cus_signup" && req.method === "POST") return send({ id: "cus_signup", object: "customer", livemode: false });
-      if (p === "/v1/customers/cus_signup") return send({ id: "cus_signup", object: "customer", livemode: false, invoice_settings: { default_payment_method: card } });
-      if (p === "/v1/subscriptions/sub_signup" && req.method === "POST") return send({ id: "sub_signup", object: "subscription", livemode: false, status: "active" });
-      return send({ error: { message: "mock: no route " + req.method + " " + p } }, 404);
-    });
-  });
-  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ hits, st, url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((d) => server.close(() => d())) })));
-}
+const startStripeMock = startTrialStripeMock;
 
 async function postWebhook(worker, event) {
   const body = JSON.stringify(event);
@@ -126,7 +69,7 @@ const signupBody = {
   logoDataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
 };
 
-test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fulfillment", async (t) => {
+test("self-serve signup: card saved (not charged), 15-ride Solo trial, no setup fee, no SMS, permanent slug, fulfillment", async (t) => {
   const persistTo = await mkdtemp(join(tmpdir(), "nudge-signup-"));
   const mock = await startStripeMock();
   let worker;
@@ -149,7 +92,8 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     assert.equal(cfg.data.plan, "solo");
     assert.equal(cfg.data.smsAllowed, false);
     assert.equal(cfg.data.setupWaived, true);
-    assert.match(cfg.data.selfSetupLabel, /setup fee waived/);
+    assert.match(cfg.data.selfSetupLabel, /no setup fee/);
+    assert.equal(cfg.data.trialRides, 15);
     assert.match(cfg.data.assistedSetupText, /\$299 one-time assisted setup/);
     assert.match(cfg.data.assistedSetupMailto, /^mailto:nudgedispatch@gmail\.com\?subject=/);
     assert.match(cfg.data.textingUpgradeNote, /Small fleet and up/);
@@ -186,12 +130,14 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     assert.match(started.data.url, /checkout\.stripe\.com/);
     const checkout = mock.hits.find((h) => h.method === "POST" && h.path === "/v1/checkout/sessions");
     assert.ok(checkout);
-    assert.match(checkout.body, /mode=subscription/);
+    assert.match(checkout.body, /mode=setup/);
+    assert.match(checkout.body, /customer=cus_signup/);
     assert.match(checkout.body, /payment_method_configuration=pmc_cardonlytest1/);
+    assert.match(checkout.body, /custom_text\[submit\]\[message\]=Free for your first 15 rides\. Then \$39\/month, charged automatically to this card\. Cancel anytime in Account settings\./);
     assert.doesNotMatch(checkout.body, /allow_promotion_codes/);
+    assert.doesNotMatch(checkout.body, /line_items/);
     assert.doesNotMatch(checkout.body, /nudge_setup_solo/);
     assert.doesNotMatch(checkout.body, /nudge_sms_/);
-    assert.match(checkout.body, new RegExp(LOOKUP.solo.base.replace(/[.]/g, "[.]")));
     assert.match(checkout.body, /metadata\[sms\]=off/);
 
     const pending = (await sql(persistTo, "SELECT email, booking_slug, status, sms_addon, plan, theme_color, logo_data_url, owner_phone, business_phone FROM signups", true))[0];
@@ -213,9 +159,22 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
     assert.equal(done.data.role, "owner");
     assert.ok(done.cookie.includes("nudge_session="));
 
-    const company = (await sql(persistTo, "SELECT name, billing_plan, trial_status, setup_fee, booking_slug, sms_addon_enabled, stripe_subscription_id FROM companies WHERE name = 'Peach State Cars'", true))[0];
+    // Trialing subscription: Solo price only, trial_end at the horizon, the saved card as default. No invoice now.
+    const subs = mock.hits.filter((h) => h.method === "POST" && h.path === "/v1/subscriptions");
+    assert.equal(subs.length, 1);
+    assert.match(subs[0].body, new RegExp("items\\[0\\]\\[price\\]=price_" + LOOKUP.solo.base));
+    assert.match(subs[0].body, /trial_end=\d+/);
+    assert.match(subs[0].body, /default_payment_method=pm_signup/);
+    assert.doesNotMatch(subs[0].body, /nudge_setup_solo|nudge_sms_/);
+    assert.ok(!mock.hits.some((h) => h.path.startsWith("/v1/invoices") || h.path.startsWith("/v1/payment_intents")), "nothing charged at signup");
+
+    const company = (await sql(persistTo, "SELECT name, billing_plan, trial_status, trial_billing, trial_ride_limit, trial_days, setup_fee, booking_slug, sms_addon_enabled, stripe_subscription_id, pm_last4 FROM companies WHERE name = 'Peach State Cars'", true))[0];
     assert.equal(company.billing_plan, "solo");
-    assert.equal(company.trial_status, "active");
+    assert.equal(company.trial_status, "trial");
+    assert.equal(company.trial_billing, "auto");
+    assert.equal(company.trial_ride_limit, 15);
+    assert.equal(company.trial_days, 0);
+    assert.equal(company.pm_last4, "4242");
     assert.equal(company.setup_fee, "charge");
     assert.equal(company.booking_slug, "peach-state-cars");
     assert.equal(company.sms_addon_enabled, 0);
@@ -242,7 +201,7 @@ test("self-serve signup: Solo checkout, no setup fee, no SMS, permanent slug, fu
       type: "checkout.session.completed",
       livemode: false,
       created: Math.floor(Date.now() / 1000),
-      data: { object: { id: "cs_test_signupsession1", object: "checkout.session", mode: "subscription", customer: "cus_signup", subscription: "sub_signup", metadata: { purpose: "signup", signup_id: pending && null } } },
+      data: { object: { id: "cs_test_signupsession1", object: "checkout.session", mode: "setup", customer: "cus_signup", metadata: { purpose: "signup", signup_id: "from-session" } } },
     });
     // metadata signup_id is resolved from the retrieved session in the handler; this should be idempotent.
     assert.equal(hook.status, 200, JSON.stringify(hook.data));
