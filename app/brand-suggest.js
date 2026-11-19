@@ -77,7 +77,7 @@ export function isPrivateIp(ip) {
 export async function dohResolve(host, fetchImpl, signal) {
   const out = [];
   for (const type of ["A", "AAAA"]) {
-    const r = await fetchImpl(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=${type}`, { headers: { accept: "application/dns-json" }, signal, redirect: "error" });
+    const r = await fetchImpl(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=${type}`, { headers: { accept: "application/dns-json" }, signal, redirect: "manual" });
     if (!r.ok) throw new SuggestError("dns", "Couldn't look up that website.");
     const data = await r.json().catch(() => ({}));
     for (const a of data.Answer || []) if (a.type === 1 || a.type === 28) out.push(String(a.data));
@@ -214,7 +214,7 @@ export function suggestFromPage(html, css, baseUrl) {
     const first = d.replace(/font-family\s*:\s*/i, "").split(",")[0].replace(/["']/g, "").trim();
     if (first && !/^(inherit|initial|var\(|-apple-system|system-ui|sans-serif|serif)$/i.test(first)) families.push(first);
   }
-  found.fonts = [...new Set(families)].slice(0, 6);
+  found.fonts = [...new Set(families)].filter((f) => f && !/^var\(|^inherit$|^initial$|^-apple-system$|^system-ui$|^sans-serif$|^serif$/i.test(f)).slice(0, 6);
   // Logo: apple-touch-icon, og:image, an <img> that says logo, then icon.
   const cands = [];
   for (const t of tags(html, "img")) {
@@ -288,6 +288,7 @@ export async function suggestBrand(rawUrl, { fetchImpl = fetch, resolve, timeout
   } catch (e) {
     if (signal.aborted) throw new SuggestError("timeout", "That website took too long to answer.");
     if (e instanceof SuggestError) throw e;
+    console.log(JSON.stringify({ level: "warn", msg: "brand suggest failed", name: e && e.name, detail: String(e && e.message || "").slice(0, 200) }));
     throw new SuggestError("fetch", "We couldn't read that website.");
   } finally {
     clearTimeout(timer);
