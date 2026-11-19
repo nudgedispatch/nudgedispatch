@@ -1920,6 +1920,7 @@ async function decideBooking(request, env, id, decision) {
     if (finalCents === null) return fail(400, "Enter the final price in dollars, such as 125 or 125.50.");
     const driverId = user.accountKind === "individual" ? user.userId : existing.driver_user_id;
     result = await env.DB.prepare("UPDATE rides SET approval = 'approved', status = 'scheduled', driver_user_id = ?, fare_cents = ?, updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'").bind(driverId, finalCents, now, user.companyId, id).run();
+    if (result.meta.changes) queueRideAlert(request, env, user, id, driverId, "assigned");
   } else {
     result = await env.DB.prepare("UPDATE rides SET approval = 'declined', status = 'cancelled', updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'").bind(now, user.companyId, id).run();
   }
@@ -2632,6 +2633,10 @@ async function handleApi(request, env) {
     if (clientMatch && method === "GET") return getClient(request, env, clientMatch[1]);
     if (clientMatch && method === "PATCH") return updateClient(request, env, clientMatch[1]);
     if (clientMatch && method === "DELETE") return deleteClient(request, env, clientMatch[1]);
+    if (path === "/api/push/config" && method === "GET") return pushConfig(request, env);
+    if (path === "/api/push/subscribe" && method === "POST") return pushSubscribe(request, env);
+    if (path === "/api/push/unsubscribe" && method === "POST") return pushUnsubscribe(request, env);
+    if (path === "/api/push/test" && method === "POST") return pushTest(request, env);
     if (path === "/api/rides" && method === "GET") return listRides(request, env);
     if (path === "/api/rides" && method === "POST") return createRide(request, env);
     const rideMatch = /^\/api\/rides\/([0-9a-f-]{36})$/.exec(path);
@@ -4353,6 +4358,7 @@ async function confirmOccurrence(request, env, id, occursOn) {
     if (isConstraintError(error)) return fail(409, "That date is already confirmed or skipped.");
     throw error;
   }
+  queueRideAlert(request, env, user, rideId, driverId, "assigned");
   const ride = await ownedRide(env, user, rideId);
   return json({ ok: true, occursOn, ride: ride ? rideJson(ride, user.role) : null }, 201);
 }
@@ -4440,6 +4446,9 @@ async function updateRide(request, env, id) {
       if (!member) return fail(404, "That driver is not in this company.");
     }
     await env.DB.prepare("UPDATE rides SET driver_user_id = ?, updated_at = ? WHERE company_id = ? AND id = ?").bind(driverId, now, user.companyId, id).run();
+    // Alerts go out after the response (ctx.waitUntil); a failed push never fails the assignment.
+    if (driverId) queueRideAlert(request, env, user, id, driverId, "assigned");
+    if (existing.driver_user_id) queueRideAlert(request, env, user, id, existing.driver_user_id, "unassigned");
   }
   const row = await ownedRide(env, user, id);
   return json({ ok: true, ride: row ? rideJson(row, user.role) : null });
@@ -4455,6 +4464,7 @@ async function setRideStatus(request, env, id, status) {
   if (existing.status === "completed") return fail(409, "A completed ride stays on the books. Change the payment status if you need to.");
   const now = Date.now();
   await env.DB.prepare("UPDATE rides SET status = ?, updated_at = ? WHERE company_id = ? AND id = ?").bind(status, now, user.companyId, id).run();
+  if (status === "cancelled" && existing.status !== "cancelled" && existing.driver_user_id) queueRideAlert(request, env, user, id, existing.driver_user_id, "cancelled");
   const row = await ownedRide(env, user, id);
   return json({ ok: true, ride: row ? rideJson(row, user.role) : null });
 }
@@ -5391,6 +5401,7 @@ async function deleteDriver(request, env, id) {
   statements.push(env.DB.prepare(
     "UPDATE location_links SET revoked_at = ? WHERE company_id = ? AND user_id = ? AND revoked_at IS NULL"
   ).bind(now, user.companyId, id));
+  statements.push(env.DB.prepare("DELETE FROM push_subscriptions WHERE company_id = ? AND user_id = ?").bind(user.companyId, id));
   const results = await env.DB.batch(statements);
   const unassigned = results[1] && results[1].meta ? results[1].meta.changes || 0 : 0;
   return json({ ok: true, unassignedRides: unassigned });
@@ -5607,6 +5618,147 @@ async function viewLocation(env, token) {
 }
 __name(viewLocation, "viewLocation");
 
+// ---- Driver ride alerts: Web Push (draft Nov 19, 2026; see app/push.js, migrations/0017) ----
+// A push never blocks or fails the request that caused it: it runs in ctx.waitUntil after the response.
+var REQUEST_CTX = new WeakMap();
+function inBackground(request, task) {
+  const p = Promise.resolve().then(task).catch((error) => {
+    console.log(JSON.stringify({ level: "error", msg: "push", name: error instanceof Error ? error.name : "Error" }));
+  });
+  const ctx = request ? REQUEST_CTX.get(request) : null;
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  return p;
+}
+__name(inBackground, "inBackground");
+var PUSH_MAX_DEVICES = 10;
+var PUSH_MAX_FAILS = 20;
+async function pushToUser(env, companyId, userId, payload, opts) {
+  const out = { devices: 0, sent: 0, failed: 0, removed: 0 };
+  if (!vapidConfigured(env) || !userId) return out;
+  const rows = (await env.DB.prepare(
+    "SELECT id, endpoint, p256dh, auth, fail_count FROM push_subscriptions WHERE company_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?"
+  ).bind(companyId, userId, PUSH_MAX_DEVICES).all()).results || [];
+  out.devices = rows.length;
+  await Promise.all(rows.map(async (sub) => {
+    if (endpointProblem(env, sub.endpoint)) {
+      await env.DB.prepare("DELETE FROM push_subscriptions WHERE id = ?").bind(sub.id).run();
+      out.removed++;
+      return;
+    }
+    const result = await sendPush(env, sub, payload, opts);
+    if (result.ok) {
+      out.sent++;
+      await env.DB.prepare("UPDATE push_subscriptions SET last_ok = ?, fail_count = 0 WHERE id = ?").bind(Date.now(), sub.id).run();
+    } else if (result.gone || (sub.fail_count || 0) + 1 >= PUSH_MAX_FAILS) {
+      out.removed++;
+      await env.DB.prepare("DELETE FROM push_subscriptions WHERE id = ?").bind(sub.id).run();
+    } else {
+      out.failed++;
+      await env.DB.prepare("UPDATE push_subscriptions SET fail_count = fail_count + 1 WHERE id = ?").bind(sub.id).run();
+    }
+  }));
+  console.log(JSON.stringify({ level: "info", msg: "push", kind: payload.kind, ...out }));
+  return out;
+}
+__name(pushToUser, "pushToUser");
+async function notifyRideDriver(env, companyId, rideId, driverId, kind) {
+  const ride = await env.DB.prepare("SELECT id, pickup_date, pickup_time, pickup, status, driver_user_id FROM rides WHERE company_id = ? AND id = ?").bind(companyId, rideId).first();
+  if (!ride) return null;
+  // Only alert for an assignment that is still true when the background task runs.
+  if (kind === "assigned" && (ride.driver_user_id !== driverId || ride.status === "completed" || ride.status === "cancelled")) return null;
+  const company = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(companyId).first();
+  const payload = rideAlertPayload(kind, ride, company ? company.name : "");
+  return pushToUser(env, companyId, driverId, payload, {
+    ttl: kind === "assigned" ? 6 * 60 * 60 : 60 * 60,
+    urgency: kind === "assigned" ? "high" : "normal",
+    topic: String(rideId).replace(/-/g, "").slice(0, 32),
+  });
+}
+__name(notifyRideDriver, "notifyRideDriver");
+function queueRideAlert(request, env, user, rideId, driverId, kind) {
+  if (!driverId || !user || !vapidConfigured(env)) return null;
+  if (driverId === user.userId) return null;
+  return inBackground(request, () => notifyRideDriver(env, user.companyId, rideId, driverId, kind));
+}
+__name(queueRideAlert, "queueRideAlert");
+function driverOnly(user) {
+  return user.role === "driver" ? null : fail(403, "Ride alerts are for drivers.");
+}
+__name(driverOnly, "driverOnly");
+async function pushConfig(request, env) {
+  const user = await authed(request, env, false);
+  if (isResponse(user)) return user;
+  const enabled = vapidConfigured(env) && user.role === "driver";
+  let devices = 0;
+  if (enabled) {
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM push_subscriptions WHERE company_id = ? AND user_id = ?").bind(user.companyId, user.userId).first();
+    devices = row ? row.n : 0;
+  }
+  return json({ ok: true, enabled, publicKey: enabled ? env.VAPID_PUBLIC_KEY : "", devices });
+}
+__name(pushConfig, "pushConfig");
+async function pushSubscribe(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = driverOnly(user);
+  if (denied) return denied;
+  if (!vapidConfigured(env)) return fail(503, "Ride alerts are not set up yet.");
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+  const keys = body.keys && typeof body.keys === "object" ? body.keys : {};
+  const p256dh = typeof keys.p256dh === "string" ? keys.p256dh.trim() : "";
+  const auth = typeof keys.auth === "string" ? keys.auth.trim() : "";
+  if (endpointProblem(env, endpoint)) return fail(400, "This browser's alert service is not supported. Try Chrome, Safari, Edge, or Firefox.");
+  if (subscriptionKeysProblem(p256dh, auth)) return fail(400, "That alert subscription is not valid. Turn alerts off and on again.");
+  const platform = str(body.platform, 20).toLowerCase().replace(/[^a-z]/g, "");
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO push_subscriptions (id, company_id, user_id, endpoint, p256dh, auth, platform, created_at, last_ok, fail_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
+     ON CONFLICT(endpoint) DO UPDATE SET company_id = excluded.company_id, user_id = excluded.user_id, p256dh = excluded.p256dh,
+       auth = excluded.auth, platform = excluded.platform, created_at = excluded.created_at, fail_count = 0`
+  ).bind(crypto.randomUUID(), user.companyId, user.userId, endpoint, p256dh, auth, platform, now).run();
+  // Keep the newest few devices per driver.
+  await env.DB.prepare(
+    `DELETE FROM push_subscriptions WHERE company_id = ? AND user_id = ? AND id NOT IN
+       (SELECT id FROM push_subscriptions WHERE company_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?)`
+  ).bind(user.companyId, user.userId, user.companyId, user.userId, PUSH_MAX_DEVICES).run();
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM push_subscriptions WHERE company_id = ? AND user_id = ?").bind(user.companyId, user.userId).first();
+  return json({ ok: true, devices: row ? row.n : 1 }, 201);
+}
+__name(pushSubscribe, "pushSubscribe");
+async function pushUnsubscribe(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+  if (!endpoint) return fail(400, "Missing endpoint.");
+  await env.DB.prepare("DELETE FROM push_subscriptions WHERE company_id = ? AND user_id = ? AND endpoint = ?").bind(user.companyId, user.userId, endpoint).run();
+  return json({ ok: true });
+}
+__name(pushUnsubscribe, "pushUnsubscribe");
+async function pushTest(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = driverOnly(user);
+  if (denied) return denied;
+  if (!vapidConfigured(env)) return fail(503, "Ride alerts are not set up yet.");
+  if (!await limitHit(env, "pushtest:" + user.userId, 6, 10 * 60 * 1e3)) return fail(429, "Too many test alerts. Try again in a few minutes.");
+  const result = await pushToUser(env, user.companyId, user.userId, rideAlertPayload("test", {}), { ttl: 120, urgency: "high", topic: "" });
+  if (!result.devices) return fail(409, "Turn on ride alerts on this phone first.");
+  return json({ ok: true, ...result });
+}
+__name(pushTest, "pushTest");
+
+function base64Bytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 // src/shell.ts
 import indexHtml from "./index.html";
 import appCss from "./app.css";
@@ -5647,6 +5799,8 @@ import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
 import { parseBrand, brandCss, brandQrCss, brandChrome, brandRenders, brandJson, brandContrastProblems, deriveBrand, simpleOf, pairOf, FONT_PAIRS, BRAND_FONT_PATH } from "./brand.js";
 import { BRAND_FONT_FILES } from "./fonts/brand-fonts.js";
 import { suggestBrand, SuggestError } from "./brand-suggest.js";
+import { sendPush, vapidConfigured, endpointProblem, subscriptionKeysProblem, rideAlertPayload } from "./push.js";
+import { RIDE_ALERT_MP3_B64, RIDE_ALERT_OGG_B64 } from "./sounds/ride-alert-audio.js";
 import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS, PAYPAL_OPEN_STATUSES, payPalOutcome, eventInvoice, verifyWebhook, fetchPayPalInvoice } from "./paypal.js";
 import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, trialSubscriptionParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
@@ -5662,6 +5816,8 @@ var FILES = {
   "/app.css": { body: appCss, type: "text/css; charset=utf-8", cache: "public, max-age=300" },
   "/app.js": { body: appJs, type: "text/javascript; charset=utf-8", cache: "no-cache" },
   "/sw.js": { body: swJs, type: "text/javascript; charset=utf-8", cache: "no-cache" },
+  "/sounds/ride-alert.mp3": { body: base64Bytes(RIDE_ALERT_MP3_B64), type: "audio/mpeg", cache: "public, max-age=86400" },
+  "/sounds/ride-alert.ogg": { body: base64Bytes(RIDE_ALERT_OGG_B64), type: "audio/ogg", cache: "public, max-age=86400" },
   "/robots.txt": { body: robotsTxt, type: "text/plain; charset=utf-8", cache: "public, max-age=300" },
   "/manifest.webmanifest": { body: manifest, type: "application/manifest+json", cache: "public, max-age=300" },
   "/brand/wordmark.svg": { body: wordmark, type: "image/svg+xml", cache: "public, max-age=300" },
@@ -5866,7 +6022,8 @@ __name(securityHeaders, "securityHeaders");
 
 // src/index.ts
 var index_default = {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    if (ctx) REQUEST_CTX.set(request, ctx);
     const url = new URL(request.url);
     if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
       if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
