@@ -3367,6 +3367,11 @@ if ("serviceWorker" in navigator) {
 }
 
 // Backup for phones without push (or iPhone in Safari): while the app is open, check every 30 s.
+function alertDay(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
+  if (!m) return iso || "";
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" }).replace(",", "");
+}
 function rideAlertKey(ride) { return ride.status === "cancelled" || ride.status === "completed" ? "" : ride.id; }
 async function pollDriverRides() {
   if (!isDriverView() || document.visibilityState !== "visible") return;
@@ -3378,7 +3383,7 @@ async function pollDriverRides() {
   for (const x of live) rideAlerts.seen.add(x.key);
   if (!fresh.length) return;
   const ride = fresh[0].ride;
-  onRideAlert({ kind: "assigned", rideId: ride.id, title: fresh.length > 1 ? `${fresh.length} new rides assigned` : "New ride assigned", body: `Pickup ${ride.date} · ${time12(ride.time)}`, url: "/#/rides/" + ride.id });
+  onRideAlert({ kind: "assigned", rideId: ride.id, title: fresh.length > 1 ? `${fresh.length} new rides assigned` : "New ride assigned", body: `Pickup ${alertDay(ride.date)}, ${time12(ride.time)}`, url: "/#/rides/" + ride.id });
 }
 function startDriverPolling() {
   if (rideAlerts.pollTimer || !isDriverView()) return;
@@ -3493,7 +3498,7 @@ async function paintRideAlerts(gen, message) {
     testBtn.disabled = true;
     const result = await api("/api/push/test", { method: "POST", body: {} });
     paintRideAlerts(renderGen, result.data.ok
-      ? (result.data.sent ? { ok: true, text: "Test alert sent. It should show in a few seconds." } : { text: "The alert service did not accept the test. Turn alerts off and on again." })
+      ? (result.data.sent ? { ok: true, text: "Test alert sent. It should show in a few seconds." } : { text: "The alert service is still setting up this phone. Try again in a minute. If it keeps failing, turn alerts off and on again." })
       : { text: result.data.error || "Could not send a test alert." });
   };
   const off = box.querySelector("#alerts-off");

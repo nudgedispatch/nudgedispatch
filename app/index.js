@@ -5632,11 +5632,14 @@ function inBackground(request, task) {
 __name(inBackground, "inBackground");
 var PUSH_MAX_DEVICES = 10;
 var PUSH_MAX_FAILS = 20;
+// FCM can answer 410 for a few seconds right after a browser subscribes, before the new token propagates.
+// A brand-new subscription is only counted as a failure then; after this window 404/410 deletes it.
+var PUSH_NEW_GRACE_MS = 10 * 60 * 1e3;
 async function pushToUser(env, companyId, userId, payload, opts) {
   const out = { devices: 0, sent: 0, failed: 0, removed: 0 };
   if (!vapidConfigured(env) || !userId) return out;
   const rows = (await env.DB.prepare(
-    "SELECT id, endpoint, p256dh, auth, fail_count FROM push_subscriptions WHERE company_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?"
+    "SELECT id, endpoint, p256dh, auth, fail_count, created_at FROM push_subscriptions WHERE company_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?"
   ).bind(companyId, userId, PUSH_MAX_DEVICES).all()).results || [];
   out.devices = rows.length;
   await Promise.all(rows.map(async (sub) => {
@@ -5649,7 +5652,7 @@ async function pushToUser(env, companyId, userId, payload, opts) {
     if (result.ok) {
       out.sent++;
       await env.DB.prepare("UPDATE push_subscriptions SET last_ok = ?, fail_count = 0 WHERE id = ?").bind(Date.now(), sub.id).run();
-    } else if (result.gone || (sub.fail_count || 0) + 1 >= PUSH_MAX_FAILS) {
+    } else if ((result.gone && Date.now() - (sub.created_at || 0) > PUSH_NEW_GRACE_MS) || (sub.fail_count || 0) + 1 >= PUSH_MAX_FAILS) {
       out.removed++;
       await env.DB.prepare("DELETE FROM push_subscriptions WHERE id = ?").bind(sub.id).run();
     } else {

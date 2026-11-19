@@ -36,6 +36,14 @@ async function applyMigrations(persistTo) {
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("local migration exited " + code))));
   });
 }
+async function localSql(persistTo, command) {
+  await new Promise((resolve, reject) => {
+    const child = spawn("npx", ["wrangler", "d1", "execute", "nudge-app-local", "--local", "--persist-to", persistTo, "--command", command],
+      { cwd: new URL("..", import.meta.url).pathname, env: { ...process.env, CI: "1" }, stdio: "ignore" });
+    child.on("error", reject);
+    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("local sql exited " + code))));
+  });
+}
 async function owner(worker, email, companyName) {
   const invite = await call(worker, "/api/admin/invites", { method: "POST", admin: true, body: { email, companyName, accountKind: "fleet" } });
   assert.equal(invite.status, 201, JSON.stringify(invite.data));
@@ -204,6 +212,14 @@ test("driver ride alerts: subscribe, assign/reassign/cancel/schedule push, 410 c
     const a2 = await call(worker, `/api/rides/${ride2.data.ride.id}`, { method: "PATCH", session: s, body: { driverUserId: sam.id } });
     assert.equal(a2.status, 200);
     assert.equal(a2.data.ride.driverUserId, sam.id);
+    assert.ok(await nextFor("/p/sam", mark));
+    // A brand-new subscription survives a 410 (FCM answers 410 for a moment right after subscribing).
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal((await call(worker, "/api/push/config", { session: sam.session })).data.devices, 1, "new subscription kept after early 410");
+    // Once it is older than the grace window, 410 deletes it.
+    await localSql(persistTo, "UPDATE push_subscriptions SET created_at = 0");
+    mark = push.received.length;
+    assert.equal((await call(worker, "/api/push/test", { method: "POST", session: sam.session, body: {} })).status, 200);
     assert.ok(await nextFor("/p/sam", mark));
     let devices = 1;
     for (let i = 0; i < 40 && devices; i++) {
