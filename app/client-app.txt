@@ -1696,7 +1696,7 @@ function brandMockHtml(name, logo) {
 function brandColorField(id, label, value, hint) {
   return `<div class="brand-color"><label for="${id}">${esc(label)}</label><div class="brand-color-row"><input type="color" id="${id}-pick" value="${esc(value)}" aria-label="${esc(label)} picker"><input id="${id}" value="${esc(value)}" maxlength="7" autocapitalize="none" autocomplete="off" spellcheck="false"></div>${hint ? `<span class="sub">${esc(hint)}</span>` : ""}</div>`;
 }
-const BRAND_ADV_KEYS = [["accent", "Button"], ["accentDark", "Button pressed"], ["accentLight", "Highlight / focus"], ["ink", "Text"], ["inkSoft", "Labels"], ["muted", "Small print"], ["bg", "Page"], ["paper", "Header and cards"], ["line", "Lines"]];
+const BRAND_ADV_KEYS = [["accent", "Button"], ["accentDark", "Button pressed"], ["accentLight", "Highlight / focus"], ["ink", "Text"], ["inkSoft", "Labels"], ["muted", "Small print"], ["bg", "Page"], ["paper", "Header and cards"], ["line", "Lines"], ["field", "Field borders"]];
 async function renderBrandSettings(gen, companyId) {
   const admin = !!companyId;
   const apiPath = admin ? "/api/platform/companies/" + encodeURIComponent(companyId) + "/brand" : "/api/brand";

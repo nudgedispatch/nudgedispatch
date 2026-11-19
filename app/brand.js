@@ -89,6 +89,9 @@ export function parseBrand(value) {
     if (!hex) return null;
     colors[key] = hex;
   }
+  // Optional 10th color: form field border (absent on PR #31 brands, which keep the brochure default).
+  const field = normalizeThemeHex(raw.colors.field);
+  if (field) colors.field = field;
   const fonts = {};
   const f = raw.fonts && typeof raw.fonts === "object" ? raw.fonts : {};
   for (const slot of ["heading", "body"]) {
@@ -165,6 +168,7 @@ export function deriveBrand(simple, fontPair) {
       ink, inkSoft: ensureContrast(mix(ink, bg, 0.15), paper, 7, ink),
       muted: ensureContrast(mix(ink, bg, 0.3), paper, 4.5, ink),
       bg, paper, line: mix(bg, ink, 0.2),
+      field: ensureContrast(mix(bg, ink, 0.35), mix(bg, ink, 0.07), 3, ink),
     };
   } else {
     const paper = mix(bg, "#ffffff", 0.45);
@@ -173,6 +177,7 @@ export function deriveBrand(simple, fontPair) {
       ink, inkSoft: ensureContrast(mix(ink, bg, 0.2), paper, 7, ink),
       muted: ensureContrast(mix(ink, bg, 0.4), paper, 4.5, ink),
       bg, paper, line: mix(bg, ink, 0.16),
+      field: ensureContrast(mix(bg, ink, 0.3), "#ffffff", 3, ink),
     };
   }
   const out = { v: 1, colors, fonts };
@@ -207,7 +212,7 @@ export function brandTokens(brand) {
     ...c, base: dark ? "dark" : "light", onAccent, onAccentDark, fonts: b.fonts, source: b.source, headWeight,
     accentText: dark ? c.accentLight : c.accentDark,
     fieldBg: dark ? mix(c.bg, c.ink, 0.07) : "#ffffff",
-    fieldBorder: dark ? mix(c.bg, c.ink, 0.35) : "#bfb193",
+    fieldBorder: c.field || (dark ? mix(c.bg, c.ink, 0.35) : "#bfb193"),
     headerRule: dark ? c.accentDark : c.ink,
     errColor: dark ? "#ff9b8f" : "#a1281a",
   };
