@@ -465,6 +465,16 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .air-msg.ok { color: var(--green); }
 .air-msg.bad { color: var(--red); }
 
+/* Text-to-ride drafts */
+.intake-box { background: #141c26; border: 1px solid #263649; border-radius: 12px; padding: 10px 12px; margin: 8px 0 0; }
+.intake-label { margin: 0 0 4px; text-transform: uppercase; letter-spacing: .04em; font-size: 12px; }
+.intake-msg { margin: 0 0 6px; padding: 8px 10px; border-left: 3px solid var(--teal); background: #0f151d; border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.intake-msg .sub { display: block; margin-top: 4px; }
+.intake-warn { margin: 6px 0 0; padding-left: 20px; color: #e8c37a; font-size: 15px; }
+.intake-count { color: #e8c37a; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.grid2 > label { min-width: 0; }
+
 /* 15-ride free trial (Nov 17, 2026) */
 .card.trial { position: relative; }
 .card.trial-converted, .card.trial-converting { border-color: #2f6b45; }
