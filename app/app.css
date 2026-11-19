@@ -530,3 +530,10 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .brand-ok { color: var(--green); margin: 10px 0 0; }
 .brand-locked .badge { color: var(--teal-2); }
 @media (max-width: 420px) { .brand-adv-grid { grid-template-columns: 1fr; } }
+.brand-suggest-row { display: flex; gap: 8px; align-items: stretch; margin-top: 6px; }
+.brand-suggest-row input { flex: 1 1 auto; min-width: 0; }
+.brand-suggest-row .btn { flex: 0 0 auto; margin: 0; }
+.brand-swatches { display: grid; grid-template-columns: 28px 1fr 28px 1fr; gap: 6px 8px; align-items: center; margin: 8px 0; }
+.brand-swatch { width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--line); }
+.brand-suggestion .admin-actions { display: flex; gap: 8px; margin-top: 10px; }
+.brand-suggestion .admin-actions .btn { flex: 1; margin: 0; }

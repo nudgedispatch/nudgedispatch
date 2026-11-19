@@ -2667,6 +2667,9 @@ async function handleApi(request, env) {
     if (path === "/api/brand" && method === "PUT") return putBrand(request, env);
     if (path === "/api/brand" && method === "DELETE") return deleteBrand(request, env);
     if (path === "/api/brand/check" && method === "POST") return checkBrand(request, env);
+    if (path === "/api/brand/suggest" && method === "POST") return suggestBrandApi(request, env);
+    const platformBrandSuggest = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/brand\/suggest$/.exec(path);
+    if (platformBrandSuggest && method === "POST") return suggestBrandApi(request, env, platformBrandSuggest[1]);
     if (path === "/api/brand/preview.css" && method === "GET") return brandPreviewCss(request, env);
     const platformBrand = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/brand$/.exec(path);
     if (platformBrand && method === "GET") return getBrand(request, env, platformBrand[1]);
@@ -4789,6 +4792,43 @@ async function putBrand(request, env, companyId) {
   return getBrand(new Request(request.url, { headers: request.headers }), env, companyId);
 }
 __name(putBrand, "putBrand");
+// "Paste your website URL" suggestions. Never saves anything; the owner reviews and presses Save.
+var BRAND_SUGGEST_MAX = 10;
+var BRAND_SUGGEST_WINDOW_MS = 60 * 60 * 1e3;
+async function brandSuggestAllowed(env, companyId) {
+  const bucket = "brand-suggest:" + companyId;
+  const now = Date.now();
+  const row = await env.DB.prepare("SELECT hits, window_started FROM booking_limits WHERE bucket = ?").bind(bucket).first();
+  if (!row || now - row.window_started > BRAND_SUGGEST_WINDOW_MS) {
+    await env.DB.prepare(
+      `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?, 1, ?)
+       ON CONFLICT(bucket) DO UPDATE SET hits = 1, window_started = excluded.window_started`
+    ).bind(bucket, now).run();
+    return true;
+  }
+  if (row.hits >= BRAND_SUGGEST_MAX) return false;
+  await env.DB.prepare("UPDATE booking_limits SET hits = hits + 1 WHERE bucket = ?").bind(bucket).run();
+  return true;
+}
+__name(brandSuggestAllowed, "brandSuggestAllowed");
+async function suggestBrandApi(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, true);
+  if (isResponse(a)) return a;
+  const paid = await companyPaid(env, a.companyId);
+  if (!a.admin && !paid) return fail(403, brandLockText(paid, null));
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  if (!await brandSuggestAllowed(env, a.companyId)) return fail(429, "That's a lot of lookups. Try again in an hour.");
+  try {
+    const out = await suggestBrand(typeof body.url === "string" ? body.url : "");
+    const brand = parseBrand(deriveBrand(out.simple, out.simple.pair));
+    return json({ ok: true, suggestion: out, problems: brandContrastProblems(brand) });
+  } catch (e) {
+    const known = e instanceof SuggestError;
+    return json({ ok: false, error: known ? e.message : "We couldn't read that website.", code: known ? e.code : "fetch" }, known && e.code === "url" ? 400 : 422);
+  }
+}
+__name(suggestBrandApi, "suggestBrandApi");
 async function deleteBrand(request, env, companyId) {
   const a = await brandActor(request, env, companyId, true);
   if (isResponse(a)) return a;
@@ -5606,6 +5646,7 @@ import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugPr
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
 import { parseBrand, brandCss, brandQrCss, brandChrome, brandRenders, brandJson, brandContrastProblems, deriveBrand, simpleOf, pairOf, FONT_PAIRS, BRAND_FONT_PATH } from "./brand.js";
 import { BRAND_FONT_FILES } from "./fonts/brand-fonts.js";
+import { suggestBrand, SuggestError } from "./brand-suggest.js";
 import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS, PAYPAL_OPEN_STATUSES, payPalOutcome, eventInvoice, verifyWebhook, fetchPayPalInvoice } from "./paypal.js";
 import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, trialSubscriptionParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
 import { driverFields, passcodeProblem, isRosterEmail, rosterEmailFor } from "./drivers.js";
