@@ -2663,6 +2663,15 @@ async function handleApi(request, env) {
     if (revokeLink && method === "POST") return revokeLocationLink(request, env, revokeLink[1]);
     const viewLink = /^\/api\/location\/view\/([A-Za-z0-9_-]{20,})$/.exec(path);
     if (viewLink && method === "GET") return viewLocation(env, viewLink[1]);
+    if (path === "/api/brand" && method === "GET") return getBrand(request, env);
+    if (path === "/api/brand" && method === "PUT") return putBrand(request, env);
+    if (path === "/api/brand" && method === "DELETE") return deleteBrand(request, env);
+    if (path === "/api/brand/check" && method === "POST") return checkBrand(request, env);
+    if (path === "/api/brand/preview.css" && method === "GET") return brandPreviewCss(request, env);
+    const platformBrand = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/brand$/.exec(path);
+    if (platformBrand && method === "GET") return getBrand(request, env, platformBrand[1]);
+    if (platformBrand && method === "PUT") return putBrand(request, env, platformBrand[1]);
+    if (platformBrand && method === "DELETE") return deleteBrand(request, env, platformBrand[1]);
     if (path === "/api/settings" && method === "GET") return getSettings(request, env);
     if (path === "/api/settings" && method === "PUT") return putSettings(request, env);
     if (path === "/api/rate-sheet" && method === "GET") return getRateSheet(request, env);
@@ -4646,6 +4655,150 @@ function invoiceText(settings, ride, number, issuedOn) {
   ].join("\n");
 }
 __name(invoiceText, "invoiceText");
+
+// ---- Booking page brand ("Match your website") ----
+// Gating (Jesse, Nov 19, 2026): free trial uses standard stock. Owners on a paid plan edit their own brand;
+// a platform admin (assisted setup) can set one for any company, and an admin-set brand renders on any plan.
+async function companyPaid(env, companyId) {
+  const row = await env.DB.prepare(`SELECT ${TRIAL_COLS} FROM companies c WHERE c.id = ?`).bind(companyId).first();
+  if (!row) return false;
+  return trialState(row, 0).plan === "active";
+}
+__name(companyPaid, "companyPaid");
+// The brand a public page should render for this company row (needs id + brand_json), or null.
+async function renderedBrand(env, company) {
+  if (!company) return null;
+  const brand = parseBrand(company.brand_json);
+  if (!brand) return null;
+  if (brand.source !== "owner") return brand;
+  return brandRenders(brand, await companyPaid(env, company.id)) ? brand : null;
+}
+__name(renderedBrand, "renderedBrand");
+async function brandActor(request, env, companyId, mutate) {
+  if (companyId) {
+    const user = await platformUser(request, env, mutate);
+    if (isResponse(user)) return user;
+    const row = await env.DB.prepare("SELECT id, name, booking_slug FROM companies WHERE id = ?").bind(companyId).first();
+    if (!row) return fail(404, "No company with that id.");
+    return { user, companyId, admin: true, company: row };
+  }
+  const user = await authed(request, env, mutate);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const row = await env.DB.prepare("SELECT id, name, booking_slug FROM companies WHERE id = ?").bind(user.companyId).first();
+  return { user, companyId: user.companyId, admin: false, company: row || { id: user.companyId } };
+}
+__name(brandActor, "brandActor");
+// Body: { mode: "simple", simple: { base, primary, accent, background, text }, pair } or
+//       { mode: "advanced", base, colors: {9 keys}, pair }
+function brandFromBody(body) {
+  const pair = typeof body.pair === "string" ? body.pair : "standard";
+  if (body.mode === "advanced") {
+    const fp = FONT_PAIRS.find((p) => p.id === pair) || FONT_PAIRS[0];
+    const fonts = {};
+    if (fp.heading) fonts.heading = fp.heading;
+    if (fp.body) fonts.body = fp.body;
+    return parseBrand({ v: 1, base: body.base === "dark" ? "dark" : "light", colors: body.colors || {}, fonts });
+  }
+  return parseBrand(deriveBrand(body.simple || {}, pair));
+}
+__name(brandFromBody, "brandFromBody");
+function brandLockText(paid, brand) {
+  if (paid) return "";
+  if (brand && brand.source !== "owner") return "Your booking page brand was set up for you by Nudge Dispatch. Custom branding you edit yourself comes with a paid plan.";
+  return "Your free trial uses the standard Nudge look. Matching your booking page to your website comes with a paid plan. Ask Jesse at nudgedispatch@gmail.com to upgrade or for assisted setup.";
+}
+__name(brandLockText, "brandLockText");
+async function getBrand(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, false);
+  if (isResponse(a)) return a;
+  const settings = await loadSettings(env, a.companyId);
+  const brand = parseBrand(settings && settings.brand_json);
+  const paid = await companyPaid(env, a.companyId);
+  const locked = !a.admin && !paid;
+  return json({
+    ok: true,
+    admin: a.admin,
+    companyName: (settings && settings.business_name) || (a.company && a.company.name) || "",
+    bookingSlug: (a.company && a.company.booking_slug) || "",
+    paid,
+    locked,
+    lockedText: locked ? brandLockText(paid, brand) : "",
+    brand,
+    simple: simpleOf(brand),
+    pair: pairOf(brand),
+    renders: !!brand && brandRenders(brand, paid),
+    logoDataUrl: (settings && settings.logo_data_url) || "",
+    fontPairs: FONT_PAIRS.map((p) => ({ id: p.id, name: p.name }))
+  });
+}
+__name(getBrand, "getBrand");
+async function checkBrand(request, env) {
+  const user = await requireUser(request, env);
+  if (isResponse(user)) return user;
+  const csrf = await requireCsrf(request, user);
+  if (csrf) return csrf;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const brand = brandFromBody(body);
+  if (!brand) return json({ ok: true, brand: null, problems: brandContrastProblems(null) });
+  return json({ ok: true, brand, simple: simpleOf(brand), problems: brandContrastProblems(brand) });
+}
+__name(checkBrand, "checkBrand");
+async function brandPreviewCss(request, env) {
+  const user = await requireUser(request, env);
+  if (isResponse(user)) return new Response("", { status: 401, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
+  const raw = new URL(request.url).searchParams.get("b") || "";
+  const brand = parseBrand(raw);
+  const css = brand ? brandCss(brand, "#brand-live .bookpage-mock", { scoped: true }) : "";
+  return new Response(css, { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
+}
+__name(brandPreviewCss, "brandPreviewCss");
+async function ensureSettingsRow(env, companyId, name) {
+  await env.DB.prepare("INSERT INTO invoice_settings (company_id, business_name, updated_at) VALUES (?, ?, ?) ON CONFLICT(company_id) DO NOTHING").bind(companyId, name || "", Date.now()).run();
+}
+__name(ensureSettingsRow, "ensureSettingsRow");
+async function putBrand(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, true);
+  if (isResponse(a)) return a;
+  const paid = await companyPaid(env, a.companyId);
+  if (!a.admin && !paid) return fail(403, brandLockText(paid, null));
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const brand = brandFromBody(body);
+  if (!brand) return fail(400, "Pick a color for every field.");
+  const problems = brandContrastProblems(brand);
+  if (problems.length) return json({ ok: false, error: "Some colors are hard to read. Adjust them before saving.", problems }, 400);
+  let logo;
+  if (body.logoDataUrl !== void 0) {
+    if (body.logoDataUrl === "") logo = "";
+    else if (typeof body.logoDataUrl !== "string" || body.logoDataUrl.length > 18e4 || !LOGO_RE.test(body.logoDataUrl)) {
+      return fail(400, "The logo must be a PNG, JPG, or WebP image under about 120 KB.");
+    } else logo = body.logoDataUrl;
+  }
+  const stored = brandJson(brand, a.admin ? "admin" : "owner");
+  await ensureSettingsRow(env, a.companyId, a.company && a.company.name);
+  const now = Date.now();
+  if (logo !== void 0) {
+    await env.DB.prepare("UPDATE invoice_settings SET brand_json = ?, logo_data_url = ?, updated_at = ? WHERE company_id = ?").bind(stored, logo, now, a.companyId).run();
+  } else {
+    await env.DB.prepare("UPDATE invoice_settings SET brand_json = ?, updated_at = ? WHERE company_id = ?").bind(stored, now, a.companyId).run();
+  }
+  if (a.admin) await writeAudit(env, a.user.userId, "brand.set", "company", a.companyId, { name: a.company && a.company.name, base: brand.base || "light", logo: logo !== void 0 });
+  return getBrand(new Request(request.url, { headers: request.headers }), env, companyId);
+}
+__name(putBrand, "putBrand");
+async function deleteBrand(request, env, companyId) {
+  const a = await brandActor(request, env, companyId, true);
+  if (isResponse(a)) return a;
+  const paid = await companyPaid(env, a.companyId);
+  if (!a.admin && !paid) return fail(403, brandLockText(paid, null));
+  await env.DB.prepare("UPDATE invoice_settings SET brand_json = '', updated_at = ? WHERE company_id = ?").bind(Date.now(), a.companyId).run();
+  if (a.admin) await writeAudit(env, a.user.userId, "brand.reset", "company", a.companyId, { name: a.company && a.company.name });
+  return getBrand(new Request(request.url, { headers: request.headers }), env, companyId);
+}
+__name(deleteBrand, "deleteBrand");
 async function loadSettings(env, companyId) {
   return env.DB.prepare("SELECT * FROM invoice_settings WHERE company_id = ?").bind(companyId).first();
 }
@@ -5451,7 +5604,7 @@ import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";
-import { parseBrand, brandCss, BRAND_FONT_PATH } from "./brand.js";
+import { parseBrand, brandCss, brandQrCss, brandChrome, brandRenders, brandJson, brandContrastProblems, deriveBrand, simpleOf, pairOf, FONT_PAIRS, BRAND_FONT_PATH } from "./brand.js";
 import { BRAND_FONT_FILES } from "./fonts/brand-fonts.js";
 import { PayPalError, paypalServerMode, paypalServerProblem, allowedAppModes, validateCredentialsInput, credentialsSummary, saveCredentials, removeCredentials, loadPayPalCredentials, testConnection, PAYPAL_WEBHOOK_EVENTS, buildPayPalInvoice, createAndSendInvoice, validRiderEmail, safePayerUrl, PAYPAL_STATUS_LABELS, PAYPAL_OPEN_STATUSES, payPalOutcome, eventInvoice, verifyWebhook, fetchPayPalInvoice } from "./paypal.js";
 import { PUBLIC_BILLING_PLAN, SIGNUP_TERMS_VERSION, TERMS_CONSENT_ERROR, SIGNUP_TTL_MS, SIGNUP_RATE_WINDOW_MS, SIGNUP_POST_MAX, SIGNUP_SLUG_MAX, signupPublicConfig, signupFieldProblems, signupWantsSms, suggestedSlug, checkoutParams, trialSubscriptionParams, isSignupCheckout, signupSessionProblem, verifyTurnstile, normSignupEmail, normalizeSignupPhone } from "./signup.js";
@@ -5511,6 +5664,8 @@ async function serveBookingManifest(env, slug) {
   if (!company) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
   const companyName = publicCompanyName(company);
   const base = "/book/" + slug + "/";
+  const brandNow = await renderedBrand(env, company);
+  const chrome = brandNow ? brandChrome(brandNow) : null;
   const body = JSON.stringify({
     id: base,
     name: companyName + " \u2014 Book a ride",
@@ -5519,8 +5674,8 @@ async function serveBookingManifest(env, slug) {
     start_url: base,
     scope: base,
     display: "standalone",
-    background_color: themeVars(company.theme_color || "").background,
-    theme_color: themeVars(company.theme_color || "").background,
+    background_color: chrome ? chrome.background : themeVars(company.theme_color || "").background,
+    theme_color: chrome ? chrome.header : themeVars(company.theme_color || "").background,
     icons: [
       { src: base + "icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
       { src: base + "icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
@@ -5561,7 +5716,8 @@ async function serveBookingQr(env, slug, rest, url) {
   const bookingUrl = bookingUrlFor(url.origin, slug);
   const logoDataUrl = company.logo_data_url || "";
   if (rest === "/qr/") {
-    const html = qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl, themeColor: company.theme_color || "", assetTag: BOOK_QR_TAG });
+    const qrBrand = await renderedBrand(env, company);
+    const html = qrPageHtml({ slug, companyName, bookingUrl, logoDataUrl, themeColor: company.theme_color || "", assetTag: BOOK_QR_TAG, brandChrome: qrBrand ? brandChrome(qrBrand) : null });
     return new Response(html, { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/qr.svg") {
@@ -5571,8 +5727,13 @@ async function serveBookingQr(env, slug, rest, url) {
     const png = await qrPng(bookingUrl, { logoDataUrl });
     return new Response(png, { status: 200, headers: securityHeaders("image/png", "public, max-age=300") });
   }
+  if (rest === "/qr/theme.css") {
+    const qrBrand = await renderedBrand(env, company);
+    return new Response(qrBrand ? brandQrCss(qrBrand) : "", { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
+  }
   if (rest === "/qr/manifest.webmanifest") {
-    return new Response(JSON.stringify(qrManifest(slug, companyName, company.theme_color || "")), { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
+    const qrBrand = await renderedBrand(env, company);
+    return new Response(JSON.stringify(qrManifest(slug, companyName, company.theme_color || "", qrBrand ? brandChrome(qrBrand) : null)), { status: 200, headers: securityHeaders("application/manifest+json", "no-store") });
   }
   return new Response(bookQrSwJs, { status: 200, headers: securityHeaders("text/javascript; charset=utf-8", "no-store") });
 }
@@ -5589,16 +5750,17 @@ async function serveBookingAsset(request, env, slug, rest, url) {
   if (rest === "/") {
     const company = await publicBookingCompany(env, slug);
     const companyName = company ? publicCompanyName(company) : "";
-    const brand = company ? parseBrand(company.brand_json) : null;
-    return new Response(bookPageHtml(companyName, brand ? brand.colors.paper : company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+    const brand = await renderedBrand(env, company);
+    return new Response(bookPageHtml(companyName, brand ? brandChrome(brand).header : company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
   }
   if (rest === "/theme.css") {
     const company = await publicBookingCompany(env, slug);
-    const css = company ? (brandCss(company.brand_json) || themeCss(company.theme_color || "")) : "";
+    const brand = await renderedBrand(env, company);
+    const css = company ? (brand ? brandCss(brand) : themeCss(company.theme_color || "")) : "";
     return new Response(css, { status: 200, headers: securityHeaders("text/css; charset=utf-8", "no-store") });
   }
   if (rest === "/manifest.webmanifest") return serveBookingManifest(env, slug);
-  if (rest === "/qr" || rest === "/qr/" || rest === "/qr.png" || rest === "/qr.svg" || rest === "/qr/manifest.webmanifest" || rest === "/qr/sw.js") {
+  if (rest === "/qr" || rest === "/qr/" || rest === "/qr.png" || rest === "/qr.svg" || rest === "/qr/manifest.webmanifest" || rest === "/qr/sw.js" || rest === "/qr/theme.css") {
     return serveBookingQr(env, slug, rest, url);
   }
   if (rest === "/sw.js") {

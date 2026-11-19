@@ -498,3 +498,35 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 #pp-invoice .err:empty, #paypal-card .err:empty { display: none; }
 #pp-invoice .actions { margin-top: 8px; }
 #pp-webhook-url { overflow-wrap: anywhere; }
+
+/* Booking page brand settings (Nov 19, 2026) */
+#brand-live { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; margin: 8px 0 4px; }
+#brand-live .bookpage-mock { background: var(--bg); color: var(--text); }
+#brand-live .bookpage-mock .top { position: static; display: flex; align-items: center; gap: 10px; padding: 10px 14px; z-index: auto; }
+#brand-live .bookpage-mock .logo { width: 34px; height: 34px; object-fit: contain; }
+#brand-live .bookpage-mock .brand .coname { display: block; }
+#brand-live .bookpage-mock .brand small { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+#brand-live .bookpage-mock .mock-body { padding: 10px 14px 14px; }
+#brand-live .bookpage-mock h1 { margin: 4px 0 8px; }
+#brand-live .bookpage-mock .two { display: flex; gap: 10px; }
+#brand-live .bookpage-mock .two label { flex: 1; min-width: 0; }
+#brand-live .bookpage-mock .btn { display: block; width: 100%; margin: 10px 0; }
+#brand-live .bookpage-mock input, #brand-live .bookpage-mock select { pointer-events: none; }
+.brand-fs { border: 1px solid var(--line); border-radius: 12px; padding: 6px 12px 12px; margin: 12px 0 0; min-width: 0; }
+.brand-fs legend { color: var(--muted); font-size: 14px; padding: 0 6px; }
+.brand-presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.brand-preset { min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 2px solid var(--line); font-size: 14px; font-weight: 600; }
+.brand-color { margin: 12px 0 0; }
+.brand-color label { margin: 0 0 6px; }
+.brand-color-row { display: flex; gap: 8px; align-items: center; }
+.brand-color-row input[type=color] { width: 52px; min-width: 52px; height: 50px; padding: 4px; border-radius: 10px; }
+.brand-adv summary { cursor: pointer; color: var(--teal-2); margin: 14px 0 4px; font-weight: 600; }
+.brand-adv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.brand-logo-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.brand-logo-thumb { width: 96px; height: 64px; object-fit: contain; background: #fff; border-radius: 8px; padding: 4px; }
+.brand-logo-row .btn { margin: 0; }
+.brand-checks .brand-bad { border-color: var(--red); }
+.brand-checks .brand-bad ul { margin: 6px 0 0; padding-left: 18px; }
+.brand-ok { color: var(--green); margin: 10px 0 0; }
+.brand-locked .badge { color: var(--teal-2); }
+@media (max-width: 420px) { .brand-adv-grid { grid-template-columns: 1fr; } }

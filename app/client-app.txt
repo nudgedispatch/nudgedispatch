@@ -1613,6 +1613,270 @@ function contrastText(bg) {
   return (1.05 / (L + 0.05)) >= ((L + 0.05) / 0.05) ? "#f5f5f5" : "#111111";
 }
 
+// ---- Booking page brand ("Match your website") ----
+// Owner (paid plans) at #/settings/brand; platform admin for any company at #/admin/brand/<companyId>.
+const BRAND_PRESETS = [
+  ["Ivory & gold", { base: "light", primary: "#a8842f", accent: "#8a6d24", background: "#f5f0e6", text: "#111111" }, "classic"],
+  ["Black & gold", { base: "dark", primary: "#e8d060", accent: "#e8d060", background: "#0b0b0b", text: "#f5f0e6" }, "classic"],
+  ["White & navy", { base: "light", primary: "#1f3a5f", accent: "#1f3a5f", background: "#ffffff", text: "#111111" }, "modern"],
+  ["Charcoal & teal", { base: "dark", primary: "#5fd6c4", accent: "#8ee6d8", background: "#121417", text: "#f2efe8" }, "clean"],
+  ["Forest", { base: "light", primary: "#1d5c47", accent: "#1d5c47", background: "#f4f1ea", text: "#132018" }, "warm"],
+];
+const BRAND_LOGO_EDGES = [400, 320, 240];
+const BRAND_LOGO_MAX = 120000;
+async function compressBrandLogo(file) {
+  if (file.size > 15 * 1024 * 1024) throw new Error("too-large");
+  const img = await loadImageFromFile(file);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("canvas");
+  try {
+    for (const edge of BRAND_LOGO_EDGES) {
+      const w = img.naturalWidth || img.width;
+      const h = img.naturalHeight || img.height;
+      const scale = Math.min(1, edge / Math.max(w, h, 1));
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const webp = canvas.toDataURL("image/webp", 0.86);
+      if (webp.startsWith("data:image/webp") && webp.length <= BRAND_LOGO_MAX) return webp;
+      const png = canvas.toDataURL("image/png");
+      if (png.length <= BRAND_LOGO_MAX) return png;
+    }
+  } finally {
+    if (img && typeof img.close === "function") try { img.close(); } catch { /* ignore */ }
+  }
+  throw new Error("too-large");
+}
+function brandLum(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || "").trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const ch = (c) => { const s = c / 255; return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); };
+  return 0.2126 * ch((n >> 16) & 255) + 0.7152 * ch((n >> 8) & 255) + 0.0722 * ch(n & 255);
+}
+function brandRatio(a, b) {
+  const x = brandLum(a); const y = brandLum(b);
+  if (x === null || y === null) return 0;
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+// Instant client-side check on the four main colors (the server re-checks every derived color on save).
+function brandQuickProblems(simple) {
+  const out = [];
+  const keys = ["primary", "accent", "background", "text"];
+  for (const k of keys) if (brandLum(simple[k]) === null) out.push(`Enter ${k} as a 6-digit hex color, like #a8842f.`);
+  if (out.length) return out;
+  const dark = simple.base === "dark";
+  const textOnButton = Math.max(...(dark ? [simple.background, "#111111", simple.text, "#ffffff"] : [simple.text, "#ffffff"]).map((c) => brandRatio(simple.primary, c)));
+  const checks = [
+    ["Body text on the page background", brandRatio(simple.text, simple.background), 4.5],
+    ["Large headings", brandRatio(simple.accent, simple.background), 3],
+    ["Button against the page", brandRatio(simple.primary, simple.background), 3],
+    ["Button text", textOnButton, 4.5],
+  ];
+  for (const [label, r, need] of checks) if (r < need) out.push(`${label} is hard to read (${r.toFixed(2)}:1, needs ${need}:1).`);
+  return out;
+}
+function brandMockHtml(name, logo) {
+  return `<div class="bookpage-mock" aria-hidden="true">
+    <header class="top"><img class="logo" alt="" src="${esc(logo || "/icons/icon-192.png")}"><div class="brand"><span class="coname">${esc(name || "Your company")}</span><small>Request a ride</small></div></header>
+    <div class="mock-body">
+      <h1>Book a ride</h1>
+      <h2 class="steph">Your trip</h2>
+      <label>Pickup address<input tabindex="-1" value="100 Peachtree St, Atlanta" readonly></label>
+      <div class="two"><label>Pickup date<input tabindex="-1" type="date" value="2026-12-04" readonly></label><label>Vehicle<select tabindex="-1"><option>SUV (up to 6)</option></select></label></div>
+      <div class="card quote"><div class="sub">Instant estimate</div><div class="qprice">$125</div><p class="fine qconfirm">Final price confirmed when they approve.</p></div>
+      <button class="btn" type="button" tabindex="-1">Continue</button>
+      <button class="btn ghost" type="button" tabindex="-1">+ Add stop</button>
+      <p class="fine">Your request goes to the operator for approval.</p>
+    </div>
+  </div>`;
+}
+function brandColorField(id, label, value, hint) {
+  return `<div class="brand-color"><label for="${id}">${esc(label)}</label><div class="brand-color-row"><input type="color" id="${id}-pick" value="${esc(value)}" aria-label="${esc(label)} picker"><input id="${id}" value="${esc(value)}" maxlength="7" autocapitalize="none" autocomplete="off" spellcheck="false"></div>${hint ? `<span class="sub">${esc(hint)}</span>` : ""}</div>`;
+}
+const BRAND_ADV_KEYS = [["accent", "Button"], ["accentDark", "Button pressed"], ["accentLight", "Highlight / focus"], ["ink", "Text"], ["inkSoft", "Labels"], ["muted", "Small print"], ["bg", "Page"], ["paper", "Header and cards"], ["line", "Lines"]];
+async function renderBrandSettings(gen, companyId) {
+  const admin = !!companyId;
+  const apiPath = admin ? "/api/platform/companies/" + encodeURIComponent(companyId) + "/brand" : "/api/brand";
+  setTabs(!admin);
+  shell(`<p class="muted"><a href="${admin ? "#/admin" : "#/settings"}">${admin ? "Admin" : "More"}</a></p><h1>Booking page brand</h1><div id="brandbox" class="muted">Loading\u2026</div>`);
+  const loaded = await api(apiPath);
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#brandbox");
+  if (!loaded.data.ok) { box.textContent = loaded.data.error || "Could not load your brand."; return; }
+  let d = loaded.data;
+  box.classList.remove("muted");
+  const start = d.simple || { base: "light", primary: "#a8842f", accent: "#8a6d24", background: "#f5f0e6", text: "#111111" };
+  const pairOpts = (sel) => d.fontPairs.map((p) => `<option value="${esc(p.id)}" ${p.id === sel ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+  const status = d.brand ? (d.renders ? "Live on your booking page." : "Saved, but not shown: free trials use the standard look.") : "Your booking page uses the standard Nudge look.";
+  if (d.locked) {
+    box.innerHTML = `<section class="card brand-locked" id="brand-locked">
+        <div class="row"><span class="title">Match your website</span><span class="badge">Paid plans</span></div>
+        <p class="sub">${esc(d.lockedText)}</p>
+        <p class="sub">${esc(status)}</p>
+      </section>
+      <section class="card"><h2>What clients see now</h2><div id="brand-live" class="brand-live-standard">${brandMockHtml(d.companyName, d.logoDataUrl)}</div></section>`;
+    return;
+  }
+  box.innerHTML = `<section class="card">
+      <p class="sub">${admin ? `Assisted setup for <strong>${esc(d.companyName)}</strong>. A brand you save here shows on their booking page on any plan.` : "Make your booking page match your website: logo, colors, and fonts. Clients see it on your booking link and QR page."}</p>
+      <p class="sub" id="brand-status">${esc(status)}</p>
+    </section>
+    <form id="brandform" class="fields" novalidate>
+      <fieldset class="full brand-fs"><legend>Start from</legend><div class="brand-presets" id="brand-presets"></div></fieldset>
+      <fieldset class="full brand-fs"><legend>Look</legend>
+        <label class="check"><input type="radio" name="base" value="light" ${start.base !== "dark" ? "checked" : ""}> Light background</label>
+        <label class="check"><input type="radio" name="base" value="dark" ${start.base === "dark" ? "checked" : ""}> Dark background</label>
+      </fieldset>
+      ${brandColorField("b-primary", "Primary (buttons)", start.primary, "")}
+      ${brandColorField("b-accent", "Accent (big headings)", start.accent, "")}
+      ${brandColorField("b-background", "Background", start.background, "")}
+      ${brandColorField("b-text", "Text", start.text, "")}
+      <label class="full">Fonts<select id="b-pair">${pairOpts(d.pair === "custom" ? "standard" : d.pair)}</select><span class="sub">Open-licence fonts we host for you. Nothing loads from other sites.</span></label>
+      <details class="full brand-adv" id="brand-adv"><summary>Advanced: every color</summary>
+        <p class="sub">Change any of these to fine-tune. Editing here overrides the four colors above until you change one of them again.</p>
+        <div class="brand-adv-grid" id="brand-adv-grid"></div>
+      </details>
+      <label class="full">Logo<input id="b-logo" type="file" accept="image/png,image/jpeg,image/webp,image/*">
+        <span class="sub">We shrink it to 400px or less and save a small WebP or PNG.</span></label>
+      <div class="full brand-logo-row"><img id="b-logo-img" alt="Current logo" class="brand-logo-thumb ${d.logoDataUrl ? "" : "hidden"}" src="${esc(d.logoDataUrl || "")}"><button type="button" class="btn ghost ${d.logoDataUrl ? "" : "hidden"}" id="b-logo-remove">Remove logo</button></div>
+      <div class="full"><h2>Live preview</h2><div id="brand-live">${brandMockHtml(d.companyName, d.logoDataUrl)}</div></div>
+      <div class="full brand-checks" id="brand-checks" aria-live="polite"></div>
+      <p class="err full" id="brand-err"></p>
+      <button class="btn full" type="submit" id="brand-save">Save brand</button>
+      <button class="btn ghost full" type="button" id="brand-reset" ${d.brand ? "" : "disabled"}>Reset to standard look</button>
+    </form>`;
+  let mode = "simple";
+  let adv = d.brand ? { ...d.brand.colors } : null;
+  let advBase = d.brand && d.brand.base === "dark" ? "dark" : "light";
+  let logoChange; // undefined = unchanged, "" = remove, data URL = new
+  let serverProblems = [];
+  let serverBrand = d.brand;
+  let seq = 0;
+  let link = document.querySelector("#brand-preview-css");
+  if (!link) { link = document.createElement("link"); link.rel = "stylesheet"; link.id = "brand-preview-css"; document.head.appendChild(link); }
+  const $ = (sel) => box.querySelector(sel);
+  const readSimple = () => ({
+    base: (box.querySelector("input[name=base]:checked") || {}).value === "dark" ? "dark" : "light",
+    primary: $("#b-primary").value.trim().toLowerCase(),
+    accent: $("#b-accent").value.trim().toLowerCase(),
+    background: $("#b-background").value.trim().toLowerCase(),
+    text: $("#b-text").value.trim().toLowerCase(),
+  });
+  const drawAdv = () => {
+    const grid = $("#brand-adv-grid");
+    const colors = adv || (serverBrand && serverBrand.colors) || {};
+    grid.innerHTML = BRAND_ADV_KEYS.map(([k, label]) => brandColorField("adv-" + k, label, colors[k] || "#000000", "")).join("");
+    BRAND_ADV_KEYS.forEach(([k]) => wireColor("adv-" + k, () => { mode = "advanced"; adv = adv || { ...(serverBrand ? serverBrand.colors : {}) }; adv[k] = $("#adv-" + k).value.trim().toLowerCase(); advBase = readSimple().base; refresh(); }));
+  };
+  const drawChecks = () => {
+    const quick = mode === "simple" ? brandQuickProblems(readSimple()) : [];
+    const all = [...new Set([...quick, ...serverProblems.map((p) => p.message)])];
+    const el = $("#brand-checks");
+    el.innerHTML = all.length
+      ? `<div class="card brand-bad"><strong>Fix before saving</strong><ul>${all.map((m) => `<li>${esc(m)}</li>`).join("")}</ul></div>`
+      : `<p class="brand-ok">\u2713 Readable: text, headings, and buttons pass the WCAG contrast check.</p>`;
+    $("#brand-save").disabled = all.length > 0;
+  };
+  const payload = () => {
+    const pair = $("#b-pair").value;
+    if (mode === "advanced" && adv) return { mode: "advanced", base: advBase, colors: adv, pair };
+    return { mode: "simple", simple: readSimple(), pair };
+  };
+  const refresh = () => {
+    drawChecks();
+    const mine = ++seq;
+    clearTimeout(refresh.t);
+    refresh.t = setTimeout(async () => {
+      const r = await api("/api/brand/check", { method: "POST", body: payload() });
+      if (mine !== seq || gen !== renderGen) return;
+      if (!r.data.ok) { serverProblems = [{ message: r.data.error || "Could not check these colors." }]; drawChecks(); return; }
+      serverProblems = r.data.problems || [];
+      serverBrand = r.data.brand;
+      if (serverBrand) link.href = "/api/brand/preview.css?b=" + encodeURIComponent(JSON.stringify(serverBrand));
+      if (mode === "simple") drawAdv();
+      drawChecks();
+    }, 200);
+  };
+  function wireColor(id, onChange) {
+    const text = $("#" + id);
+    const pick = $("#" + id + "-pick");
+    if (!text || !pick) return;
+    pick.addEventListener("input", () => { text.value = pick.value; onChange(); });
+    text.addEventListener("input", () => { if (/^#[0-9a-f]{6}$/i.test(text.value.trim())) pick.value = text.value.trim().toLowerCase(); onChange(); });
+  }
+  const setSimple = (simple, pair) => {
+    ["primary", "accent", "background", "text"].forEach((k) => { $("#b-" + k).value = simple[k]; $("#b-" + k + "-pick").value = simple[k]; });
+    box.querySelectorAll("input[name=base]").forEach((r) => { r.checked = r.value === simple.base; });
+    if (pair) $("#b-pair").value = pair;
+    mode = "simple"; adv = null;
+    refresh();
+  };
+  const presets = $("#brand-presets");
+  BRAND_PRESETS.forEach(([name, simple, pair]) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "brand-preset";
+    b.textContent = name;
+    b.style.background = simple.background;
+    b.style.color = simple.text;
+    b.style.borderColor = simple.primary;
+    b.addEventListener("click", () => setSimple(simple, pair));
+    presets.appendChild(b);
+  });
+  ["b-primary", "b-accent", "b-background", "b-text"].forEach((id) => wireColor(id, () => { mode = "simple"; adv = null; refresh(); }));
+  box.querySelectorAll("input[name=base]").forEach((r) => r.addEventListener("change", () => { if (mode === "advanced") advBase = readSimple().base; refresh(); }));
+  $("#b-pair").addEventListener("change", refresh);
+  const setLogo = (url) => {
+    const img = $("#b-logo-img");
+    img.src = url || "";
+    img.classList.toggle("hidden", !url);
+    $("#b-logo-remove").classList.toggle("hidden", !url);
+    const mockLogo = box.querySelector("#brand-live .logo");
+    if (mockLogo) mockLogo.src = url || "/icons/icon-192.png";
+  };
+  $("#b-logo").addEventListener("change", async () => {
+    const file = $("#b-logo").files[0];
+    if (!file) return;
+    try { logoChange = await compressBrandLogo(file); setLogo(logoChange); $("#brand-err").textContent = ""; }
+    catch { $("#brand-err").textContent = "We couldn't use that image. Try a PNG, JPG, or WebP."; }
+  });
+  $("#b-logo-remove").addEventListener("click", () => { logoChange = ""; $("#b-logo").value = ""; setLogo(""); });
+  $("#brandform").onsubmit = async (event) => {
+    event.preventDefault();
+    const err = $("#brand-err");
+    err.style.color = "";
+    const body = payload();
+    if (logoChange !== undefined) body.logoDataUrl = logoChange;
+    $("#brand-save").disabled = true;
+    const saved = await api(apiPath, { method: "PUT", body });
+    if (gen !== renderGen) return;
+    if (!saved.data.ok) {
+      serverProblems = saved.data.problems || [];
+      drawChecks();
+      err.textContent = saved.data.error || "Could not save.";
+      return;
+    }
+    d = saved.data;
+    logoChange = undefined;
+    $("#brand-status").textContent = d.renders ? "Saved. Live on the booking page." : "Saved.";
+    $("#brand-reset").disabled = false;
+    err.style.color = "var(--green)";
+    err.textContent = "Saved.";
+    drawChecks();
+  };
+  $("#brand-reset").addEventListener("click", async () => {
+    if (!confirm("Go back to the standard Nudge look? Your colors and fonts are cleared. Your logo stays.")) return;
+    const r = await api(apiPath, { method: "DELETE", body: {} });
+    if (!r.data.ok) { $("#brand-err").textContent = r.data.error || "Could not reset."; return; }
+    route();
+  });
+  drawAdv();
+  refresh();
+}
+
 async function renderSettings(gen) {
   setTabs(true);
   shell(`<h1>More</h1><p class="muted">${esc(state.me.companyName)} · ${esc(state.me.email)}</p>${state.me.accountKind === "fleet" ? `<section class="card" id="drivers-card"><h2>Drivers</h2><p class="note">Add a driver by name. Type of vehicle and plate are optional. Then set that driver's sign-in passcode here. Drivers sign in with the company code, their name, and the passcode. Nothing is texted or emailed. Remove a driver to take them off the roster: they cannot sign in, upcoming rides become unassigned, and completed rides keep their name.</p><p class="sub" id="driver-code">Company code: loading…</p><form id="add-driver"><label>Name<input id="driver-name" maxlength="80" required autocomplete="off"></label><label>Type of vehicle<input id="driver-vehicle" maxlength="40" placeholder="SUV" autocomplete="off"></label><label>Plate number<input id="driver-plate" maxlength="12" placeholder="ABC1234" autocomplete="off" autocapitalize="characters"></label><p class="err" id="driver-err"></p><button class="btn full" type="submit">Add driver</button></form><div id="driver-list" class="muted">Loading drivers…</div></section>` : ""}<div id="box" class="muted">Loading…</div>`);
@@ -1651,6 +1915,11 @@ async function renderSettings(gen) {
       <p class="sub">Download your rides and clients as spreadsheet files (CSV). This works any time, including after a trial ends or is canceled.</p>
       <div class="export-actions"><a class="btn ghost" href="/api/export/rides.csv" download>Rides (CSV)</a><a class="btn ghost" href="/api/export/clients.csv" download>Clients (CSV)</a></div>
     </section>
+    ${state.me.role === "owner" ? `<section class="card" id="brand-card">
+      <h2>Booking page brand</h2>
+      <p class="sub">Match your booking page to your website: logo, colors, and fonts.</p>
+      <a class="btn ghost full" id="brand-link" href="#/settings/brand">Edit brand</a>
+    </section>` : ""}
     <section class="card" id="rates-card">
       <h2>Rates &amp; instant quotes</h2>
       <p class="sub">Set your vehicles, per-mile and hourly rates, airport flat fares, and fees. Clients see an estimate on your booking page; you confirm the final price when you approve.</p>
@@ -1969,6 +2238,7 @@ async function renderAdmin(gen) {
         <button class="btn ghost" type="button" data-act="edit">Edit name and plan</button>
         <button class="btn ${account.status === "suspended" ? "" : "danger"}" type="button" data-act="${account.status === "suspended" ? "reactivate" : "suspend"}">${account.status === "suspended" ? "Reactivate" : "Suspend"}</button>
         <button class="btn ghost" type="button" data-act="reset">Password reset link</button>
+        <a class="btn ghost" href="#/admin/brand/${esc(account.id)}">Booking page brand</a>
       </div>
       <div class="once" aria-live="polite"></div>
       ${adminTrialHtml(trialById[account.id])}
@@ -2970,6 +3240,8 @@ async function route() {
       location.hash = state.me ? "#/rides" : "#/login";
       return;
     }
+    const adminParts = routeName().parts;
+    if (id === "brand" && /^[0-9a-f-]{36}$/.test(adminParts[2] || "")) return renderBrandSettings(gen, adminParts[2]);
     return renderAdmin(gen);
   }
   if (billingLocked() && name !== "login" && name !== "start" && name !== "welcome") return renderLocked();
@@ -2992,6 +3264,7 @@ async function route() {
   if (name === "rides" && id) return renderRide(id, gen);
   if (name === "invoices" && id) return renderInvoice(id, gen);
   if (name === "settings" && id === "rates") return renderRateSheet(gen);
+  if (name === "settings" && id === "brand") return renderBrandSettings(gen);
   if (name === "profile" && id === "cancel") return renderCancelTrial(gen);
   if (name === "profile") return renderProfile(gen);
   if (name === "settings") return renderSettings(gen);
