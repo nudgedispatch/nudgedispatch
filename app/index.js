@@ -1331,7 +1331,18 @@ function intakeJson(row) {
     createdClient: Boolean(v.createdClient),
     ownerEdited: Boolean(v.ownerEdited),
     direction: v.parsed && v.parsed.direction || "",
-    airport: v.parsed && v.parsed.airport || null
+    airport: v.parsed && v.parsed.airport || null,
+    ...v.channel === "voice" ? {
+      callId: String(v.callId || ""),
+      callbackNumber: v.callbackNumber || "",
+      callbackDisplay: prettyPhone(v.callbackNumber || ""),
+      summary: String(v.summary || ""),
+      transcript: Array.isArray(v.transcript) ? v.transcript.map((t) => ({ who: t.who === "caller" ? "caller" : "agent", text: String(t.text || "") })) : [],
+      recordingUrl: /^https:\/\//.test(v.recordingUrl || "") ? v.recordingUrl : "",
+      callLengthMin: typeof v.callLengthMin === "number" ? v.callLengthMin : null,
+      needsCallback: Boolean(v.needsCallback),
+      fieldSource: v.fieldSource && typeof v.fieldSource === "object" ? v.fieldSource : {}
+    } : {}
   };
 }
 __name(intakeJson, "intakeJson");
@@ -1943,8 +1954,8 @@ async function decideBooking(request, env, id, decision) {
       driverId = body.driverUserId === null || body.driverUserId === "" ? null : str(body.driverUserId, 36);
       if (driverId && !await companyMember(env, user.companyId, driverId)) return fail(404, "That driver is not in this company.");
     }
-    if (existing.source === "text") {
-      // A text draft must be complete before it becomes a ride.
+    if (existing.source === "text" || existing.source === "voice") {
+      // A text or voice draft must be complete before it becomes a ride.
       if (!validDate(existing.pickup_date)) return fail(400, "Set the pickup date before approving.");
       if (!validTime(existing.pickup_time)) return fail(400, "Set the pickup time before approving.");
       if (!existing.pickup) return fail(400, "Set the pickup address before approving.");
@@ -2120,7 +2131,7 @@ async function updateTextDraft(request, env, id) {
   if (denied) return denied;
   const existing = await ownedRide(env, user, id);
   if (!existing) return fail(404, "Ride not found.");
-  if (existing.approval !== "requested" || existing.source !== "text") return fail(409, "Only a text draft waiting for approval can be edited here.");
+  if (existing.approval !== "requested" || (existing.source !== "text" && existing.source !== "voice")) return fail(409, "Only a text or call draft waiting for approval can be edited here.");
   const body = await readJson(request);
   if (isResponse(body)) return body;
   const date = body.date === void 0 ? existing.pickup_date : str(body.date, 10);
@@ -2177,13 +2188,16 @@ async function textIntakeChange(request, env, companyId) {
   const number = e164(body.inboundNumber);
   if (!number) return fail(400, "Enter a US or Canada number, such as +14045550100.");
   const enabled = body.enabled === void 0 ? 1 : body.enabled ? 1 : 0;
+  const voiceEnabled = body.voiceEnabled === void 0 ? null : body.voiceEnabled ? 1 : 0;
   const taken = await env.DB.prepare("SELECT company_id FROM text_intake_settings WHERE inbound_number = ? AND company_id != ?").bind(number, companyId).first();
   if (taken) return fail(409, "That number already feeds another company.");
   await env.DB.prepare(
-    `INSERT INTO text_intake_settings (company_id, inbound_number, enabled, updated_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(company_id) DO UPDATE SET inbound_number = excluded.inbound_number, enabled = excluded.enabled, updated_at = excluded.updated_at`
-  ).bind(companyId, number, enabled, now).run();
-  return json({ ok: true, textIntake: { inboundNumber: number, enabled: Boolean(enabled) } });
+    `INSERT INTO text_intake_settings (company_id, inbound_number, enabled, voice_enabled, updated_at) VALUES (?, ?, ?, COALESCE(?, 0), ?)
+     ON CONFLICT(company_id) DO UPDATE SET inbound_number = excluded.inbound_number, enabled = excluded.enabled,
+       voice_enabled = COALESCE(?, text_intake_settings.voice_enabled), updated_at = excluded.updated_at`
+  ).bind(companyId, number, enabled, voiceEnabled, now, voiceEnabled).run();
+  const saved = await env.DB.prepare("SELECT voice_enabled FROM text_intake_settings WHERE company_id = ?").bind(companyId).first();
+  return json({ ok: true, textIntake: { inboundNumber: number, enabled: Boolean(enabled), voiceEnabled: Boolean(saved && saved.voice_enabled) } });
 }
 __name(textIntakeChange, "textIntakeChange");
 async function adminTextIntake(request, env, id) {
@@ -2204,10 +2218,158 @@ async function ownerTextIntake(request, env) {
   if (isResponse(user)) return user;
   const denied = ownerOnly(user);
   if (denied) return denied;
-  const row = await env.DB.prepare("SELECT inbound_number, enabled FROM text_intake_settings WHERE company_id = ?").bind(user.companyId).first();
-  return json({ ok: true, textIntake: row ? { inboundNumber: row.inbound_number, display: prettyPhone(row.inbound_number), enabled: Boolean(row.enabled), webhookReady: Boolean(env.TEXT_INTAKE_TOKEN) } : null });
+  const row = await env.DB.prepare("SELECT inbound_number, enabled, voice_enabled FROM text_intake_settings WHERE company_id = ?").bind(user.companyId).first();
+  return json({ ok: true, textIntake: row ? { inboundNumber: row.inbound_number, display: prettyPhone(row.inbound_number), enabled: Boolean(row.enabled), webhookReady: Boolean(env.TEXT_INTAKE_TOKEN), voiceEnabled: Boolean(row.voice_enabled), voiceReady: Boolean(env.VOICE_INTAKE_TOKEN) } : null });
 }
 __name(ownerTextIntake, "ownerTextIntake");
+
+// ---- Voice-to-ride (PREVIEW, Nov 19, 2026) ----
+// A caller phones the company's Bland number; Bland's AI agent collects the ride (script:
+// docs/voice-booking/agent-prompt.md) and POSTs the finished call here. The call becomes a DRAFT ride
+// (approval 'requested', source 'voice') with a suggested driver, the same as text-to-ride. Never books on
+// its own, never calls or texts anyone back, never takes payment.
+// Auth: secret path token (VOICE_INTAKE_TOKEN, required) and, when BLAND_WEBHOOK_SECRET is set, Bland's
+// X-Webhook-Signature HMAC-SHA256 of the raw body. Idempotent on call_id.
+var VOICE_INTAKE_MAX_BODY = 256e3;
+async function logCall(env, row) {
+  try {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO inbound_calls (id, call_id, company_id, ride_id, from_number, to_number, provider, call_length_min, dedupe_key, outcome, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'bland', ?, ?, ?, ?)`
+    ).bind(crypto.randomUUID(), row.callId || "", row.companyId || null, row.rideId || null, row.from || "", row.to || "", row.lengthMin ?? null, row.dedupeKey, row.outcome, Date.now()).run();
+  } catch {
+    // Logging never blocks the webhook.
+  }
+}
+__name(logCall, "logCall");
+async function postBlandVoice(request, env, token) {
+  const configured = env.VOICE_INTAKE_TOKEN || "";
+  if (!configured || !token || !await safeEqual(token, configured)) return fail(404, "Not found.");
+  if (!await limitHit(env, "voice-in:all", 120, 10 * 60 * 1e3)) return fail(429, "Too many calls.");
+  const len = Number(request.headers.get("content-length") || "0");
+  if (Number.isFinite(len) && len > VOICE_INTAKE_MAX_BODY) return fail(413, "Too large.");
+  const raw = await request.text();
+  if (raw.length > VOICE_INTAKE_MAX_BODY) return fail(413, "Too large.");
+  if (env.BLAND_WEBHOOK_SECRET) {
+    const good = await verifyBlandSignature(env.BLAND_WEBHOOK_SECRET, raw, request.headers.get("x-webhook-signature"));
+    if (!good) return fail(401, "Bad signature.");
+  }
+  let payload;
+  try { payload = JSON.parse(raw); } catch { return fail(400, "Expected JSON."); }
+  const numbers = await env.DB.prepare(
+    `SELECT t.company_id, t.inbound_number, c.name, c.kind, c.status FROM text_intake_settings t JOIN companies c ON c.id = t.company_id WHERE t.voice_enabled = 1`
+  ).all();
+  const byNumber = new Map((numbers.results || []).map((r) => [r.inbound_number, r]));
+  const call = readBlandCall(payload, (n) => byNumber.has(n));
+  if (call.ignore) return intakeOk({ ignored: call.ignore });
+  if (call.followUp) return voiceFollowUp(request, env, call, raw);
+  const row = byNumber.get(call.ours);
+  const company = { id: row.company_id, name: row.name, kind: row.kind === "fleet" ? "fleet" : "individual", status: row.status };
+  const dedupeKey = "call|" + call.callId;
+  const base = { callId: call.callId, companyId: company.id, from: call.caller, to: call.ours, lengthMin: call.callLengthMin };
+  const seen = await env.DB.prepare("SELECT ride_id FROM inbound_calls WHERE dedupe_key = ?").bind(dedupeKey).first();
+  if (seen) return intakeOk({ duplicate: true, rideId: seen.ride_id || null });
+  if (company.status !== "active") {
+    await logCall(env, { ...base, dedupeKey, outcome: "ignored" });
+    return intakeOk({ ignored: "company not active" });
+  }
+  if (call.caller && !await limitHit(env, "voice-in:" + company.id + ":" + call.caller, 6, 60 * 60 * 1e3)) {
+    await logCall(env, { ...base, dedupeKey, outcome: "rate_limited" });
+    return intakeOk({ ignored: "rate limited" });
+  }
+  const now = Date.now();
+  const settings = await loadBookingSettings(env, company.id);
+  const parsed = parseCall(call, { now, airports: settings.airports && settings.airports.airports });
+  if (emptyCall(call, parsed)) {
+    await logCall(env, { ...base, dedupeKey, outcome: "empty" });
+    return intakeOk({ ignored: "no ride details" });
+  }
+  // Claim the call id before writing, so a Bland retry racing this request cannot make a second draft.
+  const claim = await env.DB.prepare(
+    `INSERT OR IGNORE INTO inbound_calls (id, call_id, company_id, ride_id, from_number, to_number, provider, call_length_min, dedupe_key, outcome, received_at)
+     VALUES (?, ?, ?, NULL, ?, ?, 'bland', ?, ?, 'pending', ?)`
+  ).bind(crypto.randomUUID(), call.callId, company.id, call.caller || "", call.ours, call.callLengthMin ?? null, dedupeKey, now).run();
+  if (!claim.meta || !claim.meta.changes) {
+    const again = await env.DB.prepare("SELECT ride_id FROM inbound_calls WHERE dedupe_key = ?").bind(dedupeKey).first();
+    return intakeOk({ duplicate: true, rideId: again && again.ride_id || null });
+  }
+  const phone = parsed.callbackNumber || call.caller || "";
+  const clients = await env.DB.prepare("SELECT id, name, phone FROM clients WHERE company_id = ? LIMIT 2000").bind(company.id).all();
+  const match = phone ? (clients.results || []).find((c) => phonesMatch(c.phone, phone) || (call.caller && phonesMatch(c.phone, call.caller))) : null;
+  let clientId;
+  let createdClient = false;
+  if (match) clientId = match.id;
+  else {
+    clientId = crypto.randomUUID();
+    createdClient = true;
+    const name = parsed.name || (phone ? "Call from " + prettyPhone(phone) : "Caller (number hidden)");
+    await env.DB.prepare("INSERT INTO clients (id, company_id, name, phone, email, notes, created_at, updated_at) VALUES (?, ?, ?, ?, '', ?, ?, ?)")
+      .bind(clientId, company.id, name.slice(0, 80), phone ? prettyPhone(phone) : "", "Added from a call to the fleet number.", now, now).run();
+  }
+  const suggestion = await suggestIntakeDriver(env, company, parsed);
+  const rideId = crypto.randomUUID();
+  const intake = { ...voiceIntake(call, parsed), parsed, warnings: parsed.warnings, suggested: suggestion, matchedClient: Boolean(match), createdClient, ownerEdited: false };
+  intake.messages = [{ body: call.summary || "(No summary from Bland.)", at: now }];
+  const notes = parsed.notes ? "From the call: " + parsed.notes : "";
+  await env.DB.prepare(
+    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, luggage, intake_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'voice', ?, ?)`
+  ).bind(rideId, company.id, clientId, suggestion ? suggestion.id : null, parsed.date, parsed.time || "", parsed.pickup || "", parsed.dropoff || "", parsed.passengers || 1, parsed.flight || "",
+    notes, now, now, parsed.luggage ?? null, JSON.stringify(intake)).run();
+  await env.DB.prepare("UPDATE inbound_calls SET ride_id = ?, outcome = 'draft' WHERE dedupe_key = ?").bind(rideId, dedupeKey).run();
+  return intakeOk({ rideId, draft: true });
+}
+__name(postBlandVoice, "postBlandVoice");
+// A Bland Agents disposition that finished after the call webhook: fill blanks on the still-open draft.
+async function voiceFollowUp(request, env, call, raw) {
+  const key = request.headers.get("x-webhook-idempotency-key") || await sha256Hex("bland-voice|" + raw);
+  const dedupeKey = "disp|" + String(key).slice(0, 120);
+  const seen = await env.DB.prepare("SELECT ride_id FROM inbound_calls WHERE dedupe_key = ?").bind(dedupeKey).first();
+  if (seen) return intakeOk({ duplicate: true, rideId: seen.ride_id || null });
+  const first = await env.DB.prepare("SELECT company_id, ride_id FROM inbound_calls WHERE dedupe_key = ?").bind("call|" + call.callId).first();
+  const base = { callId: call.callId, companyId: first && first.company_id, rideId: first && first.ride_id, dedupeKey };
+  if (!first || !first.ride_id) { await logCall(env, { ...base, outcome: "ignored" }); return intakeOk({ ignored: "no draft for this call" }); }
+  const ride = await env.DB.prepare("SELECT id, intake_json, pickup_date, passengers, driver_user_id FROM rides WHERE company_id = ? AND id = ? AND approval = 'requested' AND source = 'voice'").bind(first.company_id, first.ride_id).first();
+  const intake = ride && parseIntake(ride.intake_json);
+  if (!ride || !intake || intake.ownerEdited) { await logCall(env, { ...base, outcome: "ignored" }); return intakeOk({ ignored: "draft closed or edited" }); }
+  const f = call.fields;
+  const prev = intake.parsed || {};
+  const next = { ...prev };
+  for (const k of ["pickup", "dropoff", "name", "flight"]) if (!next[k] && f[k]) next[k] = String(f[k]).slice(0, k === "name" ? 80 : 200);
+  if (next.passengers == null && f.passengers) next.passengers = f.passengers;
+  if ((!next.time || !next.dateExplicit) && (f.date || f.time)) {
+    const w = normalizeWhen(f.date || (next.dateExplicit ? next.date : ""), f.time || "", Date.now());
+    if (!next.time && w.time) { next.time = w.time; next.timeAssumed = w.timeAssumed; }
+    if (!next.dateExplicit && w.dateExplicit) { next.date = w.date; next.dateExplicit = true; }
+  }
+  if (f.needsCallback) next.needsCallback = true;
+  if (f.confirmed) next.confirmed = true;
+  next.looksLikeRide = Boolean(next.pickup || next.dropoff || next.time || next.flight || next.airport);
+  next.warnings = voiceWarnings(next, { caller: intake.fromNumber, completed: true });
+  const updated = { ...intake, parsed: next, warnings: next.warnings, needsCallback: Boolean(next.needsCallback) };
+  await env.DB.prepare(
+    `UPDATE rides SET pickup_date = ?, pickup_time = ?, pickup = ?, dropoff = ?, flight = ?, passengers = ?, intake_json = ?, updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'`
+  ).bind(next.date || ride.pickup_date, next.time || "", next.pickup || "", next.dropoff || "", next.flight || "", next.passengers || ride.passengers || 1, JSON.stringify(updated), Date.now(), first.company_id, ride.id).run();
+  await logCall(env, { ...base, outcome: "updated" });
+  return intakeOk({ rideId: ride.id, updated: true });
+}
+__name(voiceFollowUp, "voiceFollowUp");
+// Owner switch: answer calls on my number with the AI agent (on) or not (off). The number itself is
+// assigned by the platform admin only (an owner can never claim another fleet's number).
+async function ownerVoiceToggle(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  if (typeof body.enabled !== "boolean") return fail(400, "Send enabled: true or false.");
+  const row = await env.DB.prepare("SELECT inbound_number FROM text_intake_settings WHERE company_id = ?").bind(user.companyId).first();
+  if (!row) return fail(409, "Your company does not have a booking phone number yet. Ask Nudge Dispatch to set one up.");
+  await env.DB.prepare("UPDATE text_intake_settings SET voice_enabled = ?, updated_at = ? WHERE company_id = ?").bind(body.enabled ? 1 : 0, Date.now(), user.companyId).run();
+  return ownerTextIntake(new Request(request.url, { method: "GET", headers: request.headers }), env);
+}
+__name(ownerVoiceToggle, "ownerVoiceToggle");
 
 // ---- Rate sheet + instant quotes (draft, Nov 10, 2026) ----
 // Prices are always computed here from the company's saved rate sheet. The booking page only
@@ -2841,6 +3003,14 @@ async function handleApi(request, env) {
     }
   }
   // Bland calls this directly (no X-Nudge-Client header): secret path token + optional HMAC signature.
+  // Bland post-call webhook for voice-to-ride (same auth model as SMS: secret path token + HMAC).
+  const blandVoice = /^\/api\/inbound\/bland\/voice\/([A-Za-z0-9_-]{16,128})$/.exec(path);
+  if (blandVoice && method === "POST") {
+    try { return await postBlandVoice(request, env, blandVoice[1]); } catch (error) {
+      console.log(JSON.stringify({ level: "error", msg: "bland voice", name: error instanceof Error ? error.name : "Error" }));
+      return fail(500, "Webhook error.");
+    }
+  }
   const blandInbound = /^\/api\/inbound\/bland\/sms\/([A-Za-z0-9_-]{16,128})$/.exec(path);
   if (blandInbound && method === "POST") {
     try { return await postBlandInbound(request, env, blandInbound[1]); } catch (error) {
@@ -2980,6 +3150,7 @@ async function handleApi(request, env) {
     const draftMatch = /^\/api\/rides\/([0-9a-f-]{36})\/draft$/.exec(path);
     if (draftMatch && method === "PATCH") return updateTextDraft(request, env, draftMatch[1]);
     if (path === "/api/text-intake" && method === "GET") return ownerTextIntake(request, env);
+    if (path === "/api/voice-intake" && method === "PUT") return ownerVoiceToggle(request, env);
     const adminIntake = /^\/api\/admin\/companies\/([0-9a-f-]{36})\/text-intake$/.exec(path);
     if (adminIntake && method === "PUT") return adminTextIntake(request, env, adminIntake[1]);
     const platformIntake = /^\/api\/platform\/companies\/([0-9a-f-]{36})\/text-intake$/.exec(path);
@@ -5934,6 +6105,7 @@ import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNo
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
 import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProblem, recipientProblem, smsMode } from "./sms.js";
 import { parseRideText, mergeParsed, draftWarnings, readBlandInbound, suggestDriver, verifyBlandSignature, prettyPhone, e164, MERGE_WINDOW_MS } from "./text-intake.js";
+import { readBlandCall, parseCall, voiceIntake, voiceWarnings, emptyCall, normalizeWhen } from "./voice-intake.js";
 import { meetingPointForArrived } from "./progress-nav.js";
 import { readSchedule, parseDayList, matchDate, pendingOccurrences, describeSchedule, monthEndNote, todayInZone, addDays, shortDate, MAX_LOOKAHEAD_DAYS } from "./schedules.js";
 import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";

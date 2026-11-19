@@ -743,10 +743,30 @@ function trialPausedHtml() {
   return `<p class="sub trial-paused">Approving new requests is paused because the free trial has ended. You can still decline.</p>`;
 }
 
+// Text-to-ride and call drafts waiting for the owner.
+function intakeDraft(ride) {
+  return ride.source === "text" || ride.source === "voice";
+}
+
+// Call drafts: Bland's summary, the transcript and recording, what Nudge could not tell, the suggested driver.
+function voiceIntakeHtml(ride, full) {
+  const it = ride.intake;
+  const mins = typeof it.callLengthMin === "number" ? ` · ${it.callLengthMin < 1 ? "under 1" : Math.round(it.callLengthMin)} min call` : "";
+  const who = `<div class="sub">${it.fromDisplay ? "Called from " + esc(it.fromDisplay) : "Caller ID hidden"}${it.callbackDisplay && it.callbackDisplay !== it.fromDisplay ? " · call back on " + esc(it.callbackDisplay) : ""}${mins} · ${it.matchedClient ? "matched to an existing client" : "new client from this call"}</div>`;
+  const summary = `<blockquote class="intake-msg">${esc(it.summary || "No summary from the phone agent.")}</blockquote>`;
+  const warn = (it.warnings || []).length ? `<ul class="intake-warn">${it.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : "";
+  const sug = it.suggested && ride.status === "requested" ? `<div class="sub">Suggested driver: <strong>${esc(it.suggested.name || "Driver")}</strong>${it.suggested.reason ? " · " + esc(it.suggested.reason) : ""}</div>` : "";
+  const rec = full && it.recordingUrl ? `<p class="sub"><a href="${esc(it.recordingUrl)}" target="_blank" rel="noopener noreferrer">Listen to the call</a></p>` : "";
+  const lines = full && (it.transcript || []).length ? `<details class="intake-transcript"><summary>Transcript (${it.transcript.length} lines)</summary>${it.transcript.map((t) => `<p class="tline ${t.who === "caller" ? "caller" : "agent"}"><strong>${t.who === "caller" ? "Caller" : "Agent"}:</strong> ${esc(t.text)}</p>`).join("")}</details>` : "";
+  const count = !full && (it.warnings || []).length ? `<div class="sub intake-count">${it.warnings.length} thing${it.warnings.length === 1 ? "" : "s"} to check</div>` : "";
+  return `<div class="intake-box intake-voice"><div class="sub intake-label">Phone call summary</div>${summary}${who}${sug}${full ? warn : count}${rec}${lines}</div>`;
+}
+
 // Text-to-ride drafts: the client's own words, what Nudge could not tell, and the suggested driver.
 function intakeHtml(ride, full) {
   const it = ride.intake;
   if (!it) return "";
+  if (it.channel === "voice") return voiceIntakeHtml(ride, full);
   const msgs = (it.messages || []).map((m) => `<blockquote class="intake-msg">${esc(m.body)}${full && m.at ? `<span class="sub">${esc(new Date(m.at).toLocaleString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }))} ET</span>` : ""}</blockquote>`).join("");
   const who = it.fromDisplay ? `<div class="sub">Texted from ${esc(it.fromDisplay)} · ${it.matchedClient ? "matched to an existing client" : "new client from this number"}</div>` : "";
   const warn = (it.warnings || []).length ? `<ul class="intake-warn">${it.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : "";
@@ -759,7 +779,7 @@ function draftFormHtml(ride, roster) {
   const driverSel = roster ? `<label>Driver<select id="d-driver"><option value="">Unassigned</option>${roster.map((m) => `<option value="${esc(m.id)}">${esc(driverOptionLabel(m))}${it.suggested && it.suggested.id === m.id ? " (suggested)" : ""}</option>`).join("")}</select></label>` : "";
   return `<form id="draft-form" class="card noprint">
       <h2>Review the draft</h2>
-      <p class="sub">Nudge filled this in from the text. Fix anything, then approve. Nothing is sent to the client.</p>
+      <p class="sub">Nudge filled this in from the ${ride.source === "voice" ? "call" : "text"}. Fix anything, then approve. Nothing is sent to the client.</p>
       ${it.createdClient ? `<label>Client name<input id="d-name" value="${esc(ride.clientName)}" maxlength="80" autocomplete="off"></label>` : ""}
       <div class="grid2"><label>Date<input id="d-date" type="date" value="${esc(ride.date)}"></label><label>Pickup time<input id="d-time" type="time" value="${esc(ride.time)}"></label></div>
       <label>Pickup<input id="d-pickup" value="${esc(ride.pickup)}" maxlength="200" placeholder="Pickup address" autocomplete="off"></label>
@@ -781,13 +801,13 @@ function readDraftForm() {
 }
 
 function rideCardHtml(ride, pending) {
-  const when = `${esc(ride.date)} · ${ride.time ? esc(time12(ride.time)) : "time?"}${ride.flight && ride.source === "text" ? " · " + esc(ride.flight) : ""}`;
+  const when = `${esc(ride.date)} · ${ride.time ? esc(time12(ride.time)) : "time?"}${ride.flight && intakeDraft(ride) ? " · " + esc(ride.flight) : ""}`;
   const fare = ride.status === "requested" || !ride.fare || ride.fare === "$0.00" ? "" : " · " + esc(ride.fare);
   const phone = ride.clientPhone ? `<div class="sub">${esc(ride.clientPhone)}</div>` : "";
   const notes = pending && ride.notes ? `<div class="sub">${esc(ride.notes)}</div>` : "";
   const trip = (tripLine(ride) ? `<div class="sub">${esc(tripLine(ride))}</div>` : "") + airportHtml(ride, "div");
   const owner = !(state.me && state.me.role === "driver");
-  const textDraft = pending && owner && ride.source === "text";
+  const textDraft = pending && owner && intakeDraft(ride);
   const quote = textDraft ? intakeHtml(ride, false) : pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">${rideStops(ride).length ? "No estimate: this request has stops, so the client saw Price on request." : "No estimate was shown to the client."}</div>`) : "";
   const actions = textDraft ? `<div class="pend-actions"><a class="btn approve" href="#/rides/${esc(ride.id)}">Review draft</a><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : pending && owner ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, `data-fare="${esc(ride.id)}"`, `data-approve="${esc(ride.id)}"`)}<div class="pend-actions"><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : "";
   return `<div class="list-btn${pending ? " pending-request card" : ""}" data-id="${esc(ride.id)}">
@@ -905,7 +925,7 @@ async function renderRide(id, gen) {
   }, 0);
   const links = loc.data.ok && Array.isArray(loc.data.links) ? loc.data.links.filter((link) => !link.revokedAt) : [];
   box.innerHTML = `<article class="card">
-      <div class="row"><h2>${esc(ride.clientName)}</h2><span class="badge ${esc(ride.status)}">${esc(ride.source === "text" && ride.status === "requested" ? rideBadgeText(ride) : schedule.now || label(ride.status))}</span></div>
+      <div class="row"><h2>${esc(ride.clientName)}</h2><span class="badge ${esc(ride.status)}">${esc(intakeDraft(ride) && ride.status === "requested" ? rideBadgeText(ride) : schedule.now || label(ride.status))}</span></div>
       <p class="route">${esc(ride.pickup)}<br>${rideStops(ride).map((stop, i) => `→ <span class="stop-tag">Stop ${i + 1}:</span> ${esc(stop)}<br>`).join("")}→ ${esc(ride.dropoff)}</p>
       ${rideStops(ride).length && ride.status === "requested" && !driverView && !ride.quote ? `<p class="sub">This request has stops. No estimate was shown; the client saw Price on request.</p>` : ""}
       ${tripLine(ride) ? `<p class="sub">${esc(tripLine(ride))}</p>` : ""}
@@ -918,7 +938,7 @@ async function renderRide(id, gen) {
       <p class="sub">Times are Eastern and come only from taps. Waiting is from Arrived to Picked up.</p>
       ${ride.notes ? `<p>${esc(ride.notes)}</p>` : ""}
     </article>
-    ${ride.status === "requested" && ride.source === "text" && !driverView ? draftFormHtml(ride, fleetOwner ? roster : null) : ""}
+    ${ride.status === "requested" && intakeDraft(ride) && !driverView ? draftFormHtml(ride, fleetOwner ? roster : null) : ""}
     <div class="stack noprint">
       ${ride.status === "requested" && !driverView ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, 'id="final-fare"', 'id="approve"')}<div class="pend-actions"><button class="btn ghost" id="decline" type="button">Decline</button></div>` : ""}
       ${schedule.nav ? `<a class="btn ghost" id="maps" href="${esc(schedule.nav.url)}" target="_blank" rel="noopener">${esc(schedule.nav.label)}</a>` : ""}
@@ -2014,6 +2034,7 @@ async function renderSettings(gen) {
       <p class="sub">The QR page has Share and Save image buttons. Open it on your phone and add it to your home screen for one-tap access.</p>` : ""}
       <p class="err" id="booking-copy"></p>
     </section>
+    <section class="card" id="phone-card" hidden></section>
     <section class="card" id="plan-card" hidden></section>
     ${state.me.role === "owner" ? `<section class="card" id="card-card"><h2>Payment method</h2><p class="sub">Loading…</p></section>` : ""}
     <section class="card" id="export-card">
@@ -2067,6 +2088,7 @@ async function renderSettings(gen) {
     <p class="muted">On iPhone or iPad, use Share, then Add to Home Screen.</p>
     <button class="btn ghost full" id="out" type="button">Sign out</button>`;
   if (state.me.role === "owner") loadPaymentCard(gen);
+  if (state.me.role === "owner") loadPhoneBookingCard(gen);
   if (state.me.role === "owner") loadPayPalCard(gen);
   const presets = document.querySelector("#theme-presets");
   const themeInput = document.querySelector("#themeColor");
@@ -2690,6 +2712,7 @@ function stepContactNote(nextStep, smsInfo) {
 
 function rideBadgeText(ride) {
   if (ride.status === "requested" && ride.source === "text") return "From text, needs approval";
+  if (ride.status === "requested" && ride.source === "voice") return "From call, needs approval";
   const schedule = ride.schedule || {};
   if (schedule.now && (ride.status !== "scheduled" || schedule.progress)) return schedule.now;
   return label(ride.status);
@@ -3384,3 +3407,29 @@ tabs.onclick = (event) => {
 };
 window.addEventListener("hashchange", () => { route(); });
 boot();
+
+// More > Phone booking: the company's booking number (set by Nudge Dispatch), text status, and the
+// owner's own switch for AI call answering. Calls become drafts in Rides; nothing is booked automatically.
+async function loadPhoneBookingCard(gen) {
+  const res = await api("/api/text-intake");
+  if (gen !== renderGen) return;
+  const card = document.querySelector("#phone-card");
+  if (!card || !res.data.ok || !res.data.textIntake) return;
+  const t = res.data.textIntake;
+  card.innerHTML = `<h2>Phone booking</h2>
+    <p class="sub">Booking number: <strong>${esc(t.display)}</strong></p>
+    <p class="sub">Texts to this number: ${t.enabled ? "become draft rides" : "off"}</p>
+    <label class="check"><input type="checkbox" id="voice-on" ${t.voiceEnabled ? "checked" : ""}> Answer calls with the AI booking agent</label>
+    <p class="note">The agent asks for pickup, drop-off, date, time, name and a callback number, reads them back, and tells the caller you will confirm. Each call becomes a draft in Rides with the summary, transcript and a suggested driver. It never quotes a price, never takes payment, and never books on its own.${t.voiceReady ? "" : " (Call answering is not connected on this server yet.)"}</p>
+    <p class="err" id="voice-err"></p>`;
+  card.hidden = false;
+  const box = card.querySelector("#voice-on");
+  box.onchange = async () => {
+    box.disabled = true;
+    const next = await api("/api/voice-intake", { method: "PUT", body: { enabled: box.checked } });
+    if (gen !== renderGen) return;
+    box.disabled = false;
+    if (!next.data.ok) { box.checked = !box.checked; card.querySelector("#voice-err").textContent = next.data.error || "Could not save."; return; }
+    box.checked = Boolean(next.data.textIntake && next.data.textIntake.voiceEnabled);
+  };
+}

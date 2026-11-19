@@ -475,6 +475,13 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .grid2 > label { min-width: 0; }
 
+/* Call drafts */
+.intake-voice .intake-msg { border-left-color: #c9a227; }
+.intake-transcript { margin: 8px 0 0; }
+.intake-transcript summary { cursor: pointer; color: var(--teal); }
+.intake-transcript .tline { margin: 4px 0; font-size: 15px; overflow-wrap: anywhere; }
+.intake-transcript .tline.agent { color: #9fb0c2; }
+
 /* 15-ride free trial (Nov 17, 2026) */
 .card.trial { position: relative; }
 .card.trial-converted, .card.trial-converting { border-color: #2f6b45; }
