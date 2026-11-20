@@ -1259,6 +1259,22 @@ function isMissingArchiveCol(err) {
   return /no such column: archived_at|has no column named archived_at/i.test(String(err && err.message || err));
 }
 __name(isMissingArchiveCol, "isMissingArchiveCol");
+// Auto-restore (Nov 20, 2026, Jesse): any NEW ride attached to an archived client (public booking page, owner
+// New ride, schedule confirm) un-archives that client. Schedules stay paused. Before migration 0018: no-op.
+async function autoRestoreClient(env, companyId, clientId, rideId, actorId, source) {
+  try {
+    const now = Date.now();
+    const res = await env.DB.batch([
+      env.DB.prepare("UPDATE clients SET archived_at = NULL, updated_at = ? WHERE company_id = ? AND id = ? AND archived_at IS NOT NULL").bind(now, companyId, clientId),
+      env.DB.prepare("INSERT INTO admin_audit (id, actor_user_id, action, target_type, target_id, detail, created_at) SELECT ?, ?, 'client.auto_restore', 'client', ?, ?, ? WHERE changes() > 0").bind(crypto.randomUUID(), actorId || "", clientId, JSON.stringify({ companyId, rideId, source }), now)
+    ]);
+    return !!res[0].meta.changes;
+  } catch (err) {
+    if (isMissingArchiveCol(err)) return false;
+    throw err;
+  }
+}
+__name(autoRestoreClient, "autoRestoreClient");
 function displayRideStatus(row) {
   if (row.approval === "requested") return "requested";
   if (row.approval === "declined") return "declined";
@@ -1893,6 +1909,7 @@ async function postPublicBook(request, env, slug) {
     luggageRaw,
     stopsToStored(stops)
   ).run();
+  await autoRestoreClient(env, company.id, clientId, rideId, "", "booking-page");
   const view = quoted ? quoteView(quoted, publicCompanyName(company)) : null;
   return json({
     ok: true,
@@ -4145,6 +4162,7 @@ async function createRide(request, env) {
     `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, stops_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'unpaid', ?, ?, ?)`
   ).bind(id, user.companyId, f.client_id, user.accountKind === "individual" ? user.userId : null, f.pickup_date, f.pickup_time, f.pickup, f.dropoff, f.passengers, f.flight, f.fare_cents, f.notes, now, now, f.stops_json).run();
+  await autoRestoreClient(env, user.companyId, f.client_id, id, user.userId, "owner");
   const row = await ownedRide(env, user, id);
   return json({ ok: true, ride: row ? rideJson(row, user.role) : null }, 201);
 }
@@ -4435,6 +4453,7 @@ async function confirmOccurrence(request, env, id, occursOn) {
     if (isConstraintError(error)) return fail(409, "That date is already confirmed or skipped.");
     throw error;
   }
+  await autoRestoreClient(env, user.companyId, f.client_id, rideId, user.userId, "schedule");
   queueRideAlert(request, env, user, rideId, driverId, "assigned");
   const ride = await ownedRide(env, user, rideId);
   return json({ ok: true, occursOn, ride: ride ? rideJson(ride, user.role) : null }, 201);

@@ -183,3 +183,46 @@ test("delete client before migration 0018: list/get work, hard delete works, arc
     await rm(persistTo, { recursive: true, force: true });
   }
 });
+
+test("auto-restore: a new ride for an archived client (owner New ride, public booking page) un-archives it; schedules stay paused", { timeout: 180000 }, async () => {
+  const persistTo = await mkdtemp(join(tmpdir(), "nudge-client-restore-"));
+  let worker;
+  try {
+    await applyMigrations(persistTo);
+    worker = await boot(persistTo);
+    const A = await openOwner(worker, "auto@example.test", "Auto Cars");
+    const archivedList = async () => (await call(worker, "/api/clients?archived=1", { session: A.session })).data.clients.map((c) => c.id);
+
+    // Owner + New ride on an archived client (with an active schedule that gets paused).
+    const rita = await newClient(worker, A.session, "Rita Regular");
+    const r1 = await call(worker, "/api/rides", { method: "POST", session: A.session, body: { clientId: rita, date: etDay(3), time: "09:30", pickup: "Hotel", dropoff: "Airport", passengers: 1, fare: "40" } });
+    assert.equal(r1.status, 201, JSON.stringify(r1.data));
+    const sched = await call(worker, "/api/schedules", { method: "POST", session: A.session, body: { clientId: rita, time: "05:30", pickup: "100 Main St", dropoff: "ATL Airport", startDate: etDay(0), weekDays: [1, 3] } });
+    const sid = sched.data.schedule.id;
+    assert.equal((await call(worker, "/api/clients/" + rita, { method: "DELETE", session: A.session })).data.archived, true);
+    assert.deepEqual(await archivedList(), [rita]);
+    const r2 = await call(worker, "/api/rides", { method: "POST", session: A.session, body: { clientId: rita, date: etDay(4), time: "10:00", pickup: "Hotel", dropoff: "Airport", passengers: 1, fare: "40" } });
+    assert.equal(r2.status, 201, JSON.stringify(r2.data));
+    assert.deepEqual(await archivedList(), []);
+    assert.equal((await call(worker, "/api/clients/" + rita, { session: A.session })).data.client.archived, false);
+    assert.equal((await call(worker, "/api/schedules/" + sid, { session: A.session })).data.schedule.active, false, "schedule stays paused");
+    // Editing an existing ride of an archived client does not restore it.
+    assert.equal((await call(worker, "/api/clients/" + rita, { method: "DELETE", session: A.session })).data.archived, true);
+    const edit = await call(worker, "/api/rides/" + r2.data.ride.id, { method: "PATCH", session: A.session, body: { notes: "edit only" } });
+    assert.equal(edit.status, 200, JSON.stringify(edit.data));
+    assert.deepEqual(await archivedList(), [rita]);
+
+    // Public booking page from the archived client's phone: same client, restored, no duplicate.
+    const settings = await call(worker, "/api/settings", { session: A.session });
+    const book = await call(worker, "/api/public/book/" + settings.data.settings.bookingSlug, { method: "POST", body: { name: "Rita Regular", phone: "404-555-0100", date: etDay(6), time: "15:30", tripType: "one-way", passengers: 1, pickup: "100 Main St, Alpharetta", dropoff: "ATL Airport" } });
+    assert.equal(book.status, 201, JSON.stringify(book.data));
+    assert.deepEqual(await archivedList(), []);
+    const all = (await call(worker, "/api/clients", { session: A.session })).data.clients;
+    assert.equal(all.filter((c) => c.name === "Rita Regular").length, 1, "no duplicate client");
+    const rides = (await call(worker, "/api/rides", { session: A.session })).data.rides.filter((r) => r.clientId === rita);
+    assert.equal(rides.length, 3);
+  } finally {
+    if (worker) await worker.stop();
+    await rm(persistTo, { recursive: true, force: true });
+  }
+});
