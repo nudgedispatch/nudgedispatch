@@ -1248,10 +1248,17 @@ function clientJson(row) {
     phone: row.phone,
     email: row.email,
     notes: row.notes,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    // Nov 20, 2026 (migration 0018): archived clients keep their history but are hidden by default.
+    archived: !!row.archived_at,
+    archivedAt: row.archived_at || null
   };
 }
 __name(clientJson, "clientJson");
+function isMissingArchiveCol(err) {
+  return /no such column: archived_at|has no column named archived_at/i.test(String(err && err.message || err));
+}
+__name(isMissingArchiveCol, "isMissingArchiveCol");
 function displayRideStatus(row) {
   if (row.approval === "requested") return "requested";
   if (row.approval === "declined") return "declined";
@@ -2633,6 +2640,8 @@ async function handleApi(request, env) {
     if (clientMatch && method === "GET") return getClient(request, env, clientMatch[1]);
     if (clientMatch && method === "PATCH") return updateClient(request, env, clientMatch[1]);
     if (clientMatch && method === "DELETE") return deleteClient(request, env, clientMatch[1]);
+    const clientRestore = /^\/api\/clients\/([0-9a-f-]{36})\/restore$/.exec(path);
+    if (clientRestore && method === "POST") return restoreClient(request, env, clientRestore[1]);
     if (path === "/api/push/config" && method === "GET") return pushConfig(request, env);
     if (path === "/api/push/subscribe" && method === "POST") return pushSubscribe(request, env);
     if (path === "/api/push/unsubscribe" && method === "POST") return pushUnsubscribe(request, env);
@@ -3921,10 +3930,24 @@ async function listClients(request, env) {
   if (isResponse(user)) return user;
   const denied = ownerOnly(user);
   if (denied) return denied;
-  const rows = await env.DB.prepare(
-    "SELECT id, name, phone, email, notes, created_at, updated_at FROM clients WHERE company_id = ? ORDER BY name COLLATE NOCASE"
-  ).bind(user.companyId).all();
-  return json({ ok: true, clients: (rows.results || []).map(clientJson) });
+  // ?archived=1 lists archived clients only; the default list (and the new-ride picker) hides them.
+  const archived = new URL(request.url).searchParams.get("archived") === "1";
+  let rows;
+  let archiveOn = true;
+  try {
+    rows = await env.DB.prepare(
+      "SELECT id, name, phone, email, notes, created_at, updated_at, archived_at FROM clients WHERE company_id = ? AND archived_at IS " + (archived ? "NOT NULL" : "NULL") + " ORDER BY name COLLATE NOCASE"
+    ).bind(user.companyId).all();
+  } catch (err) {
+    if (!isMissingArchiveCol(err)) throw err;
+    archiveOn = false;
+    rows = archived ? { results: [] } : await env.DB.prepare(
+      "SELECT id, name, phone, email, notes, created_at, updated_at FROM clients WHERE company_id = ? ORDER BY name COLLATE NOCASE"
+    ).bind(user.companyId).all();
+  }
+  let archivedCount = 0;
+  if (archiveOn) archivedCount = Number((await env.DB.prepare("SELECT COUNT(*) AS n FROM clients WHERE company_id = ? AND archived_at IS NOT NULL").bind(user.companyId).first())?.n || 0);
+  return json({ ok: true, clients: (rows.results || []).map(clientJson), archivedCount, archiveOn });
 }
 __name(listClients, "listClients");
 function clientFields(body) {
@@ -3955,8 +3978,9 @@ async function createClient(request, env) {
 }
 __name(createClient, "createClient");
 async function ownedClient(env, companyId, id) {
+  // SELECT * so archived_at comes back after migration 0018 and nothing breaks before it.
   return env.DB.prepare(
-    "SELECT id, name, phone, email, notes, created_at, updated_at FROM clients WHERE company_id = ? AND id = ?"
+    "SELECT * FROM clients WHERE company_id = ? AND id = ?"
   ).bind(companyId, id).first();
 }
 __name(ownedClient, "ownedClient");
@@ -3967,9 +3991,23 @@ async function getClient(request, env, id) {
   if (denied) return denied;
   const row = await ownedClient(env, user.companyId, id);
   if (!row) return fail(404, "Client not found.");
-  return json({ ok: true, client: clientJson(row) });
+  return json({ ok: true, client: clientJson(row), history: await clientHistory(env, user.companyId, id) });
 }
 __name(getClient, "getClient");
+// What "Delete client" would keep. Invoices hang off rides (invoices.ride_id), so any invoice implies a ride.
+async function clientHistory(env, companyId, id) {
+  const today = todayIso();
+  const n = /* @__PURE__ */ __name(async (sql, ...b) => Number((await env.DB.prepare(sql).bind(...b).first())?.n || 0), "n");
+  const [rides, upcomingRides, invoices, schedules, activeSchedules] = await Promise.all([
+    n("SELECT COUNT(*) AS n FROM rides WHERE company_id = ? AND client_id = ?", companyId, id),
+    n("SELECT COUNT(*) AS n FROM rides WHERE company_id = ? AND client_id = ? AND status = 'scheduled' AND pickup_date >= ?", companyId, id, today),
+    n("SELECT COUNT(*) AS n FROM invoices i JOIN rides r ON r.id = i.ride_id AND r.company_id = i.company_id WHERE i.company_id = ? AND r.client_id = ?", companyId, id),
+    n("SELECT COUNT(*) AS n FROM ride_schedules WHERE company_id = ? AND client_id = ?", companyId, id),
+    n("SELECT COUNT(*) AS n FROM ride_schedules WHERE company_id = ? AND client_id = ? AND active = 1", companyId, id)
+  ]);
+  return { rides, upcomingRides, invoices, schedules, activeSchedules, hardDelete: !rides && !invoices && !schedules };
+}
+__name(clientHistory, "clientHistory");
 async function updateClient(request, env, id) {
   const user = await authed(request, env, true);
   if (isResponse(user)) return user;
@@ -3988,6 +4026,10 @@ async function updateClient(request, env, id) {
   return json({ ok: true, client: clientJson({ ...existing, ...fields, updated_at: now }) });
 }
 __name(updateClient, "updateClient");
+// Owner "Delete client" (Nov 20, 2026). Company owner only; every query is scoped to the owner's company_id.
+// No rides, invoices or schedules -> the client row is deleted. Otherwise the client is ARCHIVED (migration 0018):
+// rides, invoices and billed totals stay; active regular schedules are paused (active = 0, end date kept) so no
+// new dates come due. Restore clears the archive flag and leaves schedules paused for the owner to turn back on.
 async function deleteClient(request, env, id) {
   const user = await authed(request, env, true);
   if (isResponse(user)) return user;
@@ -3995,14 +4037,49 @@ async function deleteClient(request, env, id) {
   if (denied) return denied;
   const existing = await ownedClient(env, user.companyId, id);
   if (!existing) return fail(404, "Client not found.");
-  const ride = await env.DB.prepare("SELECT id FROM rides WHERE company_id = ? AND client_id = ?").bind(user.companyId, id).first();
-  if (ride) return fail(409, "This client has rides, so the record stays.");
-  const schedule = await env.DB.prepare("SELECT id FROM ride_schedules WHERE company_id = ? AND client_id = ?").bind(user.companyId, id).first();
-  if (schedule) return fail(409, "This client has a regular schedule. Delete the schedule first.");
-  await env.DB.prepare("DELETE FROM clients WHERE company_id = ? AND id = ?").bind(user.companyId, id).run();
-  return json({ ok: true });
+  const h = await clientHistory(env, user.companyId, id);
+  const now = Date.now();
+  if (h.hardDelete) {
+    const gone = "NOT EXISTS (SELECT 1 FROM clients WHERE company_id = ? AND id = ?)";
+    const res = await env.DB.batch([
+      // Guarded: a ride or schedule added since the check above keeps the client.
+      env.DB.prepare("DELETE FROM clients WHERE company_id = ? AND id = ? AND NOT EXISTS (SELECT 1 FROM rides WHERE company_id = ? AND client_id = ?) AND NOT EXISTS (SELECT 1 FROM ride_schedules WHERE company_id = ? AND client_id = ?)").bind(user.companyId, id, user.companyId, id, user.companyId, id),
+      env.DB.prepare("INSERT INTO admin_audit (id, actor_user_id, action, target_type, target_id, detail, created_at) SELECT ?, ?, 'client.delete', 'client', ?, ?, ? WHERE " + gone).bind(crypto.randomUUID(), user.userId, id, JSON.stringify({ companyId: user.companyId, hard: true }), now, user.companyId, id)
+    ]);
+    if (!res[0].meta.changes) return fail(409, "This client just got a ride or schedule. Refresh and try again.");
+    return json({ ok: true, deleted: true });
+  }
+  if (existing.archived_at) return json({ ok: true, archived: true, already: true, history: h, pausedSchedules: 0 });
+  try {
+    const res = await env.DB.batch([
+      env.DB.prepare("UPDATE clients SET archived_at = ?, updated_at = ? WHERE company_id = ? AND id = ? AND archived_at IS NULL").bind(now, now, user.companyId, id),
+      env.DB.prepare("UPDATE ride_schedules SET active = 0, updated_at = ? WHERE company_id = ? AND client_id = ? AND active = 1").bind(now, user.companyId, id),
+      env.DB.prepare("INSERT INTO admin_audit (id, actor_user_id, action, target_type, target_id, detail, created_at) VALUES (?, ?, 'client.archive', 'client', ?, ?, ?)").bind(crypto.randomUUID(), user.userId, id, JSON.stringify({ companyId: user.companyId, rides: h.rides, invoices: h.invoices, schedules: h.schedules, pausedSchedules: h.activeSchedules }), now)
+    ]);
+    return json({ ok: true, archived: true, history: h, pausedSchedules: res[1].meta.changes || 0 });
+  } catch (err) {
+    if (isMissingArchiveCol(err)) return json({ ok: false, needsMigration: true, error: "This client has rides or schedules, so they would be archived, not deleted. Archiving needs a database update first. Nothing was changed." }, 409);
+    throw err;
+  }
 }
 __name(deleteClient, "deleteClient");
+async function restoreClient(request, env, id) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const denied = ownerOnly(user);
+  if (denied) return denied;
+  const existing = await ownedClient(env, user.companyId, id);
+  if (!existing) return fail(404, "Client not found.");
+  if (!("archived_at" in existing)) return fail(409, "Archive needs a database update first.");
+  if (!existing.archived_at) return json({ ok: true, restored: false, client: clientJson(existing) });
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE clients SET archived_at = NULL, updated_at = ? WHERE company_id = ? AND id = ?").bind(now, user.companyId, id),
+    env.DB.prepare("INSERT INTO admin_audit (id, actor_user_id, action, target_type, target_id, detail, created_at) VALUES (?, ?, 'client.restore', 'client', ?, ?, ?)").bind(crypto.randomUUID(), user.userId, id, JSON.stringify({ companyId: user.companyId }), now)
+  ]);
+  return json({ ok: true, restored: true, client: clientJson({ ...existing, archived_at: null, updated_at: now }) });
+}
+__name(restoreClient, "restoreClient");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
   r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.arrived_at, r.picked_up_at, r.completed_at,
   r.driver_user_id, drv.name AS assigned_driver_name, drv.vehicle AS assigned_driver_vehicle, drv.plate AS assigned_driver_plate, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
