@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://nudgedispatch.com/sitemap.xml

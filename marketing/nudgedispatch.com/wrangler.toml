@@ -1,0 +1,6 @@
+# Live marketing site Worker for nudgedispatch.com.
+# Do not deploy from this file without Jesse's explicit OK.
+name = "nudge-sandbox"
+main = "published/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = false

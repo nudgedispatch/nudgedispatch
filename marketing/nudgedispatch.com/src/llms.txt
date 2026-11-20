@@ -1,0 +1,23 @@
+# Nudge Dispatch
+
+> Dispatch and booking software for small chauffeur and car-service fleets (1 to 15 drivers). Website requests land in one approval queue; the owner approves or declines, assigns a driver (with opt-in nearest-driver suggestions), checks the flight link, tracks unpaid / invoiced / paid per ride, and gets an invoice with the company's own logo. It does not process payments: clients pay the company directly. Nothing is sent to clients automatically.
+
+Nudge Dispatch is a spinoff of Iron Gate Executive Transport, built by a working chauffeur for operators like him. Started by Jesse Bailey, who runs a private chauffeur service in metro Atlanta, Georgia. Operated by Iron Gate Executive Transport LLC (https://irongatevip.com). Contact: nudgedispatch@gmail.com
+Status: self-serve Solo sign-up is open with a 15-ride free trial. Solo drivers sign up themselves, get 15 free completed rides, then the account converts automatically to Solo at $39/mo with no setup fee. A card is required at signup and isn't charged during the trial. The 15 completed rides are the only limit. The public demo uses sample data only. Small fleet and Fleet plans are set up with the team. Assisted Solo setup is $299 one-time.
+
+## Pricing
+- Solo (1 driver (owner-operator)): sign up yourself — 15 free completed rides, then $39/mo, setup fee waived (a card is required at signup and isn't charged during the trial); or $299 one-time if the team sets it up for you
+- Small fleet (2–5 drivers): $59/mo + $10 per driver, $599 one-time setup
+- Fleet (6–15 drivers): $99/mo + $8 per driver, $1,199 one-time setup
+- SMS texting add-on (Small fleet and Fleet): $75 one-time + $19/mo with 500 texts, then $0.03 per extra text
+- No per-trip or per-ride fees. A 300-trip month costs the same as a 30-trip month with the same drivers. The only metered item is the optional SMS add-on, at $0.03 per text beyond the 500 texts it includes.
+
+## Pages
+- [Home](https://nudgedispatch.com/): what it does, how it works, who it's for, pricing, FAQ
+- [Small-fleet dispatch software](https://nudgedispatch.com/small-fleet-dispatch-software.html): overview for small car-service fleets
+- [Changelog](https://nudgedispatch.com/changelog.html): dated list of shipped updates
+- [Free 15-ride trial](https://nudgedispatch.com/trial.html): plain-language summary of the self-serve Solo trial
+- [Beta program notice](https://nudgedispatch.com/beta-conditions.html): the beta tester program has ended; this URL now points to the trial
+- [Privacy](https://nudgedispatch.com/privacy.html)
+- [Terms](https://nudgedispatch.com/terms.html)
+- [Demo](https://demo.nudgedispatch.com): sample data only; nothing in it is real and nobody is contacted
