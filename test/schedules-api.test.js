@@ -181,8 +181,13 @@ test("regular schedules: upcoming list, confirm creates exactly one ride, skip p
     assert.equal(csv.status, 200);
     assert.equal(csv.text.split("\n").filter((line) => line.includes(",schedule,")).length, 3);
 
-    // A client with a schedule cannot be deleted out from under it; deleting a schedule keeps its rides.
-    assert.equal((await call(worker, `/api/clients/${clientId}`, { method: "DELETE", session })).status, 409);
+    // A client with a schedule (and rides) is archived, not deleted (Nov 20, 2026); the schedule is paused, not removed.
+    const del = await call(worker, `/api/clients/${clientId}`, { method: "DELETE", session });
+    assert.equal(del.status, 200, JSON.stringify(del.data));
+    assert.equal(del.data.archived, true);
+    assert.equal((await call(worker, `/api/clients/${clientId}`, { session })).data.client.archived, true);
+    assert.equal((await call(worker, `/api/schedules/${sid}`, { session })).data.schedule.active, false);
+    // Deleting a schedule keeps its rides.
     assert.equal((await call(worker, `/api/schedules/${sid}`, { method: "DELETE", session })).status, 200);
     assert.equal((await call(worker, `/api/schedules/${sid}`, { session })).status, 404);
     rides = (await call(worker, "/api/rides", { session })).data.rides;

@@ -567,3 +567,10 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .note.driver-help { margin-top: 14px; }
 .desktop-site-hint { display: flex; gap: 10px; align-items: center; justify-content: space-between; background: #2a2412; color: var(--text); border-bottom: 1px solid #5a4a1a; padding: 10px 14px; font-size: 15px; }
 .desktop-site-hint .btn { min-height: 40px; padding: 8px 12px; flex: none; }
+
+/* Clients: Archived toggle + Delete client (Nov 20, 2026) */
+.arch-tabs { display: flex; gap: 8px; margin: 0 0 12px; }
+.arch-tabs .chip { cursor: pointer; font: inherit; font-size: 14px; }
+.arch-tabs .chip.on { border-color: var(--teal); color: var(--teal); background: transparent; }
+.archived-note .btn { margin-top: 10px; }
+#delclient { margin-top: 18px; }

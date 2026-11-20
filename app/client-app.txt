@@ -1059,15 +1059,28 @@ async function renderWhere(token, gen) {
   box.innerHTML = `<article class="card"><p>${esc(String(point.lat))}, ${esc(String(point.lng))}</p><p class="sub">Fix ${esc(new Date(point.fixAt).toLocaleString())}${point.stale ? " · stale" : ""}</p><a class="btn" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}" target="_blank" rel="noopener">Open the point in Maps</a></article>`;
 }
 
+// Clients tab: false = the normal list, true = archived clients (Nov 20, 2026; migration 0018).
+let clientsArchivedView = false;
 async function renderClients(gen) {
   setTabs(true);
-  shell(`<div class="row"><h1>Clients</h1><a class="btn" href="#/clients/new">Add</a></div><div id="list" class="muted">Loading…</div>`);
-  const result = await api("/api/clients");
+  shell(`<div class="row"><h1>Clients</h1><a class="btn" href="#/clients/new">Add</a></div><div id="archtabs"></div><div id="list" class="muted">Loading…</div>`);
+  const result = await api("/api/clients" + (clientsArchivedView ? "?archived=1" : ""));
   if (gen !== renderGen) return;
   const list = document.querySelector("#list");
   if (!result.data.ok) { list.textContent = result.data.error || "Could not load clients."; return; }
-  if (!result.data.clients.length) { list.innerHTML = "<p>No clients yet.</p>"; return; }
-  list.innerHTML = result.data.clients.map((client) => `<button class="list-btn" data-id="${esc(client.id)}">
+  const nArch = clientsArchivedView ? result.data.clients.length : Number(result.data.archivedCount || 0);
+  const tabs = document.querySelector("#archtabs");
+  if (nArch || clientsArchivedView) {
+    tabs.innerHTML = `<div class="chips arch-tabs"><button type="button" class="chip${clientsArchivedView ? "" : " on"}" data-arch="0">Clients</button><button type="button" class="chip${clientsArchivedView ? " on" : ""}" data-arch="1">Archived (${nArch})</button></div>`;
+    tabs.onclick = (event) => {
+      const b = event.target.closest("[data-arch]");
+      if (!b) return;
+      clientsArchivedView = b.dataset.arch === "1";
+      renderClients(renderGen);
+    };
+  }
+  if (!result.data.clients.length) { list.innerHTML = clientsArchivedView ? "<p>No archived clients.</p>" : "<p>No clients yet.</p>"; return; }
+  list.innerHTML = (clientsArchivedView ? `<p class="sub">Hidden from Clients and New ride. Open one to restore it.</p>` : "") + result.data.clients.map((client) => `<button class="list-btn" data-id="${esc(client.id)}">
       <div class="title">${esc(client.name)}</div>
       <div class="sub">${esc(client.phone || client.email || "No phone yet")}</div>
     </button>`).join("");
@@ -1091,14 +1104,48 @@ function clientForm(client) {
 async function renderClientForm(id, gen) {
   setTabs(true);
   let client = null;
+  let history = null;
   if (id) {
     const result = await api("/api/clients/" + id);
     if (gen !== renderGen) return;
     if (!result.data.ok) { shell(`<p>${esc(result.data.error || "Client not found.")}</p>`); return; }
     client = result.data.client;
+    history = result.data.history || null;
   }
-  shell(`<p class="muted"><a href="#/clients">Clients</a></p><h1>${client ? "Client" : "New client"}</h1>${clientForm(client)}${client ? `<section class="card" id="schedules"><p class="muted">Loading schedules…</p></section>` : ""}`);
+  const archivedNote = client && client.archived
+    ? `<section class="note archived-note"><b>Archived${client.archivedAt ? " " + esc(new Date(client.archivedAt).toLocaleDateString()) : ""}</b><br>Hidden from Clients and New ride. Rides, invoices and billed totals are kept.<button class="btn full" type="button" id="restore">Restore client</button></section>`
+    : "";
+  shell(`<p class="muted"><a href="#/clients">Clients</a></p><h1>${client ? "Client" : "New client"}</h1>${archivedNote}${clientForm(client)}${client ? `<section class="card" id="schedules"><p class="muted">Loading schedules…</p></section>` : ""}${client && !client.archived && history ? `<button class="btn danger full" type="button" id="delclient">Delete client</button>` : ""}`);
   if (client) paintClientSchedules(id, gen);
+  const restoreBtn = document.querySelector("#restore");
+  if (restoreBtn) restoreBtn.onclick = async () => {
+    restoreBtn.disabled = true;
+    restoreBtn.textContent = "Restoring…";
+    const r = await api("/api/clients/" + id + "/restore", { method: "POST", body: {} });
+    if (!r.data.ok) { restoreBtn.disabled = false; restoreBtn.textContent = "Restore client"; alert(r.data.error || "Could not restore."); return; }
+    clientsArchivedView = false;
+    renderClientForm(id, renderGen);
+  };
+  const delBtn = document.querySelector("#delclient");
+  if (delBtn) delBtn.onclick = async () => {
+    const h = history;
+    const pl = (n, w) => n + " " + w + (n === 1 ? "" : "s");
+    let msg;
+    if (h.hardDelete) msg = `Delete ${client.name}?\n\nThey have no rides, invoices or regular schedules, so the client is removed for good. This can't be undone.`;
+    else {
+      const has = [h.rides && pl(h.rides, "ride"), h.invoices && pl(h.invoices, "invoice"), h.schedules && pl(h.schedules, "regular schedule")].filter(Boolean).join(", ");
+      msg = `Delete ${client.name}?\n\nThey have ${has}, so they will be ARCHIVED instead of deleted: hidden from Clients and New ride. Their rides, invoices and billed totals stay as they are.` +
+        (h.activeSchedules ? `\n\nTheir ${pl(h.activeSchedules, "active regular schedule")} will be paused. Restoring does not turn ${h.activeSchedules === 1 ? "it" : "them"} back on.` : "") +
+        (h.upcomingRides ? `\n\n${pl(h.upcomingRides, "upcoming ride")} stay${h.upcomingRides === 1 ? "s" : ""} on the schedule. Cancel ${h.upcomingRides === 1 ? "it" : "them"} from Rides if needed.` : "") +
+        `\n\nYou can restore them from Clients > Archived. Nobody is texted or emailed.`;
+    }
+    if (!confirm(msg)) return;
+    delBtn.disabled = true;
+    delBtn.textContent = h.hardDelete ? "Deleting…" : "Archiving…";
+    const r = await api("/api/clients/" + id, { method: "DELETE" });
+    if (!r.data.ok) { delBtn.disabled = false; delBtn.textContent = "Delete client"; alert(r.data.error || "Could not delete."); return; }
+    location.hash = "#/clients";
+  };
   document.querySelector("#f").onsubmit = async (event) => {
     event.preventDefault();
     const body = {
