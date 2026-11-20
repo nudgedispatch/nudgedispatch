@@ -105,6 +105,9 @@ try {
   await page.screenshot({ path: join(out, "driver-alerts-390-1-optin.png") });
   await page.click("#alerts-on");
   await page.waitForSelector("#alerts-test");
+  // Once on, the alert controls are a quiet status line under the rides, not a big card on top.
+  assert.equal(await page.locator("#alerts-top #alerts-on").count(), 0);
+  assert.equal(await page.locator("#alerts details.ride-alerts-status #alerts-test").count(), 1);
   const driverCookie = (await ctx.cookies(base)).filter((c) => c.name === "nudge_session").map((c) => "nudge_session=" + c.value)[0];
   const subs = (await call(worker, "/api/push/config", { session: { cookie: driverCookie, csrf: "" } })).data;
   assert.equal(subs.devices, 1, "subscription stored");
@@ -151,8 +154,20 @@ try {
   await ios.addCookies(await ctx.cookies(base));
   const ip = await ios.newPage();
   await ip.goto(base + "/#/rides", { waitUntil: "domcontentloaded" });
-  await ip.waitForSelector(".alerts-steps");
+  await ip.waitForSelector("#alerts-top .ra-more");
+  assert.equal(await ip.locator("#alerts-test, #alerts-on").count(), 0, "no test or turn-on button in iPhone Safari");
+  await ip.click(".ra-more summary");
+  await ip.waitForSelector(".alerts-steps", { state: "visible" });
   await ip.screenshot({ path: join(out, "driver-alerts-390-5-iphone-add-to-home.png") });
+  // A phone in "Desktop site" mode (wide layout viewport on a small touch screen) gets a how-to-fix hint.
+  const desk = await browser.newContext({ viewport: { width: 980, height: 1800 }, screen: { width: 390, height: 844 }, hasTouch: true, isMobile: false, userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36" });
+  const dp = await desk.newPage();
+  await dp.goto(base + "/#/login", { waitUntil: "domcontentloaded" });
+  await dp.waitForSelector("#desktop-site-hint");
+  const normal = await ctx.newPage();
+  await normal.goto(base + "/#/login", { waitUntil: "domcontentloaded" });
+  await normal.waitForTimeout(500);
+  assert.equal(await normal.locator("#desktop-site-hint").count(), 0, "no hint on a normal phone layout");
   console.log("driver-alerts e2e: passed", out);
 } finally {
   if (browser) await browser.close();

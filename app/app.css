@@ -550,3 +550,20 @@ body.bookpage .brand small { color: var(--book-theme-muted, var(--muted)); }
 .ride-alert-banner .rab-actions { display: flex; gap: 6px; flex: none; }
 .ride-alert-banner .btn { min-height: 44px; padding: 10px 14px; font-size: 16px; }
 @keyframes rab-in { from { transform: translateY(-20px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* Driver screen phone polish (Nov 19, 2026): compact alert prompt, rides first, quiet status line. */
+.card.ride-alerts.compact { padding: 12px 14px; }
+.card.ride-alerts.compact .ra-line { margin: 0; color: var(--text); font-size: 15px; line-height: 1.4; }
+.card.ride-alerts.compact .btn.full { margin: 10px 0 0; }
+.ra-more { margin-top: 6px; }
+.ra-more summary, .ride-alerts-status summary { cursor: pointer; color: var(--teal-2); font-size: 15px; min-height: 44px; display: flex; align-items: center; gap: 6px; }
+.ra-more .alerts-steps { margin-top: 2px; }
+.ride-alerts #alerts-sound { color: var(--teal-2); text-decoration: underline; min-height: 44px; font-size: 15px; }
+.ride-alerts-status { margin: 14px 0 6px; padding: 2px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+.ride-alerts-status[open] { padding-bottom: 12px; }
+.ride-alerts-status .sub { margin: 0 0 10px; }
+.ra-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.ra-actions .btn { flex: 1 1 140px; min-height: 48px; font-size: 16px; }
+.note.driver-help { margin-top: 14px; }
+.desktop-site-hint { display: flex; gap: 10px; align-items: center; justify-content: space-between; background: #2a2412; color: var(--text); border-bottom: 1px solid #5a4a1a; padding: 10px 14px; font-size: 15px; }
+.desktop-site-hint .btn { min-height: 40px; padding: 8px 12px; flex: none; }
