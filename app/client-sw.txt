@@ -1,4 +1,4 @@
-const CACHE = "nudge-app-shell-v21";
+const CACHE = "nudge-app-shell-v22";
 const SHELL = ["/", "/app.css", "/app.js", "/manifest.webmanifest", "/brand/wordmark.svg", "/brand/wordmark-on-dark.svg", "/brand/mark.svg", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/icon-192-maskable.png", "/icons/icon-512-maskable.png", "/icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (event) => {
@@ -24,4 +24,67 @@ self.addEventListener("fetch", (event) => {
     }
     return response;
   }).catch(() => caches.match(event.request).then((hit) => hit || caches.match("/"))));
+});
+
+// ---- Driver ride alerts (Web Push) ----
+// The system notification plays the phone's default notification sound; web push cannot use a custom
+// sound. Open app windows also get a message so they can play the in-app chime and show a banner.
+const APPLE = /iPhone|iPad|iPod|Macintosh/.test(self.navigator.userAgent || "");
+
+function alertFromPush(event) {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch { data = {}; }
+  return {
+    kind: String(data.kind || "assigned"),
+    rideId: String(data.rideId || ""),
+    title: String(data.title || "Nudge"),
+    body: String(data.body || "Open Nudge to see your rides."),
+    tag: String(data.tag || "nudge"),
+    url: typeof data.url === "string" && data.url.startsWith("/") ? data.url : "/#/rides",
+    requireInteraction: !!data.requireInteraction,
+  };
+}
+
+self.addEventListener("push", (event) => {
+  const alert = alertFromPush(event);
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    for (const client of windows) client.postMessage({ type: "nudge-ride-alert", alert });
+    // A focused, visible app plays its own chime and banner. Safari requires a notification for every push,
+    // so Apple devices always get one.
+    const focused = windows.some((client) => client.focused && client.visibilityState === "visible");
+    if (focused && !APPLE && alert.kind !== "test") return;
+    await self.registration.showNotification(alert.title, {
+      body: alert.body,
+      tag: alert.tag,
+      renotify: true,
+      requireInteraction: alert.requireInteraction,
+      silent: false,
+      vibrate: alert.kind === "assigned" ? [300, 120, 300, 120, 600] : [200, 100, 200],
+      icon: "/icons/icon-192.png",
+      badge: "/icons/icon-192.png",
+      timestamp: Date.now(),
+      data: { url: alert.url, rideId: alert.rideId, kind: alert.kind },
+    });
+  })());
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = new URL((event.notification.data && event.notification.data.url) || "/#/rides", self.location.origin).href;
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    for (const client of windows) {
+      if (new URL(client.url).origin !== self.location.origin) continue;
+      try { await client.focus(); } catch {}
+      client.postMessage({ type: "nudge-open", url });
+      return;
+    }
+    await self.clients.openWindow(url);
+  })());
+});
+
+self.addEventListener("pushsubscriptionchange", (event) => {
+  // The browser rotated the subscription. The app re-registers next time it opens (see syncRideAlerts).
+  event.waitUntil(Promise.resolve());
 });

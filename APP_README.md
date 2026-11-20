@@ -142,3 +142,14 @@ The company code / booking slug is chosen during signup, reserved on the pending
 Signup includes an optional Branding step: a logo (client-resized to a 384px PNG data URL under 180000 characters, the same limit as `invoice_settings.logo_data_url`) and a theme color (presets or a custom hex). Both can be skipped and edited later in Settings. The theme is stored on `invoice_settings.theme_color`. An empty value keeps the current teal-on-dark booking header; a custom hex becomes the booking and QR page header background, with text color chosen for WCAG 4.5:1 contrast. The public booking page loads `/book/<slug>/theme.css` so the color works under the page CSP.
 
 Turnstile: set `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY`. If the secret is empty (local tests), verification is skipped.
+
+## Driver ride alerts (Web Push, Nov 19, 2026)
+
+- Drivers tap **Turn on ride alerts** on their Rides screen. The browser subscription is stored in `push_subscriptions` (migration 0017).
+- The Worker sends an RFC 8291 (aes128gcm) encrypted, RFC 8292 VAPID-signed push when a ride is assigned or reassigned (owner edit, regular-schedule Confirm, approval with a driver), and a lower-priority one when it is moved off a driver or cancelled. Pushes run in `ctx.waitUntil` after the response; a failed push never fails the assignment. 404/410 deletes the subscription (after a 10-minute grace for brand-new ones, since FCM briefly answers 410 right after subscribing).
+- Lock-screen text is pickup day/time and a short pickup area only (no rider name, phone or street address).
+- **Sound:** a push notification plays the phone's default notification sound. Web push cannot use a custom sound on iPhone or Android. When the app is open, it plays `/sounds/ride-alert.mp3` (chime + "You've got a ride"), vibrates, and shows a banner; it also checks for new rides every 30 s while open as a fallback.
+- **iPhone:** push works only after Add to Home Screen (iOS 16.4+), opened from the Home Screen icon. The card explains this when Safari is not in standalone mode.
+- Secrets: `VAPID_PUBLIC_KEY` (65-byte uncompressed P-256 point, base64url) and `VAPID_PRIVATE_KEY` (32-byte d, base64url). Optional var `VAPID_SUBJECT` (default `https://nudgedispatch.com`). Without the keys the feature is hidden. `PUSH_TEST_ENDPOINT_ORIGIN` is for local tests only.
+- Sound source: `scripts/sounds/make-ride-alert.py` (original synthesized chime + Kokoro-82M TTS, Apache-2.0), sources in `app/sounds/source/`.
+- Tests: `test/push.test.js` (RFC 8291 vectors, VAPID JWT), `test/push-api.test.js` (mock push service), `scripts/e2e/driver-alerts.mjs` (browser opt-in, assign, service worker push, banner + sound).
