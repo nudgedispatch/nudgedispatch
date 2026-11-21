@@ -19,6 +19,8 @@
 // defaultByClass picks the starting option for the vehicle class the rider is booking.
 // dropoffStyle.spots limits the drop-off choice to some spots (empty or missing means all spots).
 
+import { AIRPORT_CODES, bookingConfigFor, publicAirportExtras } from "./airports-data.js";
+
 export const VEHICLE_CLASSES = ["sedan", "suv", "van", "sprinter", "bus"];
 export const LIMITS = { airports: 4, spots: 8, options: 4 };
 
@@ -209,43 +211,9 @@ export function validateAirportConfig(input) {
   return { config: { version: 1, airports } };
 }
 
-// Example config: Iron Gate Executive Transport at Hartsfield-Jackson (ATL).
-export const AIRPORT_PRESETS = {
-  ATL: {
-    code: "ATL",
-    name: "ATL Airport",
-    spots: [
-      { id: "domestic-north", label: "Domestic Terminal North" },
-      { id: "domestic-south", label: "Domestic Terminal South (Delta)" },
-      { id: "international", label: "International Terminal" },
-    ],
-    pickupMeet: {
-      options: [
-        {
-          id: "legacy-west-curb",
-          label: "Legacy West Curb (W1 and W2)",
-          detail: "Black SUV pickups at ATL are at the Legacy West Curb, zones W1 and W2. Your driver meets you there.",
-          classes: ["suv"],
-        },
-        { id: "curbside", label: "Curbside", detail: "Your driver meets you at the arrivals curb.", classes: ["sedan", "van"] },
-        // Black SUVs use the Legacy West Curb only (ATL rule); other classes keep their own choices.
-        { id: "inside", label: "Inside meet-and-greet", detail: "Your driver meets you inside at baggage claim and walks you to the car.", classes: ["sedan", "van", "sprinter", "bus"] },
-      ],
-      default: "curbside",
-      defaultByClass: { suv: "legacy-west-curb" },
-    },
-    dropoffStyle: {
-      options: [
-        { id: "topside", label: "Topside", detail: "Drop-off on the upper-level departures roadway." },
-        { id: "curbside", label: "Curbside", detail: "Drop-off at the curb." },
-      ],
-      default: "curbside",
-      defaultByClass: { suv: "topside" },
-      // Topside or curbside is a Delta (Domestic Terminal South) choice only.
-      spots: ["domestic-south"],
-    },
-  },
-};
+// Presets come from the airport list we maintain (airports-data.js). A fleet ticks codes in
+// More > Rates; the stored config is rebuilt from that list, so fleets never set terminals by hand.
+export const AIRPORT_PRESETS = Object.fromEntries(AIRPORT_CODES.map((code) => [code, bookingConfigFor(code)]));
 
 export function presetConfig(codes) {
   const list = (codes || []).map((c) => AIRPORT_PRESETS[String(c).toUpperCase()]).filter(Boolean);
@@ -275,12 +243,15 @@ export function publicAirportInfo(config) {
     spots: a.spots.map((s) => ({ id: s.id, label: s.label })),
     pickupMeet: a.pickupMeet ? { options: a.pickupMeet.options, default: a.pickupMeet.default || "", defaultByClass: a.pickupMeet.defaultByClass || {} } : null,
     dropoffStyle: a.dropoffStyle ? { options: a.dropoffStyle.options, default: a.dropoffStyle.default || "", defaultByClass: a.dropoffStyle.defaultByClass || {}, spots: a.dropoffStyle.spots || [] } : null,
+    ...(publicAirportExtras(a.code) || {}),
   }));
 }
 
 export function spotAddress(airport, spot) {
   return `${airport.name} - ${spot.label}`;
 }
+
+export const TERMINAL_SOURCES = ["flight_lookup", "airline_table", "rider"];
 
 // Read the airport part of a booking. body.airport = { code, side: "pickup"|"dropoff", spot, meet, style }.
 // Returns { airport: null } for a trip with no airport, { error } when something is missing, or
@@ -298,6 +269,8 @@ export function readAirportChoice(body, config, vehicleClass) {
   if (!spot) return { error: `Choose the ${airport.name} terminal.` };
   const cls = vehicleClass || "";
   const out = { code: airport.code, name: airport.name, side, spot: spot.id, spotLabel: spot.label };
+  // Where the terminal came from: flight_lookup | airline_table | rider (anything else = rider).
+  out.terminalSource = TERMINAL_SOURCES.includes(a.terminalSource) ? a.terminalSource : "rider";
   if (side === "pickup" && airport.pickupMeet) {
     const opts = optionsFor(airport.pickupMeet, cls);
     const want = idOf(a.meet) || defaultFor(airport.pickupMeet, cls);

@@ -21,6 +21,11 @@ STRIPE_PORTAL_CONFIGURATION = ""
 STRIPE_CARD_PAYMENT_CONFIGURATION = ""
 # Signup Turnstile. Empty locally so tests skip the widget and verification.
 TURNSTILE_SITE_KEY = ""
+# Distance pricing (Nov 20, 2026). Our own daily caps on paid calls, all fleets together.
+ROUTES_DAILY_CAP = "500"
+FLIGHT_DAILY_CAP = "200"
+# Public, referrer-restricted Places key for the booking page. Empty locally (plain address fields).
+GOOGLE_MAPS_BROWSER_KEY = ""
 
 # Shell scripts are .txt so Wrangler imports them as text. The Worker still
 # serves them at /app.js, /sw.js, /book.js, and /book/<slug>/sw.js.
@@ -35,6 +40,7 @@ type = "Data"
 globs = ["**/*.png"]
 fallthrough = true
 
-# Flight checks for airport pickups (no-op unless FLIGHT_DATA_PROVIDER and FLIGHT_DATA_API_KEY are set).
+# Flight checks for airport pickups (no-op unless FLIGHT_PROVIDER and FLIGHT_API_KEY are set;
+# the older FLIGHT_DATA_PROVIDER / FLIGHT_DATA_API_KEY names still work).
 [triggers]
 crons = ["*/5 * * * *"]
