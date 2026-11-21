@@ -5,11 +5,13 @@
 //   fare += airportFee                 if pickup or drop-off is an airport on our list
 //   fare += extraStopFee * stops
 //   round to cents
-//   round trip = 2 x one way, 20% off  (1.6 x the one-way fare above, rounded to cents)
+//   round trip = one way x the fleet's "Round trip = one way x" setting (new fleets start at 2,
+//   as before the distance-pricing work; existing fleets keep whatever they already have)
 //
 // Hourly trips are not priced here (see quote-engine.js). All money is integer cents.
 
-export const ROUND_TRIP_FACTOR = 1.6;
+// Default for new fleets and when a sheet has no factor. Not a hard-coded discount.
+export const ROUND_TRIP_FACTOR = 2;
 export const RATE_FIELDS = ["base", "perMile", "perMinute", "minimum", "airportFee", "extraStopFee"];
 const REQUIRED = ["perMile", "minimum"];
 const LABELS = {
@@ -122,16 +124,18 @@ export function computeFare(rates, trip) {
   }
   let total = oneWay;
   if (trip && trip.roundTrip) {
-    total = Math.round(oneWay * ROUND_TRIP_FACTOR);
-    lines.push({ label: "Round trip (2 x one way, 20% off)", cents: total - oneWay });
+    const factor = Number(trip.roundTripFactor) >= 1 ? Number(trip.roundTripFactor) : ROUND_TRIP_FACTOR;
+    total = Math.round(oneWay * factor);
+    lines.push({ label: `Round trip (one way x ${factor})`, cents: total - oneWay });
   }
   return { oneWayCents: oneWay, totalCents: total, minimumApplied, lines };
 }
 
 // What is saved on the ride, so a later rate change never alters this quote.
-export function rateSnapshot(rates) {
+export function rateSnapshot(rates, factor) {
   if (!rates) return null;
-  const out = { version: 1, roundTripFactor: ROUND_TRIP_FACTOR };
+  const f = Number(factor) >= 1 ? Number(factor) : ROUND_TRIP_FACTOR;
+  const out = { version: 1, roundTripFactor: f };
   for (const key of RATE_FIELDS) out[key] = rates[key] || 0;
   return out;
 }

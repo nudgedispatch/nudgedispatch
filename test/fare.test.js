@@ -53,16 +53,18 @@ test("fare: extra-stop fee per stop", () => {
   assert.equal(computeFare(RATES, { miles: 30, minutes: 50, stops: 3 }).totalCents, 10000, "no stop fee set");
 });
 
-test("fare: round trip is 2 x one way less 20% (1.6 x), fees included", () => {
-  assert.equal(ROUND_TRIP_FACTOR, 1.6);
+test("fare: round trip uses the fleet factor (default 2; a set factor is honoured)", () => {
+  assert.equal(ROUND_TRIP_FACTOR, 2);
   const rates = { ...RATES, airportFee: 1500, extraStopFee: 1000 };
   const one = computeFare(rates, { miles: 30, minutes: 50, airport: true, stops: 1 });
   const rt = computeFare(rates, { miles: 30, minutes: 50, airport: true, stops: 1, roundTrip: true });
   assert.equal(rt.oneWayCents, one.totalCents);
-  assert.equal(rt.totalCents, Math.round(one.totalCents * 1.6));
+  assert.equal(rt.totalCents, Math.round(one.totalCents * 2), "default is 2 x one way");
   assert.equal(sum(rt.lines), rt.totalCents);
-  // Minimum applies to the one-way leg before doubling.
-  assert.equal(computeFare(RATES, { miles: 2, roundTrip: true }).totalCents, Math.round(6500 * 1.6));
+  // Minimum applies to the one-way leg before the factor.
+  assert.equal(computeFare(RATES, { miles: 2, roundTrip: true }).totalCents, Math.round(6500 * 2));
+  const custom = computeFare(rates, { miles: 30, minutes: 50, airport: true, stops: 1, roundTrip: true, roundTripFactor: 1.6 });
+  assert.equal(custom.totalCents, Math.round(one.totalCents * 1.6));
 });
 
 test("fare: rounding to cents", () => {
@@ -73,8 +75,8 @@ test("fare: rounding to cents", () => {
   assert.ok(Number.isInteger(f.totalCents));
   // Per minute with a fraction of a cent: 7 x 33 = 231 exactly; 12.3 x 275 = 3382.5 -> total rounds once.
   assert.equal(computeFare(rates, { miles: 12.3, minutes: 7 }).totalCents, Math.round(1000 + 3382.5 + 231));
-  // Round trip of an odd-cent fare is rounded once more: 4383 x 1.6 = 7012.8 -> 7013.
-  assert.equal(computeFare(rates, { miles: 12.3, roundTrip: true }).totalCents, 7013);
+  // Round trip of an odd-cent fare is rounded once more: 4383 x 2 = 8766.
+  assert.equal(computeFare(rates, { miles: 12.3, roundTrip: true }).totalCents, 8766);
 });
 
 test("units: meters to miles (1 decimal) and minutes rounded up", () => {
@@ -97,7 +99,8 @@ test("rate form: dollars in, cents stored, blanks are optional, bad input is ref
   assert.match(validateDistanceRates({ perMile: "0", minimum: "65" }).error, /more than \$0/);
   assert.match(validateDistanceRates({ perMile: "3", minimum: "65", perMinute: "99" }).error, /too high/);
   assert.deepEqual(ratesForEditor(ok.rates), { base: "10", perMile: "3.25", perMinute: "", minimum: "65", airportFee: "15", extraStopFee: "" });
-  assert.deepEqual(rateSnapshot(ok.rates), { version: 1, roundTripFactor: 1.6, base: 1000, perMile: 325, perMinute: 0, minimum: 6500, airportFee: 1500, extraStopFee: 0 });
+  assert.deepEqual(rateSnapshot(ok.rates), { version: 1, roundTripFactor: 2, base: 1000, perMile: 325, perMinute: 0, minimum: 6500, airportFee: 1500, extraStopFee: 0 });
+  assert.deepEqual(rateSnapshot(ok.rates, 1.6).roundTripFactor, 1.6);
 });
 
 function sheet(distance) {
@@ -122,7 +125,12 @@ test("quote engine: distance rates replace flat fares and price stops; hourly is
   assert.equal(q.stops, 2);
   assert.equal(q.rates.perMile, 300);
   const rt = computeQuote(s, { ...req, tripType: "round-trip" }, { miles: 30, minutes: 41 });
-  assert.equal(rt.totalCents, Math.round(13500 * 1.6));
+  assert.equal(rt.totalCents, Math.round(13500 * 2), "new / unset fleets use x2");
+  const s16 = sheet({ base: "10", perMile: "3", minimum: "65", airportFee: "15", extraStopFee: "10" });
+  s16.roundTripFactor = 1.6;
+  const rt16 = computeQuote(s16, { ...req, tripType: "round-trip" }, { miles: 30, minutes: 41 });
+  assert.equal(rt16.totalCents, Math.round(13500 * 1.6));
+  assert.equal(rt16.rates.roundTripFactor, 1.6);
   // Hourly: $75/h, 3-hour minimum, then $18.75 per 15 minutes (unchanged path).
   const h = computeQuote(s, { tripType: "hourly", vehicle: "suv", pickup: "x", hours: 4 }, null);
   assert.equal(h.basis, "hourly");

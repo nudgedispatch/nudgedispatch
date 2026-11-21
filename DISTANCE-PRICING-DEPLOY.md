@@ -123,7 +123,7 @@ Setup:
    - Note: Nudge drivers have few address fields today, so this mostly matters for future driver screens.
 8. **Rider typing a common street name:** type "Main St" on the booking page. Alpharetta / North Atlanta results should come first.
 9. **Out-of-area address:** pick a Nashville address. It can still be selected, routes and prices normally.
-10. **Round trip:** exactly 1.6 x the one-way price for the same trip.
+10. **Round trip:** one way x the fleet's "Round trip = one way x" setting in Rates (new fleets start at 2, as before; existing fleets keep theirs).
 11. **Hourly:** 4 h comes to $225 + 4 x $18.75 = $300. No Google call.
 12. **Google down:** remove `GOOGLE_ROUTES_KEY` and `GOOGLE_MAPS_SERVER_KEY`, or use a wrong key.
     - The booking page shows "We'll confirm your price shortly", with no number.

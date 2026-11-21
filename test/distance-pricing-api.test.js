@@ -197,9 +197,9 @@ test("distance pricing: stops, airport fee and curb pins, round trip, hourly, fl
     // Out of the service area still routes and prices normally (bias, not restriction).
     const far = (await quote({ tripType: "one-way", pickup: "500 Broadway, Nashville, TN", dropoff: "200 Peachtree St, Atlanta, GA" })).data.quote;
     assert.equal(far.available, true, JSON.stringify(far));
-    // Round trip = 1.6 x the one-way fare.
+    // Round trip = one way x the fleet's factor (this fleet uses the default of 2).
     const rt = (await quote({ tripType: "round-trip", pickup: "100 Main St, Alpharetta, GA", dropoff: "200 Peachtree St, Atlanta, GA" })).data.quote;
-    assert.equal(cents(rt.total), Math.round(cents(q1.total) * 1.6));
+    assert.equal(cents(rt.total), Math.round(cents(q1.total) * 2));
     // Hourly unchanged: $75/h, 3 h minimum, then $18.75 per 15 min.
     const hourly = (await quote({ tripType: "hourly", pickup: "100 Main St, Alpharetta, GA", hours: 4 })).data.quote;
     assert.equal(hourly.basis, "hourly");

@@ -378,7 +378,8 @@ function distanceQuote(sheet, v, req, route, tripType, notes) {
   const minutes = route.minutes != null ? Math.max(0, Math.ceil(route.minutes - 1e-9)) : 0;
   const stops = Math.max(0, Math.floor(Number(req.stops) || 0));
   const roundTrip = tripType === "round-trip";
-  const fare = computeFare(sheet.distance, { miles, minutes, airport: !!req.airport, stops, roundTrip });
+  const factor = Number(sheet.roundTripFactor) >= 1 ? Number(sheet.roundTripFactor) : 2;
+  const fare = computeFare(sheet.distance, { miles, minutes, airport: !!req.airport, stops, roundTrip, roundTripFactor: factor });
   if (fare.totalCents > MAX_CENTS) return { available: false, reason: "too-large", message: "Send the request and the operator will quote it." };
   if (fare.minimumApplied) notes.push(`${fmt(sheet.distance.minimum)} minimum fare.`);
   return {
@@ -393,7 +394,7 @@ function distanceQuote(sheet, v, req, route, tripType, notes) {
     miles,
     minutes,
     stops,
-    rates: rateSnapshot(sheet.distance),
+    rates: rateSnapshot(sheet.distance, factor),
   };
 }
 
