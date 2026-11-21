@@ -18,3 +18,10 @@ SMS_MODE=off
 # FLIGHT_PROVIDER=off
 # FLIGHT_API_KEY=YOUR_KEY_HERE
 # FLIGHT_DAILY_CAP=200
+# Per-fleet Routes caps (Eastern day). Defaults shown.
+# ROUTES_FLEET_DAILY_CAP=500
+# ROUTES_PUBLIC_DAILY_CAP=150
+# ROUTES_FLEET_RESERVE=50
+# FLIGHT_FLEET_DAILY_CAP=100
+# Owner/driver app suggestions use the signed-in /api/places/* proxy with this server key (never the browser key).
+# GOOGLE_MAPS_SERVER_KEY=YOUR_KEY_HERE

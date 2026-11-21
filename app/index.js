@@ -1467,25 +1467,9 @@ function clientIp(request) {
 __name(clientIp, "clientIp");
 async function bookingAllowed(env, request, slug) {
   const ipHash = await sha256Hex("book-ip:" + clientIp(request));
-  const now = Date.now();
   const windowMs = 15 * 60 * 1e3;
-  const maxHits = 30;
-  async function hit(bucket) {
-    const row = await env.DB.prepare("SELECT hits, window_started FROM booking_limits WHERE bucket = ?").bind(bucket).first();
-    if (!row || now - row.window_started > windowMs) {
-      await env.DB.prepare(
-        `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?, 1, ?)
-         ON CONFLICT(bucket) DO UPDATE SET hits = 1, window_started = excluded.window_started`
-      ).bind(bucket, now).run();
-      return true;
-    }
-    if (row.hits >= maxHits) return false;
-    await env.DB.prepare("UPDATE booking_limits SET hits = hits + 1 WHERE bucket = ?").bind(bucket).run();
-    return true;
-  }
-  __name(hit, "hit");
-  if (!await hit("ip:" + ipHash)) return false;
-  if (!await hit("slug:" + slug)) return false;
+  if (!await limitHit(env, "bip:" + ipHash, 30, windowMs)) return false;
+  if (!await limitHit(env, "bslug:" + slug, 30, windowMs)) return false;
   return true;
 }
 __name(bookingAllowed, "bookingAllowed");
@@ -1823,6 +1807,74 @@ function placesEnabled(env) {
   return String(env.PLACES_AUTOCOMPLETE || "off").toLowerCase() === "on" && !!env.GOOGLE_MAPS_SERVER_KEY;
 }
 __name(placesEnabled, "placesEnabled");
+// Owner/driver app suggestions: server key, and either the booking proxy switch or (as before) a browser
+// key that used to turn them on. The page itself never gets a key.
+function appPlacesEnabled(env) {
+  return !!env.GOOGLE_MAPS_SERVER_KEY && (placesEnabled(env) || !!mapsBrowserKey(env));
+}
+__name(appPlacesEnabled, "appPlacesEnabled");
+const APP_PLACE_ID_RE = /^[A-Za-z0-9_-]{10,300}$/;
+// POST /api/places/suggest { q, session, near?: { lat, lng } } -> { suggestions: [{ text, placeId }] }
+// Bias: a driver's own position when the app sends it (used for this request only, never stored),
+// else the fleet's home base. US only; a bias, never a restriction.
+async function postAppPlacesSuggest(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const q = str(body.q, 120);
+  if (!appPlacesEnabled(env) || q.length < 3) return json({ ok: true, suggestions: [] });
+  if (!await limitHit(env, "apu:" + user.userId, 300, 15 * 60 * 1e3) || !await limitHit(env, "apc:" + user.companyId, 3e3, 24 * 60 * 60 * 1e3)) return json({ ok: true, suggestions: [] });
+  const near = body.near && Number.isFinite(Number(body.near.lat)) && Number.isFinite(Number(body.near.lng)) && Math.abs(Number(body.near.lat)) <= 90 && Math.abs(Number(body.near.lng)) <= 180 ? { lat: Number(body.near.lat), lng: Number(body.near.lng), radiusMeters: 25e3 } : null;
+  const bias = near || biasFor(await loadFleetBase(env, user.companyId));
+  const req = { input: q, includedRegionCodes: ["us"], sessionToken: str(body.session, 64) || void 0 };
+  if (bias) req.locationBias = { circle: { center: { latitude: bias.lat, longitude: bias.lng }, radius: bias.radiusMeters } };
+  try {
+    const r = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "suggestions.placePrediction.text,suggestions.placePrediction.placeId" },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!r.ok) {
+      console.log(JSON.stringify({ level: "warn", msg: "app-places", status: r.status }));
+      return json({ ok: true, suggestions: [] });
+    }
+    const data = await r.json();
+    const suggestions = (data.suggestions || []).map((x) => x.placePrediction).filter((p) => p && p.text && p.text.text).slice(0, 5)
+      .map((p) => ({ text: p.text.text, placeId: typeof p.placeId === "string" && APP_PLACE_ID_RE.test(p.placeId) ? p.placeId : "" }));
+    return json({ ok: true, suggestions });
+  } catch (error) {
+    console.log(JSON.stringify({ level: "warn", msg: "app-places", name: error instanceof Error ? error.name : "Error" }));
+    return json({ ok: true, suggestions: [] });
+  }
+}
+__name(postAppPlacesSuggest, "postAppPlacesSuggest");
+// POST /api/places/details { placeId, session } -> { text, placeId, lat, lng } (Place Details Essentials).
+async function postAppPlacesDetails(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const placeId = str(body.placeId, 300);
+  if (!appPlacesEnabled(env) || !APP_PLACE_ID_RE.test(placeId)) return json({ ok: false });
+  if (!await limitHit(env, "apd:" + user.userId, 200, 15 * 60 * 1e3)) return json({ ok: false });
+  try {
+    const session = str(body.session, 64);
+    const r = await fetch("https://places.googleapis.com/v1/places/" + encodeURIComponent(placeId) + (session ? "?sessionToken=" + encodeURIComponent(session) : ""), {
+      headers: { "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "id,formattedAddress,location" },
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!r.ok) return json({ ok: false });
+    const p = await r.json();
+    const lat = p.location && Number(p.location.latitude), lng = p.location && Number(p.location.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return json({ ok: false });
+    return json({ ok: true, text: str(p.formattedAddress, 200), placeId, lat, lng });
+  } catch {
+    return json({ ok: false });
+  }
+}
+__name(postAppPlacesDetails, "postAppPlacesDetails");
 // Airport side of a public booking or quote. Replaces the typed pickup or drop-off with the terminal.
 function applyAirportChoice(body, settings, vehicleName) {
   const choice = readAirportChoice(body, settings.airports, vehicleClassOf(vehicleName));
@@ -1956,7 +2008,7 @@ async function postPublicBook(request, env, slug) {
   // routed and priced. No price for any reason (Google down, cap reached): quote_status manual,
   // the owner sees "Price needed" and types it; the booking always goes through.
   const places = readPlaces(body);
-  const q = sheet && (!stops.length || sheet.distance) ? await quoteTrip(env, request, company.id, sheet, trip, { places, airport: placed.airport, stops, settings }) : null;
+  const q = sheet && (!stops.length || sheet.distance) ? await quoteTrip(env, request, company.id, sheet, trip, { places, airport: placed.airport, stops, settings, isPublic: true }) : null;
   const quoted = q && q.available ? q : null;
   const now = Date.now();
   if (placed.airport) {
@@ -1981,23 +2033,33 @@ async function postPublicBook(request, env, slug) {
     await env.DB.prepare("INSERT INTO clients (id, company_id, name, phone, email, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(clientId, company.id, name, phone, email, "", now, now).run();
   }
   const rideId = crypto.randomUUID();
-  await env.DB.prepare(
-    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage, stops_json, quoted_miles, quoted_minutes, quote_status, quote_rates_json, quoted_at)
-     VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
+  const baseValues = [
     rideId, company.id, clientId, date, time, pickup, dropoff, passengers, flight, notes, now, now,
     trip.tripType, trip.vehicleName, trip.tripType === "hourly" ? trip.hours : null,
     quoted ? quoted.totalCents : null,
     quoted ? JSON.stringify({ v: 1, basis: quoted.basis, label: quoted.label, vehicle: quoted.vehicle, lines: quoted.lines, notes: quoted.notes, miles: quoted.miles ?? null, minutes: quoted.minutes ?? null, at: now }) : JSON.stringify({ v: 1, manualReason: manualReason(sheet, stops, q) }),
     placed.airport ? JSON.stringify(placed.airport) : null,
     luggageRaw,
-    stopsToStored(stops),
-    quoted && quoted.miles != null ? quoted.miles : null,
-    quoted && quoted.minutes != null ? quoted.minutes : null,
-    quoted ? "auto" : "manual",
-    quoted && quoted.rates ? JSON.stringify(quoted.rates) : null,
-    quoted ? now : null
-  ).run();
+    stopsToStored(stops)
+  ];
+  const BASE_COLS = "id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage, stops_json";
+  const BASE_VALS = "?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?, ?, ?, ?";
+  try {
+    await env.DB.prepare(`INSERT INTO rides (${BASE_COLS}, quoted_miles, quoted_minutes, quote_status, quote_rates_json, quoted_at) VALUES (${BASE_VALS}, ?, ?, ?, ?, ?)`).bind(
+      ...baseValues,
+      quoted && quoted.miles != null ? quoted.miles : null,
+      quoted && quoted.minutes != null ? quoted.minutes : null,
+      quoted ? "auto" : "manual",
+      quoted && quoted.rates ? JSON.stringify(quoted.rates) : null,
+      quoted ? now : null
+    ).run();
+  } catch (error) {
+    // Worker deployed before migration 0019: save the booking without the quote snapshot columns
+    // (the quote itself is still in quote_cents / quote_json). Never lose a rider's booking.
+    if (!isMissingColumn(error)) throw error;
+    console.log(JSON.stringify({ level: "error", msg: "rides insert", reason: "pre-0019 schema" }));
+    await env.DB.prepare(`INSERT INTO rides (${BASE_COLS}) VALUES (${BASE_VALS})`).bind(...baseValues).run();
+  }
   if (!quoted) console.log(JSON.stringify({ level: "info", msg: "manual quote", reason: q ? q.reason || "unavailable" : sheet ? "no-quote" : "no-rates" }));
   await autoRestoreClient(env, company.id, clientId, rideId, "", "booking-page");
   const view = quoted ? quoteView(quoted, publicCompanyName(company)) : null;
@@ -2048,19 +2110,19 @@ __name(decideBooking, "decideBooking");
 // ---- Rate sheet + instant quotes (draft, Nov 10, 2026) ----
 // Prices are always computed here from the company's saved rate sheet. The booking page only
 // displays what this returns; any price a browser sends is ignored.
+// One atomic statement: start a new window, or count one more hit only while under maxHits. A refused
+// request changes nothing (no RETURNING row), so concurrent requests cannot pass the limit together.
 async function limitHit(env, bucket, maxHits, windowMs) {
-  const now = Date.now();
-  const row = await env.DB.prepare("SELECT hits, window_started FROM booking_limits WHERE bucket = ?").bind(bucket).first();
-  if (!row || now - row.window_started > windowMs) {
-    await env.DB.prepare(
-      `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?, 1, ?)
-       ON CONFLICT(bucket) DO UPDATE SET hits = 1, window_started = excluded.window_started`
-    ).bind(bucket, now).run();
-    return true;
-  }
-  if (row.hits >= maxHits) return false;
-  await env.DB.prepare("UPDATE booking_limits SET hits = hits + 1 WHERE bucket = ?").bind(bucket).run();
-  return true;
+  if (!(maxHits > 0)) return false;
+  const row = await env.DB.prepare(
+    `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?1, 1, ?2)
+     ON CONFLICT(bucket) DO UPDATE SET
+       hits = CASE WHEN ?2 - booking_limits.window_started > ?3 THEN 1 ELSE booking_limits.hits + 1 END,
+       window_started = CASE WHEN ?2 - booking_limits.window_started > ?3 THEN ?2 ELSE booking_limits.window_started END
+     WHERE ?2 - booking_limits.window_started > ?3 OR booking_limits.hits < ?4
+     RETURNING hits`
+  ).bind(bucket, Date.now(), windowMs, maxHits).first();
+  return !!row;
 }
 __name(limitHit, "limitHit");
 async function loadRateSheet(env, companyId) {
@@ -2152,27 +2214,71 @@ function routesDailyCap(env) {
   const n = Number(env.ROUTES_DAILY_CAP);
   return Number.isInteger(n) && n >= 0 ? n : 500;
 }
+function capVar(value, fallback) {
+  const n = Number(value);
+  return value !== void 0 && value !== null && value !== "" && Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+__name(capVar, "capVar");
+// Uncached Routes calls, per Eastern day (same todayIso as the global cap), all counted atomically:
+//   ROUTES_FLEET_DAILY_CAP   per fleet, everything (owner previews, bookings, public quotes). Default 500.
+//   ROUTES_PUBLIC_DAILY_CAP  per fleet, from unauthenticated public quotes and public bookings. Default 150, so
+//                            unique-waypoint requests cannot spend the fleet's whole cap.
+//   ROUTES_DAILY_CAP         all fleets together (shared budget). Default 500.
+//   ROUTES_FLEET_RESERVE     each fleet's first N calls of the day are not refused by the shared cap
+//                            (still counted), so one fleet cannot push every other fleet to zero. Default 50.
+// Any cap reached: no Google call; the quote is manual and the booking still saves (Price needed).
+async function takeRouteCall(env, companyId, isPublic) {
+  const publicKind = "routes-public:" + companyId;
+  const fleetKind = "routes-fleet:" + companyId;
+  if (isPublic && !await takeDaily(env, publicKind, capVar(env.ROUTES_PUBLIC_DAILY_CAP, 150))) return "public-cap";
+  const fleetCount = await takeDaily(env, fleetKind, capVar(env.ROUTES_FLEET_DAILY_CAP, 500));
+  if (!fleetCount) {
+    if (isPublic) await giveBackDaily(env, publicKind);
+    return "fleet-cap";
+  }
+  if (await takeDaily(env, "routes", routesDailyCap(env))) return "";
+  // Shared budget used up today. The fleet's reserve still goes through (counted separately);
+  // ROUTES_DAILY_CAP=0 turns routing off for everyone, reserve or not.
+  if (routesDailyCap(env) > 0 && fleetCount <= capVar(env.ROUTES_FLEET_RESERVE, 50) && await takeDaily(env, "routes-reserve", 1e6)) return "";
+  await giveBackDaily(env, fleetKind);
+  if (isPublic) await giveBackDaily(env, publicKind);
+  return "daily-cap";
+}
+__name(takeRouteCall, "takeRouteCall");
 __name(routesDailyCap, "routesDailyCap");
 function flightDailyCap(env) {
   const n = Number(env.FLIGHT_DAILY_CAP);
   return Number.isInteger(n) && n >= 0 ? n : 200;
 }
 __name(flightDailyCap, "flightDailyCap");
-// Our own daily cap across all fleets. Counts one call and returns true while under the cap.
-async function underDailyCap(env, kind, cap) {
-  if (cap <= 0) return false;
-  const day = todayIso();
+// Counts one call for (Eastern day, kind) only while under cap, atomically. Returns the new count, or 0
+// when the cap is reached (nothing counted, so raising the cap later the same day takes effect).
+// Missing usage table (migration 0019 not applied) or any error: 0, so Google is never called uncounted.
+async function takeDaily(env, kind, cap) {
+  if (!(cap > 0)) return 0;
   try {
     const row = await env.DB.prepare(
-      `INSERT INTO api_daily_usage (day, kind, calls) VALUES (?, ?, 1)
-       ON CONFLICT(day, kind) DO UPDATE SET calls = calls + 1 RETURNING calls`
-    ).bind(day, kind).first();
-    return !!row && row.calls <= cap;
+      `INSERT INTO api_daily_usage (day, kind, calls) VALUES (?1, ?2, 1)
+       ON CONFLICT(day, kind) DO UPDATE SET calls = api_daily_usage.calls + 1 WHERE api_daily_usage.calls < ?3
+       RETURNING calls`
+    ).bind(todayIso(), kind, cap).first();
+    return row ? row.calls : 0;
   } catch (error) {
-    // No usage table (migration not applied): fail closed, so we never call Google uncounted.
-    console.log(JSON.stringify({ level: "error", msg: "daily cap", kind, name: error instanceof Error ? error.name : "Error" }));
-    return false;
+    console.log(JSON.stringify({ level: "error", msg: "daily cap", kind: kind.split(":")[0], name: error instanceof Error ? error.name : "Error" }));
+    return 0;
   }
+}
+__name(takeDaily, "takeDaily");
+// Give back a count taken for a call that then did not happen (a later cap refused it).
+async function giveBackDaily(env, kind) {
+  try {
+    await env.DB.prepare("UPDATE api_daily_usage SET calls = calls - 1 WHERE day = ? AND kind = ? AND calls > 0").bind(todayIso(), kind).run();
+  } catch {
+  }
+}
+__name(giveBackDaily, "giveBackDaily");
+async function underDailyCap(env, kind, cap) {
+  return await takeDaily(env, kind, cap) > 0;
 }
 __name(underDailyCap, "underDailyCap");
 // Place picked in the booking page's autocomplete: { placeId, lat, lng, types }. Validated loosely;
@@ -2221,20 +2327,69 @@ function tripWaypoints(trip, places, airport, stops) {
 __name(tripWaypoints, "tripWaypoints");
 // Airport fee and airport detection: the rider chose an airport connection (always one of our
 // airports), or an autocomplete Place of type "airport" that is one of this fleet's airports.
-function tripAirportCode(airport, places, settings) {
+// Airport fee: a chosen airport connection, or a pickup/drop-off Place at one of the fleet's ticked
+// airports. Client-sent types are not the only signal (see detectAirport): with no types the location
+// decides, and a Place with a placeId whose types say "not an airport" (or that has no location) is
+// re-checked server-side (Place Details Essentials: types and location, server key, cached a day).
+async function tripAirportCode(env, airport, places, settings) {
   if (airport && airport.code) return airport.code;
   const codes = ((settings && settings.airports && settings.airports.airports) || []).map((a) => a.code);
-  return detectAirport(places.pickup, codes) || detectAirport(places.dropoff, codes) || "";
+  if (!codes.length) return "";
+  for (const place of [places.pickup, places.dropoff]) {
+    if (!place) continue;
+    const claimsOther = Array.isArray(place.types) && place.types.length && !place.types.includes("airport");
+    const needsCheck = place.placeId && (place.lat == null || (claimsOther && airportAt(place, codes)));
+    const checked = needsCheck ? await placeFacts(env, place.placeId) : null;
+    const code = detectAirport(checked ? { ...place, ...checked } : place, codes);
+    if (code) return code;
+  }
+  return "";
 }
 __name(tripAirportCode, "tripAirportCode");
+// { types, lat, lng } for a placeId from the server (never the page), or null (no key, error, timeout).
+async function placeFacts(env, placeId) {
+  if (!env.GOOGLE_MAPS_SERVER_KEY || !/^[A-Za-z0-9_-]{10,300}$/.test(placeId)) return null;
+  const cacheKey = new Request("https://place-facts.nudgedispatch.invalid/v1/" + encodeURIComponent(placeId));
+  const cache = typeof caches !== "undefined" ? caches.default : null;
+  try {
+    const hit = cache ? await cache.match(cacheKey) : null;
+    if (hit) return await hit.json();
+  } catch {
+  }
+  try {
+    const r = await fetch("https://places.googleapis.com/v1/places/" + encodeURIComponent(placeId), {
+      headers: { "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "types,location" },
+      signal: AbortSignal.timeout(4e3)
+    });
+    if (!r.ok) {
+      console.log(JSON.stringify({ level: "warn", msg: "place facts", status: r.status }));
+      return null;
+    }
+    const p = await r.json();
+    const lat = p.location ? Number(p.location.latitude) : NaN, lng = p.location ? Number(p.location.longitude) : NaN;
+    const facts = { types: Array.isArray(p.types) ? p.types.filter((t) => typeof t === "string").slice(0, 20) : [], lat: Number.isFinite(lat) ? lat : null, lng: Number.isFinite(lng) ? lng : null };
+    if (cache) {
+      try {
+        await cache.put(cacheKey, new Response(JSON.stringify(facts), { headers: { "content-type": "application/json", "cache-control": "max-age=86400" } }));
+      } catch {
+      }
+    }
+    return facts;
+  } catch (error) {
+    console.log(JSON.stringify({ level: "warn", msg: "place facts", name: error instanceof Error ? error.name : "Error" }));
+    return null;
+  }
+}
+__name(placeFacts, "placeFacts");
 // Returns { miles, minutes } or null (no key, cap reached, Google error or timeout). Never throws.
-async function routeTrip(env, request, companyId, waypoints) {
+async function routeTrip(env, request, companyId, waypoints, isPublic = false) {
   const provider = routingProvider(env, request);
   if (provider === "none" || !waypoints) return null;
   const keyText = JSON.stringify(waypoints).toLowerCase();
   if (provider === "fake") {
-    // Local only. The daily cap still counts here so the cap path can be tested without Google.
-    if (!await underDailyCap(env, "routes", routesDailyCap(env))) return null;
+    // Local only. The caps still count here so the cap paths can be tested without Google.
+    const refused = await takeRouteCall(env, companyId, isPublic);
+    if (refused) return null;
     if (/far away/.test(keyText)) return { miles: 640, minutes: 560 };
     const h = parseInt((await sha256Hex(keyText)).slice(0, 6), 16);
     const miles = 5 + (h % 350) / 10 + waypoints.intermediates.length * 3;
@@ -2252,14 +2407,10 @@ async function routeTrip(env, request, companyId, waypoints) {
     } catch {
     }
   }
-  // Cost guards: our global daily cap (ROUTES_DAILY_CAP, default 500) and at most 500 uncached
-  // lookups per fleet per day. Either one reached: no Google call, the request goes to manual.
-  if (!await limitHit(env, "route:" + companyId, 500, 24 * 60 * 60 * 1e3)) {
-    console.log(JSON.stringify({ level: "warn", msg: "routes", reason: "fleet-limit" }));
-    return null;
-  }
-  if (!await underDailyCap(env, "routes", routesDailyCap(env))) {
-    console.log(JSON.stringify({ level: "warn", msg: "routes", reason: "daily-cap" }));
+  // Cost guards (see takeRouteCall). Any cap reached: no Google call, the request goes to manual.
+  const refused = await takeRouteCall(env, companyId, isPublic);
+  if (refused) {
+    console.log(JSON.stringify({ level: "warn", msg: "routes", reason: refused }));
     return null;
   }
   let result = null;
@@ -2293,14 +2444,15 @@ async function routeTrip(env, request, companyId, waypoints) {
   return result;
 }
 __name(routeTrip, "routeTrip");
-// extras: { places, airport (stored airport choice or null), stops (array of addresses), settings }
+// extras: { places, airport (stored airport choice or null), stops (array of addresses), settings,
+//           isPublic (unauthenticated public quote or booking: also counts against ROUTES_PUBLIC_DAILY_CAP) }
 async function quoteTrip(env, request, companyId, sheet, trip, extras = {}) {
   if (!sheet || !trip.vehicle) return null;
   const stops = extras.stops || [];
   const places = extras.places || { pickup: null, dropoff: null, stops: [] };
-  const airportCode = tripAirportCode(extras.airport || null, places, extras.settings);
+  const airportCode = await tripAirportCode(env, extras.airport || null, places, extras.settings);
   const req = { tripType: trip.tripType || "one-way", vehicle: trip.vehicle, pickup: trip.pickup, dropoff: trip.dropoff, hours: trip.hours, passengers: trip.passengers, stops: stops.length, airport: !!airportCode };
-  const route = needsDistance(sheet, req) ? await routeTrip(env, request, companyId, tripWaypoints(trip, places, extras.airport || null, stops)) : null;
+  const route = needsDistance(sheet, req) ? await routeTrip(env, request, companyId, tripWaypoints(trip, places, extras.airport || null, stops), !!extras.isPublic) : null;
   const q = computeQuote(sheet, req, route);
   if (q) q.airportCode = airportCode;
   return q;
@@ -2351,7 +2503,7 @@ async function postPublicQuote(request, env, slug) {
   const placed = applyAirportChoice(body, settings, vehicleRow ? vehicleRow.name : "");
   if (placed.error) return json({ ok: true, quote: null });
   const trip = readTrip({ ...body, pickup: placed.pickup, dropoff: placed.dropoff, vehicle: vehicleRow ? vehicleRow.id : "" }, saved.sheet);
-  const q = await quoteTrip(env, request, company.id, saved.sheet, trip, { places: readPlaces(body), airport: placed.airport, stops: stopsIn.stops, settings });
+  const q = await quoteTrip(env, request, company.id, saved.sheet, trip, { places: readPlaces(body), airport: placed.airport, stops: stopsIn.stops, settings, isPublic: true });
   return json({ ok: true, quote: quoteView(q, publicCompanyName(company)), pickup: placed.pickup, dropoff: placed.dropoff });
 }
 __name(postPublicQuote, "postPublicQuote");
@@ -2390,7 +2542,12 @@ async function putBookingSettings(request, env) {
   if (body.base !== void 0) {
     const b = readFleetBase(body.base);
     if (b.error) return fail(400, b.error);
-    await env.DB.prepare("UPDATE companies SET base_address = ?, base_lat = ?, base_lng = ?, service_radius_miles = ? WHERE id = ?").bind(b.base ? b.base.address : null, b.base ? b.base.lat : null, b.base ? b.base.lng : null, b.base ? b.base.radiusMiles : null, user.companyId).run();
+    try {
+      await env.DB.prepare("UPDATE companies SET base_address = ?, base_lat = ?, base_lng = ?, service_radius_miles = ? WHERE id = ?").bind(b.base ? b.base.address : null, b.base ? b.base.lat : null, b.base ? b.base.lng : null, b.base ? b.base.radiusMiles : null, user.companyId).run();
+    } catch (error) {
+      if (!isMissingColumn(error)) throw error;
+      return fail(503, "Database update needed (migration 0019) before the home base can be saved.");
+    }
     if (body.airports === void 0 && body.preset === void 0 && body.capacities === void 0 && body.flightRules === void 0) return json({ ok: true, base: b.base });
   }
   let rules = current.flightRules;
@@ -2485,7 +2642,15 @@ async function postPublicFlightStatus(request, env, slug) {
       console.log(JSON.stringify({ level: "info", msg: "flight lookup", reason: "provider-off" }));
       return json(out);
     }
+    // Per fleet first (FLIGHT_FLEET_DAILY_CAP, default 100 per Eastern day), then the shared
+    // FLIGHT_DAILY_CAP. Either reached: the airline table answers; the booking is never blocked.
+    const flightFleetKind = "flight-fleet:" + company.id;
+    if (!await takeDaily(env, flightFleetKind, capVar(env.FLIGHT_FLEET_DAILY_CAP, 100))) {
+      console.log(JSON.stringify({ level: "warn", msg: "flight lookup", reason: "fleet-cap" }));
+      return json(out);
+    }
     if (!await underDailyCap(env, "flight", flightDailyCap(env))) {
+      await giveBackDaily(env, flightFleetKind);
       console.log(JSON.stringify({ level: "warn", msg: "flight lookup", reason: "daily-cap" }));
       return json(out);
     }
@@ -2926,6 +3091,8 @@ async function handleApi(request, env) {
     if (path === "/api/login" && method === "POST") return login(request, env);
     if (path === "/api/logout" && method === "POST") return logout(request, env);
     if (path === "/api/me" && method === "GET") return me(request, env);
+    if (path === "/api/places/suggest" && method === "POST") return postAppPlacesSuggest(request, env);
+    if (path === "/api/places/details" && method === "POST") return postAppPlacesDetails(request, env);
     if (path === "/api/trial" && method === "GET") return getTrial(request, env);
     if (path === "/api/trial/cancel" && method === "POST") return cancelTrial(request, env);
     if (path === "/api/account/cancel" && method === "POST") return cancelTrial(request, env);
@@ -3212,7 +3379,7 @@ async function exportRides(request, env) {
   if (isResponse(user)) return user;
   const denied = ownerOnly(user);
   if (denied) return denied;
-  const rows = await env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? ORDER BY r.pickup_date, r.pickup_time`).bind(user.companyId).all();
+  const rows = await rideSelect(env, "WHERE r.company_id = ? ORDER BY r.pickup_date, r.pickup_time", [user.companyId], "all");
   return csvResponse("rides-" + todayIso() + ".csv",
     ["Date", "Time", "Client", "Client phone", "Client email", "Pickup", "Drop-off", "Passengers", "Flight", "Status", "Fare", "Estimate", "Payment", "Trip type", "Vehicle", "Hours", "Notes", "Source", "Stops"],
     (rows.results || []).map((r) => [r.pickup_date, r.pickup_time, r.client_name, r.client_phone, r.client_email, r.pickup, r.dropoff, r.passengers, r.flight,
@@ -4215,8 +4382,9 @@ __name(logout, "logout");
 async function me(request, env) {
   const user = await requireUser(request, env);
   if (isResponse(user)) return user;
-  // Address suggestions in the owner/driver app: the browser key and the fleet's base bias.
-  const maps = !user.platformAdmin && user.companyId && mapsBrowserKey(env) ? { key: mapsBrowserKey(env), bias: biasFor(await loadFleetBase(env, user.companyId)) } : null;
+  // Address suggestions in the owner/driver app: on/off only (never a key). Suggestions come from the
+  // signed-in /api/places/* proxy, which uses the server key and the fleet's base as bias.
+  const maps = !user.platformAdmin && user.companyId && appPlacesEnabled(env) ? { on: true } : null;
   return json({ ok: true, ...publicUser(user), maps });
 }
 __name(me, "me");
@@ -4391,6 +4559,24 @@ async function restoreClient(request, env, id) {
   return json({ ok: true, restored: true, client: clientJson({ ...existing, archived_at: null, updated_at: now }) });
 }
 __name(restoreClient, "restoreClient");
+// Before migration 0019 the quote snapshot columns don't exist: rideSelect falls back to NULLs.
+function isMissingColumn(error) {
+  return /no such column|has no column named/i.test(String(error && error.message || error));
+}
+__name(isMissingColumn, "isMissingColumn");
+var RIDE_SELECT_PRE_0019 = null;
+async function rideSelect(env, tail, binds, method) {
+  const run = (sql) => env.DB.prepare(`${sql} ${tail}`).bind(...binds)[method]();
+  try {
+    return await run(RIDE_SELECT);
+  } catch (error) {
+    if (!isMissingColumn(error)) throw error;
+    console.log(JSON.stringify({ level: "error", msg: "rides select", reason: "pre-0019 schema" }));
+    RIDE_SELECT_PRE_0019 = RIDE_SELECT_PRE_0019 || RIDE_SELECT.replace("r.quoted_miles, r.quoted_minutes, r.quote_status, r.quoted_at,", "NULL AS quoted_miles, NULL AS quoted_minutes, NULL AS quote_status, NULL AS quoted_at,");
+    return run(RIDE_SELECT_PRE_0019);
+  }
+}
+__name(rideSelect, "rideSelect");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
   r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.arrived_at, r.picked_up_at, r.completed_at,
   r.driver_user_id, drv.name AS assigned_driver_name, drv.vehicle AS assigned_driver_vehicle, drv.plate AS assigned_driver_plate, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
@@ -4403,15 +4589,15 @@ var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS c
 async function listRides(request, env) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;
-  const rows = user.role === "driver" ? await env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? AND r.driver_user_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200`).bind(user.companyId, user.userId).all() : await env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200`).bind(user.companyId).all();
+  const rows = user.role === "driver" ? await rideSelect(env, "WHERE r.company_id = ? AND r.driver_user_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200", [user.companyId, user.userId], "all") : await rideSelect(env, "WHERE r.company_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200", [user.companyId], "all");
   return json({ ok: true, rides: (rows.results || []).map((row) => rideJson(row, user.role)) });
 }
 __name(listRides, "listRides");
 async function ownedRide(env, user, id) {
   if (user.role === "driver") {
-    return env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? AND r.id = ? AND r.driver_user_id = ?`).bind(user.companyId, id, user.userId).first();
+    return rideSelect(env, "WHERE r.company_id = ? AND r.id = ? AND r.driver_user_id = ?", [user.companyId, id, user.userId], "first");
   }
-  return env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? AND r.id = ?`).bind(user.companyId, id).first();
+  return rideSelect(env, "WHERE r.company_id = ? AND r.id = ?", [user.companyId, id], "first");
 }
 __name(ownedRide, "ownedRide");
 function rideFields(body) {
@@ -6202,10 +6388,11 @@ import { validatePaymentMethods, parseStoredPaymentMethods, payOptions, payLines
 import { readStops, stopsToStored, parseStoredStops, stopLines, stopsCell, STOPS_PRICE_MESSAGE } from "./stops.js";
 import { flightProvider, fetchFlightSnapshot, flightAlerts, flightRules, normalizeFlight, shouldWatch } from "./flight-alerts.js";
 import { metersToMiles, durationToMinutes } from "./fare.js";
-import { AIRPORTS, AIRPORT_CODES, airportByCode, terminalWaypoint, detectAirport, airlineOf, terminalsForAirline, terminalFromProvider, freeWaitEnds } from "./airports-data.js";
+import { AIRPORTS, AIRPORT_CODES, airportByCode, terminalWaypoint, detectAirport, airportAt, airlineOf, terminalsForAirline, terminalFromProvider, freeWaitEnds } from "./airports-data.js";
 var CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
-// Booking page and app shell, only when GOOGLE_MAPS_BROWSER_KEY is set: Google's documented allowlist
-// for the Maps JavaScript API (Places Autocomplete). Every other response keeps CSP above.
+// Public booking page (/book/<slug>/) only, and only when GOOGLE_MAPS_BROWSER_KEY is set: Google's
+// documented allowlist for the Maps JavaScript API (Places Autocomplete). The signed-in owner/driver app
+// and every other response keep CSP above (the app gets suggestions through /api/places/*).
 var CSP_BOOK_MAPS = "default-src 'self'; img-src 'self' data: https://*.googleapis.com https://*.gstatic.com *.google.com *.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' https://*.googleapis.com https://*.gstatic.com *.google.com https://*.ggpht.com *.googleusercontent.com 'unsafe-eval' blob:; connect-src 'self' https://*.googleapis.com *.google.com https://*.gstatic.com data: blob:; frame-src *.google.com; worker-src blob:; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 var CSP_SIGNUP = "default-src 'self'; img-src 'self' data: https://challenges.cloudflare.com; style-src 'self' https://challenges.cloudflare.com; script-src 'self' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://checkout.stripe.com";
 var FILES = {
@@ -6391,11 +6578,8 @@ async function serveShell(request, env) {
   }
   const file = FILES[path] || (!path.includes(".") ? FILES["/index.html"] : void 0);
   if (!file) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
-  // Owner/driver app with a browser key: Google's Maps JS allowlist for address suggestions, and the
-  // page origin as referrer so the referrer-restricted key is accepted. Same policy as the booking page.
-  if (file.body === indexHtml && mapsBrowserKey(env)) {
-    return new Response(String(indexHtml).replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\n?/, ""), { status: 200, headers: securityHeaders(file.type, file.cache, { "referrer-policy": "strict-origin-when-cross-origin" }, CSP_BOOK_MAPS) });
-  }
+  // The owner/driver app shell always keeps the strict CSP and no-referrer, browser key or not: it never
+  // loads maps.googleapis.com (address suggestions go through the signed-in /api/places/* proxy).
   return new Response(file.body, { status: 200, headers: securityHeaders(file.type, file.cache) });
 }
 __name(serveShell, "serveShell");

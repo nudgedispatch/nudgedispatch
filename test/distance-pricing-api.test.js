@@ -142,9 +142,18 @@ test("distance pricing: stops, airport fee and curb pins, round trip, hourly, fl
     assert.match(html.headers.get("content-security-policy"), /script-src [^;]*https:\/\/\*\.googleapis\.com/);
     assert.equal(html.headers.get("referrer-policy"), "strict-origin-when-cross-origin");
     assert.doesNotMatch(await html.text(), /http-equiv="Content-Security-Policy"/);
-    const appShell = await worker.fetch("http://127.0.0.1/");
-    assert.match(appShell.headers.get("content-security-policy"), /googleapis/, "owner/driver app loads Places too");
-    assert.equal(appShell.headers.get("referrer-policy"), "strict-origin-when-cross-origin");
+    // The signed-in owner/driver shell keeps the strict CSP even with the browser key set: no Maps JS
+    // allowlist, no 'unsafe-eval', no Google frames, no-referrer, and its own CSP meta stays.
+    for (const shellPath of ["/", "/index.html"]) {
+      const appShell = await worker.fetch("http://127.0.0.1" + shellPath);
+      const csp = appShell.headers.get("content-security-policy");
+      assert.doesNotMatch(csp, /unsafe-eval/, shellPath + ": no unsafe-eval");
+      assert.doesNotMatch(csp, /googleapis|google\.com|gstatic/, shellPath + ": no Google script/connect/frame sources");
+      assert.doesNotMatch(csp, /frame-src/, shellPath + ": no frame-src");
+      assert.match(csp, /script-src 'self';/);
+      assert.equal(appShell.headers.get("referrer-policy"), "no-referrer");
+      assert.match(await appShell.text(), /http-equiv="Content-Security-Policy"/);
+    }
     const css = await worker.fetch("http://127.0.0.1/app.css");
     assert.doesNotMatch(css.headers.get("content-security-policy"), /googleapis/, "other responses keep the strict CSP");
     assert.equal(css.headers.get("referrer-policy"), "no-referrer");
@@ -158,9 +167,15 @@ test("distance pricing: stops, airport fee and curb pins, round trip, hourly, fl
     const withBase = await call(worker, "/api/public/book/" + slug);
     assert.deepEqual(withBase.data.bias, { lat: 34.08, lng: -84.29, radiusMeters: 50000 });
     assert.doesNotMatch(JSON.stringify(withBase.data), /1 Main St/, "the base address is not on the public page");
+    // The signed-in app never receives a key (it uses the /api/places/* server proxy, which needs the
+    // server key; this worker has none, so app suggestions are off and the proxy answers empty).
     const meNow = await call(worker, "/api/me", { session: fleet.session });
-    assert.equal(meNow.data.maps.key, "test-browser-key-0123456789");
-    assert.deepEqual(meNow.data.maps.bias, withBase.data.bias);
+    assert.doesNotMatch(JSON.stringify(meNow.data), /test-browser-key/);
+    assert.equal(meNow.data.maps, null);
+    const sugg = await call(worker, "/api/places/suggest", { method: "POST", session: fleet.session, body: { q: "100 Main" } });
+    assert.equal(sugg.status, 200);
+    assert.deepEqual(sugg.data.suggestions, []);
+    assert.equal((await call(worker, "/api/places/suggest", { method: "POST", body: { q: "100 Main" } })).status, 401, "signed-in only");
     const settingsNow = await call(worker, "/api/booking-settings", { session: fleet.session });
     assert.equal(settingsNow.data.base.address, "1 Main St, Alpharetta, GA");
     assert.equal(settingsNow.data.base.radiusMiles, 50);
@@ -191,6 +206,11 @@ test("distance pricing: stops, airport fee and curb pins, round trip, hourly, fl
     // An autocomplete Place of type airport on our list also counts (no airport connection chosen).
     const placeAirport = (await quote({ tripType: "one-way", pickup: "Hartsfield-Jackson Atlanta International Airport", dropoff: "100 Main St, Alpharetta, GA", places: { pickup: { placeId: "ChIJexampleexampleATL", lat: 33.6407, lng: -84.4277, types: ["airport"] } } })).data;
     assert.ok(placeAirport.quote.lines.some((l) => l.label === "Airport fee"));
+    // Same ATL location with the types left out still gets the fee (types alone can't dodge it).
+    const noTypes = (await quote({ tripType: "one-way", pickup: "Hartsfield-Jackson Atlanta International Airport", dropoff: "100 Main St, Alpharetta, GA", places: { pickup: { lat: 33.6407, lng: -84.4277 } } })).data;
+    assert.ok(noTypes.quote.lines.some((l) => l.label === "Airport fee"), JSON.stringify(noTypes.quote.lines));
+    const emptyTypes = (await quote({ tripType: "one-way", pickup: "Hartsfield-Jackson Atlanta International Airport", dropoff: "100 Main St, Alpharetta, GA", places: { pickup: { lat: 33.6407, lng: -84.4277, types: [] } } })).data;
+    assert.ok(emptyTypes.quote.lines.some((l) => l.label === "Airport fee"));
     const hotel = (await quote({ tripType: "one-way", pickup: "Airport hotel", dropoff: "100 Main St, Alpharetta, GA", places: { pickup: { lat: 33.6407, lng: -84.4277, types: ["lodging"] } } })).data;
     assert.ok(!hotel.quote.lines.some((l) => l.label === "Airport fee"), "a non-airport place near ATL gets no fee");
 

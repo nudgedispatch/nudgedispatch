@@ -131,6 +131,33 @@ try {
     await page.waitForSelector("#base-settings", { timeout: 15000 });
     await page.waitForSelector("#air-codes", { timeout: 15000 });
     await shot("5-owner-rates");
+
+    // Owner app address suggestions go through the signed-in /api/places/* proxy (faked here: no Google
+    // offline). The app shell keeps the strict CSP and never requests Google.
+    const shellCsp = (await page.request.get(base + "/")).headers()["content-security-policy"] || "";
+    if (/googleapis|unsafe-eval/.test(shellCsp)) problems.push(`${vw}px app shell CSP allows Google: ${shellCsp}`);
+    const googleHits = [];
+    page.on("request", (r) => { if (/googleapis\.com|gstatic\.com/.test(r.url())) googleHits.push(r.url()); });
+    await page.route(/\/api\/me$/, async (route) => {
+      const res = await route.fetch();
+      const j = await res.json();
+      await route.fulfill({ response: res, json: { ...j, maps: { on: true } } });
+    });
+    await page.route(/\/api\/places\/suggest$/, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, suggestions: [{ text: "1 Main St, Alpharetta, GA 30009, USA", placeId: "ChIJlocalplace0001" }] }) }));
+    await page.route(/\/api\/places\/details$/, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, text: "1 Main St, Alpharetta, GA 30009, USA", placeId: "ChIJlocalplace0001", lat: 34.0754, lng: -84.2941 }) }));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#base-address", { timeout: 15000 });
+    await page.fill("#base-address", "");
+    await page.type("#base-address", "1 Main");
+    const sugg = await page.waitForSelector(".places-sugg:not(.hidden) button", { timeout: 8000 }).catch(() => null);
+    if (!sugg) problems.push(`${vw}px owner app: no address suggestions from the proxy`);
+    else {
+      await sugg.click();
+      await page.waitForTimeout(300);
+      if (!/1 Main St, Alpharetta/.test(await page.locator("#base-address").inputValue())) problems.push(`${vw}px owner app: suggestion not applied`);
+    }
+    if (googleHits.length) problems.push(`${vw}px owner app requested Google directly: ${googleHits[0]}`);
+    await page.unroute(/\/api\/me$/);
     await ctx.close();
   }
 } finally {

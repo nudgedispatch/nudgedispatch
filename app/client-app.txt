@@ -438,13 +438,13 @@ function setTabs(on) {
   }
 }
 
-// ---- Address suggestions in the owner/driver app (Nov 20, 2026) ----
-// Google Places Autocomplete (Places API New) on inputs marked data-places, only when the fleet's
-// browser key is set (GOOGLE_MAPS_BROWSER_KEY). Suggestions lean toward the fleet's home base and
-// service radius (locationBias, never a restriction; US only). Drivers: one quiet browser location
-// request per session; if allowed, suggestions lean toward the driver instead. That position stays in
-// this page (never sent or stored). No key, Google down or no suggestions: the field is a plain input.
-const placesUi = { key: "", bias: null, lib: null, loading: null, observer: null, driverPos: null };
+// ---- Address suggestions in the owner/driver app (Nov 20, 2026; server proxy since Nov 21) ----
+// Inputs marked data-places get suggestions from the signed-in /api/places/* proxy (server key, Places
+// API New). This page never loads maps.googleapis.com and never holds a key, so it keeps the strict CSP.
+// Suggestions lean toward the fleet's home base (server side). Drivers: one quiet browser location
+// request per session; if allowed, that position is sent with each suggestion request as the bias and
+// is never stored. Off, Google down or no suggestions: the field is a plain input.
+const placesUi = { on: false, observer: null, driverPos: null };
 const GEO_ASKED_KEY = "nudge-geo-asked";
 async function placesSetup() {
   if (!state.me || state.me.platformAdmin) return;
@@ -452,12 +452,9 @@ async function placesSetup() {
     const r = await api("/api/me").catch(() => null);
     state.me.maps = r && r.data && r.data.ok ? r.data.maps || null : null;
   }
-  const maps = state.me.maps;
-  if (!maps || !maps.key) return;
-  placesUi.key = maps.key;
-  placesUi.bias = maps.bias || null;
+  if (!state.me.maps || !state.me.maps.on) return;
+  placesUi.on = true;
   if (state.me.role === "driver") askDriverPosition();
-  placesLoad();
   if (!placesUi.observer && window.MutationObserver) {
     placesUi.observer = new MutationObserver(() => wirePlaces(document));
     placesUi.observer.observe(document.body, { childList: true, subtree: true });
@@ -481,39 +478,13 @@ function askDriverPosition() {
     go();
   }
 }
-function placesBias() {
-  if (placesUi.driverPos) return { center: placesUi.driverPos, radius: 25000 };
-  if (placesUi.bias) return { center: { lat: placesUi.bias.lat, lng: placesUi.bias.lng }, radius: placesUi.bias.radiusMeters };
-  return null;
-}
-function placesLoad() {
-  if (!placesUi.key) return Promise.resolve(null);
-  if (placesUi.loading) return placesUi.loading;
-  placesUi.loading = new Promise((resolve) => {
-    let settled = false;
-    const done = (lib) => { if (settled) return; settled = true; placesUi.lib = lib; resolve(lib); };
-    const timer = setTimeout(() => done(null), 10000);
-    window.gm_authFailure = () => { placesUi.lib = null; };
-    window.__nudgeAppMapsReady = async () => {
-      try {
-        const lib = await window.google.maps.importLibrary("places");
-        clearTimeout(timer);
-        done(lib && lib.AutocompleteSuggestion ? lib : null);
-      } catch (e) {
-        clearTimeout(timer);
-        done(null);
-      }
-    };
-    const s = document.createElement("script");
-    s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(placesUi.key) + "&v=weekly&loading=async&libraries=places&callback=__nudgeAppMapsReady";
-    s.async = true;
-    s.onerror = () => { clearTimeout(timer); done(null); };
-    document.head.appendChild(s);
-  });
-  return placesUi.loading;
+function placesSession() {
+  const b = new Uint8Array(12);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 function wirePlaces(root) {
-  if (!placesUi.key) return;
+  if (!placesUi.on) return;
   root.querySelectorAll("input[data-places]:not([data-places-on])").forEach((input) => {
     input.setAttribute("data-places-on", "1");
     input.setAttribute("autocomplete", "off");
@@ -525,22 +496,19 @@ function wirePlaces(root) {
     input.insertAdjacentElement("afterend", box);
     let timer = 0;
     let seq = 0;
-    let token = null;
+    let session = "";
     input.addEventListener("input", () => {
       input._place = null;
       clearTimeout(timer);
       const q = input.value.trim();
-      if (q.length < 3 || !placesUi.lib) { box.classList.add("hidden"); return; }
+      if (q.length < 3) { box.classList.add("hidden"); return; }
       timer = setTimeout(async () => {
         const my = ++seq;
+        if (!session) session = placesSession();
         let items = [];
         try {
-          if (!token) token = new placesUi.lib.AutocompleteSessionToken();
-          const req = { input: q, sessionToken: token, includedRegionCodes: ["us"] };
-          const bias = placesBias();
-          if (bias) req.locationBias = bias;
-          const r = await placesUi.lib.AutocompleteSuggestion.fetchAutocompleteSuggestions(req);
-          items = (r.suggestions || []).map((x) => x.placePrediction).filter(Boolean).slice(0, 5);
+          const r = await api("/api/places/suggest", { method: "POST", body: { q, session, ...(placesUi.driverPos ? { near: placesUi.driverPos } : {}) } });
+          items = r && r.data && r.data.ok ? (r.data.suggestions || []).slice(0, 5) : [];
         } catch (e) {
           items = [];
         }
@@ -549,18 +517,23 @@ function wirePlaces(root) {
         items.forEach((p) => {
           const b = document.createElement("button");
           b.type = "button";
-          b.textContent = p.text.toString();
+          b.textContent = p.text;
           b.onclick = async () => {
-            token = null;
-            input.value = p.text.toString();
+            const used = session;
+            session = "";
+            input.value = p.text;
             box.classList.add("hidden");
-            try {
-              const place = p.toPlace();
-              await place.fetchFields({ fields: ["formattedAddress", "location"] });
-              input.value = place.formattedAddress || input.value;
-              input._place = { placeId: place.id || "", lat: place.location ? place.location.lat() : null, lng: place.location ? place.location.lng() : null };
-            } catch (e) {
-              input._place = null;
+            input._place = null;
+            if (p.placeId) {
+              try {
+                const d = await api("/api/places/details", { method: "POST", body: { placeId: p.placeId, session: used } });
+                if (d && d.data && d.data.ok) {
+                  input.value = d.data.text || input.value;
+                  input._place = { placeId: d.data.placeId, lat: d.data.lat, lng: d.data.lng };
+                }
+              } catch (e) {
+                input._place = null;
+              }
             }
             input.dispatchEvent(new Event("change", { bubbles: true }));
           };

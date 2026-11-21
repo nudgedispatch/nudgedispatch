@@ -110,13 +110,26 @@ function kmBetween(a, b) {
   return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-// An autocomplete Place counts as an airport only when its types include "airport" AND it is one
-// of our airports (within radiusKm of the airport). codes limits the match to a fleet's airports.
+// Is this Place one of our airports? The location decides which airport (within radiusKm of the
+// airport's center, limited to the fleet's ticked codes); the types only rule it out:
+//   types include "airport"            -> airport (if the location matches)
+//   types missing or empty             -> airport (if the location matches); a client that leaves the
+//                                         types out cannot skip the airport fee that way
+//   types given without "airport"      -> not an airport (an "Airport hotel" is lodging). The Worker
+//                                         re-checks such types server-side when it can (placeId + key).
 // place: { types: [], lat, lng }. Returns the airport code or "".
 export function detectAirport(place, codes) {
-  if (!place || !Array.isArray(place.types) || !place.types.includes("airport")) return "";
+  if (!place) return "";
+  const types = Array.isArray(place.types) ? place.types : [];
+  if (types.length && !types.includes("airport")) return "";
+  return airportAt(place, codes);
+}
+
+// The airport (code) whose area contains this location, among the given codes; "" if none.
+export function airportAt(place, codes) {
+  if (!place) return "";
   const lat = Number(place.lat), lng = Number(place.lng);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "";
+  if (place.lat == null || place.lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return "";
   const allowed = Array.isArray(codes) ? codes.map((c) => String(c).toUpperCase()) : AIRPORT_CODES;
   for (const code of allowed) {
     const a = airportByCode(code);

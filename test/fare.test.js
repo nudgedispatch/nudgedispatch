@@ -158,6 +158,9 @@ test("airports: detection needs type airport AND one of our airports", () => {
   assert.equal(detectAirport(atl), "ATL");
   assert.equal(detectAirport(atl, ["CLT"]), "", "not one of this fleet's airports");
   assert.equal(detectAirport({ ...atl, types: ["lodging"] }), "", "a hotel at the airport is not the airport");
+  assert.equal(detectAirport({ lat: atl.lat, lng: atl.lng }), "ATL", "types left out: the location decides (no fee dodge)");
+  assert.equal(detectAirport({ lat: atl.lat, lng: atl.lng, types: [] }), "ATL");
+  assert.equal(detectAirport({ types: ["airport"] }), "", "no location: not detected here (the Worker re-checks by placeId)");
   assert.equal(detectAirport({ types: ["airport"], lat: 33.87, lng: -84.52 }), "", "another airport (not on our list)");
   assert.equal(detectAirport({ types: ["airport"], lat: 35.2144, lng: -80.9473 }, ["ATL", "CLT", "BNA"]), "CLT");
 });

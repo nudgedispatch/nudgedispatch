@@ -52,8 +52,13 @@ npx wrangler secret put FLIGHT_API_KEY         # flight provider key
 | Name | Kind | Value |
 | --- | --- | --- |
 | `GOOGLE_ROUTES_KEY` | secret | Server key (falls back to `GOOGLE_MAPS_SERVER_KEY` if unset). Without either key, one-way and round-trip requests arrive as **manual** ("We'll confirm your price shortly"). |
-| `GOOGLE_MAPS_BROWSER_KEY` | var | Browser key. Empty means plain address fields everywhere. |
-| `ROUTES_DAILY_CAP` | var | Default `500` (all fleets together, per Eastern day). There is also a 500/day/fleet limit. |
+| `GOOGLE_MAPS_BROWSER_KEY` | var | Browser key, used only on the public booking page (`/book/<slug>/`). Empty means plain address fields there. |
+| `GOOGLE_MAPS_SERVER_KEY` | secret | Server key with Places API (New). The owner/driver app gets address suggestions through the signed-in `/api/places/*` proxy when this is set and either `PLACES_AUTOCOMPLETE=on` or `GOOGLE_MAPS_BROWSER_KEY` is set. The app page never gets a key. It is also used to re-check a Place's types for the airport fee. |
+| `ROUTES_DAILY_CAP` | var | Default `500`. Uncached Routes calls for all fleets together, per Eastern day. `0` turns routing off. |
+| `ROUTES_FLEET_DAILY_CAP` | var | Default `500`. Per fleet, per Eastern day: everything, including owner previews, bookings and public quotes. |
+| `ROUTES_PUBLIC_DAILY_CAP` | var | Default `150`. Per fleet, per Eastern day, from unauthenticated public quotes and public bookings. |
+| `ROUTES_FLEET_RESERVE` | var | Default `50`. Each fleet's first N calls of the day still go through when the shared `ROUTES_DAILY_CAP` is used up, so one fleet cannot push the others to zero. Worst case per day is `ROUTES_DAILY_CAP` plus 50 per fleet. |
+| `FLIGHT_FLEET_DAILY_CAP` | var | Default `100`. Booking-page flight lookups per fleet, per Eastern day. |
 | `FLIGHT_PROVIDER` | var | `aeroapi` (the only adapter built), or `off`. |
 | `FLIGHT_API_KEY` | secret | AeroAPI key. |
 | `FLIGHT_DAILY_CAP` | var | Default `200`. Counts booking-page lookups only. The 5-minute flight-alert cron is not counted. |
@@ -71,16 +76,23 @@ npx wrangler secret put FLIGHT_API_KEY         # flight provider key
   - five new `rides` columns
   - the `api_daily_usage` table
   - four `companies` base columns
-- [ ] Deploy the Worker **after** the migration. Without the usage table the caps fail closed, so routing goes to manual.
+- [ ] **Apply 0019 first, then deploy the Worker.** If the Worker ships first, it still works:
+  - Bookings save without the quote snapshot columns.
+  - The ride list reads NULLs for them.
+  - Every distance quote is manual (the caps fail closed without `api_daily_usage`).
+  - Saving a home base answers "Database update needed (migration 0019)".
+
+  Apply 0019 as soon as you can after that.
 
 ## 4. Security headers (please review)
 
-These apply only to the **booking page and the owner/driver app shell**, and only when `GOOGLE_MAPS_BROWSER_KEY` is set:
+These apply only to the **public booking page** (`/book/<slug>/`), and only when `GOOGLE_MAPS_BROWSER_KEY` is set:
 - **CSP:** Google's documented allowlist for the Maps JavaScript API (`CSP_BOOK_MAPS` in `app/index.js`). It includes `'unsafe-eval'` and `'unsafe-inline'` styles, as Google's allowlist requires.
 - **Referrer policy:** `strict-origin-when-cross-origin` instead of `no-referrer`, so the referrer-restricted key is accepted. Only the page origin is sent.
 
-Every other response keeps the strict CSP and `no-referrer`. This is app code, not a Cloudflare rule, but it does loosen
-the logged-in app when the key is on.
+Every other response keeps the strict CSP and `no-referrer`, including the signed-in owner/driver app at `/` and
+`/index.html`. That app never loads `maps.googleapis.com`; its suggestions come from the signed-in `/api/places/suggest` and
+`/api/places/details` proxy, which uses the server key. This is app code, not a Cloudflare rule.
 
 ## 5. Data still to fill in (`app/airports-data.js`, all marked `TODO`)
 
@@ -149,10 +161,12 @@ WHERE company_id IN (SELECT company_id FROM rate_sheets_legacy);
 
 ## Known limits
 
-- **Airport fee can be dodged:** autocomplete Place types and locations come from the browser. A crafted request could skip the airport fee.
-  The owner still approves every price.
+- **Airport fee and client data:** the airport is recognised from the Place's location (within the airport's radius, on the
+  fleet's ticked list), and leaving the types out does not skip the fee. Non-airport types near an airport (such as a hotel) are
+  re-checked server-side by placeId when `GOOGLE_MAPS_SERVER_KEY` is set. A request that sends a location away from the airport
+  with an airport placeId is routed by the placeId but gets no fee. The owner still approves every price.
 - **Flight lookup is for pickups only:** an airport pickup gets the lookup. A drop-off uses only the airline table, because the provider's terminal is the arrival terminal.
 - **Fees and gratuity:** the old fee and gratuity settings now apply to hourly trips only.
-- **Old address proxy:** the earlier server-side proxy (`PLACES_AUTOCOMPLETE=on` with `GOOGLE_MAPS_SERVER_KEY`) is still in the code. It is used only when no browser key is set.
+- **Booking-page address proxy:** the server-side booking proxy (`PLACES_AUTOCOMPLETE=on` with `GOOGLE_MAPS_SERVER_KEY`) is used when no browser key is set.
 - **No map:** Nudge's owner and driver app has no map, so there is nothing to center. The fleet base and driver position only bias address suggestions.
 - **Iron Gate:** not done. It needs the `1b5e031` baseline tarball, the `irongate-maps` Worker source, and Jesse's rates and base location.
