@@ -7,8 +7,10 @@
 //   * it is arriving early by earlyMinutes or more (default 15; operators may set 15 to 30),
 //   * anything else about the arrival changes after the first check (new estimated time,
 //     terminal or gate, departed or landed).
-// Provider: FlightAware AeroAPI when FLIGHT_DATA_PROVIDER=aeroapi and FLIGHT_DATA_API_KEY is set.
-// With FLIGHT_DATA_PROVIDER unset or "off" nothing is fetched.
+// Provider: see flight-provider.js (FLIGHT_PROVIDER + FLIGHT_API_KEY; the older FLIGHT_DATA_* names
+// still work). With no provider set nothing is fetched.
+
+export { flightProvider, fetchFlightSnapshot, snapshotFromAeroApi } from "./flight-provider.js";
 
 export const DEFAULT_FLIGHT_RULES = { earlyMinutes: 15, delayMinutes: 30, minChangeMinutes: 5 };
 
@@ -21,13 +23,6 @@ export function flightRules(input) {
   return r;
 }
 
-export function flightProvider(env) {
-  const p = String((env && env.FLIGHT_DATA_PROVIDER) || "off").toLowerCase();
-  if (p !== "aeroapi") return { name: "off", ready: false, problem: "Flight tracking is off (FLIGHT_DATA_PROVIDER is not set)." };
-  if (!env.FLIGHT_DATA_API_KEY) return { name: p, ready: false, problem: "FLIGHT_DATA_API_KEY is not set." };
-  return { name: p, ready: true, problem: "" };
-}
-
 // "DL 1234", "dal1234", "Delta 1234" -> "DL1234"-style ident the provider accepts.
 const AIRLINE_NAMES = { delta: "DL", american: "AA", united: "UA", southwest: "WN", spirit: "NK", frontier: "F9", jetblue: "B6", alaska: "AS" };
 export function normalizeFlight(text) {
@@ -35,53 +30,6 @@ export function normalizeFlight(text) {
   for (const [name, code] of Object.entries(AIRLINE_NAMES)) if (t.startsWith(name)) t = code.toLowerCase() + t.slice(name.length);
   t = t.replace(/[^a-z0-9]/g, "").toUpperCase();
   return /^[A-Z0-9]{2,3}\d{1,4}[A-Z]?$/.test(t) ? t : "";
-}
-
-const ms = (iso) => {
-  const n = iso ? Date.parse(iso) : NaN;
-  return Number.isFinite(n) ? n : null;
-};
-
-// AeroAPI /flights/{ident} -> our snapshot, picking the flight that lands closest to `around`.
-export function snapshotFromAeroApi(data, around) {
-  const flights = data && Array.isArray(data.flights) ? data.flights : [];
-  let best = null;
-  let bestGap = Infinity;
-  for (const f of flights) {
-    const sched = ms(f.scheduled_in) ?? ms(f.scheduled_on);
-    if (sched == null) continue;
-    const gap = Math.abs(sched - around);
-    if (gap < bestGap) { best = f; bestGap = gap; }
-  }
-  if (!best || bestGap > 18 * 3600e3) return null;
-  const scheduled = ms(best.scheduled_in) ?? ms(best.scheduled_on);
-  const estimated = ms(best.actual_in) ?? ms(best.actual_on) ?? ms(best.estimated_in) ?? ms(best.estimated_on) ?? scheduled;
-  return {
-    ident: String(best.ident || best.ident_iata || ""),
-    scheduledArrival: scheduled,
-    estimatedArrival: estimated,
-    landed: !!(best.actual_on || best.actual_in),
-    departed: !!(best.actual_off || best.actual_out),
-    cancelled: !!best.cancelled,
-    diverted: !!best.diverted,
-    terminal: String(best.terminal_destination || ""),
-    gate: String(best.gate_destination || ""),
-    status: String(best.status || ""),
-  };
-}
-
-export async function fetchFlightSnapshot(env, ident, aroundMs, fetchImpl) {
-  const provider = flightProvider(env);
-  if (!provider.ready) return { ok: false, problem: provider.problem };
-  const doFetch = fetchImpl || fetch;
-  const start = new Date(aroundMs - 12 * 3600e3).toISOString().slice(0, 19) + "Z";
-  const end = new Date(aroundMs + 12 * 3600e3).toISOString().slice(0, 19) + "Z";
-  const base = env.FLIGHT_DATA_API_BASE && /^http:\/\/127\.0\.0\.1:\d+$/.test(env.FLIGHT_DATA_API_BASE) ? env.FLIGHT_DATA_API_BASE : "https://aeroapi.flightaware.com/aeroapi";
-  const url = `${base}/flights/${encodeURIComponent(ident)}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
-  const res = await doFetch(url, { headers: { "x-apikey": env.FLIGHT_DATA_API_KEY, accept: "application/json" } });
-  if (!res.ok) return { ok: false, problem: `Flight lookup failed (${res.status}).` };
-  const snap = snapshotFromAeroApi(await res.json(), aroundMs);
-  return snap ? { ok: true, snapshot: snap } : { ok: false, problem: "Flight not found near the pickup time." };
 }
 
 function clock(msValue, timeZone) {

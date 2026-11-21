@@ -438,6 +438,141 @@ function setTabs(on) {
   }
 }
 
+// ---- Address suggestions in the owner/driver app (Nov 20, 2026) ----
+// Google Places Autocomplete (Places API New) on inputs marked data-places, only when the fleet's
+// browser key is set (GOOGLE_MAPS_BROWSER_KEY). Suggestions lean toward the fleet's home base and
+// service radius (locationBias, never a restriction; US only). Drivers: one quiet browser location
+// request per session; if allowed, suggestions lean toward the driver instead. That position stays in
+// this page (never sent or stored). No key, Google down or no suggestions: the field is a plain input.
+const placesUi = { key: "", bias: null, lib: null, loading: null, observer: null, driverPos: null };
+const GEO_ASKED_KEY = "nudge-geo-asked";
+async function placesSetup() {
+  if (!state.me || state.me.platformAdmin) return;
+  if (state.me.maps === undefined) {
+    const r = await api("/api/me").catch(() => null);
+    state.me.maps = r && r.data && r.data.ok ? r.data.maps || null : null;
+  }
+  const maps = state.me.maps;
+  if (!maps || !maps.key) return;
+  placesUi.key = maps.key;
+  placesUi.bias = maps.bias || null;
+  if (state.me.role === "driver") askDriverPosition();
+  placesLoad();
+  if (!placesUi.observer && window.MutationObserver) {
+    placesUi.observer = new MutationObserver(() => wirePlaces(document));
+    placesUi.observer.observe(document.body, { childList: true, subtree: true });
+  }
+  wirePlaces(document);
+}
+function askDriverPosition() {
+  let asked = false;
+  try { asked = sessionStorage.getItem(GEO_ASKED_KEY) === "1"; } catch (e) { asked = false; }
+  if (asked || !navigator.geolocation || window.isSecureContext === false) return;
+  try { sessionStorage.setItem(GEO_ASKED_KEY, "1"); } catch (e) { /* private mode: ask at most once per page load */ }
+  const go = () => navigator.geolocation.getCurrentPosition(
+    (pos) => { placesUi.driverPos = { lat: pos.coords.latitude, lng: pos.coords.longitude }; },
+    () => { placesUi.driverPos = null; }, // denied, unavailable or timed out: the fleet base is used
+    { enableHighAccuracy: false, timeout: 6000, maximumAge: 300000 }
+  );
+  // Already denied: do not prompt again.
+  if (navigator.permissions && navigator.permissions.query) {
+    navigator.permissions.query({ name: "geolocation" }).then((p) => { if (p.state !== "denied") go(); }).catch(go);
+  } else {
+    go();
+  }
+}
+function placesBias() {
+  if (placesUi.driverPos) return { center: placesUi.driverPos, radius: 25000 };
+  if (placesUi.bias) return { center: { lat: placesUi.bias.lat, lng: placesUi.bias.lng }, radius: placesUi.bias.radiusMeters };
+  return null;
+}
+function placesLoad() {
+  if (!placesUi.key) return Promise.resolve(null);
+  if (placesUi.loading) return placesUi.loading;
+  placesUi.loading = new Promise((resolve) => {
+    let settled = false;
+    const done = (lib) => { if (settled) return; settled = true; placesUi.lib = lib; resolve(lib); };
+    const timer = setTimeout(() => done(null), 10000);
+    window.gm_authFailure = () => { placesUi.lib = null; };
+    window.__nudgeAppMapsReady = async () => {
+      try {
+        const lib = await window.google.maps.importLibrary("places");
+        clearTimeout(timer);
+        done(lib && lib.AutocompleteSuggestion ? lib : null);
+      } catch (e) {
+        clearTimeout(timer);
+        done(null);
+      }
+    };
+    const s = document.createElement("script");
+    s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(placesUi.key) + "&v=weekly&loading=async&libraries=places&callback=__nudgeAppMapsReady";
+    s.async = true;
+    s.onerror = () => { clearTimeout(timer); done(null); };
+    document.head.appendChild(s);
+  });
+  return placesUi.loading;
+}
+function wirePlaces(root) {
+  if (!placesUi.key) return;
+  root.querySelectorAll("input[data-places]:not([data-places-on])").forEach((input) => {
+    input.setAttribute("data-places-on", "1");
+    input.setAttribute("autocomplete", "off");
+    const host = input.parentElement;
+    if (host) host.classList.add("places-wrap");
+    const box = document.createElement("div");
+    box.className = "places-sugg hidden";
+    box.setAttribute("role", "listbox");
+    input.insertAdjacentElement("afterend", box);
+    let timer = 0;
+    let seq = 0;
+    let token = null;
+    input.addEventListener("input", () => {
+      input._place = null;
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < 3 || !placesUi.lib) { box.classList.add("hidden"); return; }
+      timer = setTimeout(async () => {
+        const my = ++seq;
+        let items = [];
+        try {
+          if (!token) token = new placesUi.lib.AutocompleteSessionToken();
+          const req = { input: q, sessionToken: token, includedRegionCodes: ["us"] };
+          const bias = placesBias();
+          if (bias) req.locationBias = bias;
+          const r = await placesUi.lib.AutocompleteSuggestion.fetchAutocompleteSuggestions(req);
+          items = (r.suggestions || []).map((x) => x.placePrediction).filter(Boolean).slice(0, 5);
+        } catch (e) {
+          items = [];
+        }
+        if (my !== seq) return;
+        box.innerHTML = "";
+        items.forEach((p) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.textContent = p.text.toString();
+          b.onclick = async () => {
+            token = null;
+            input.value = p.text.toString();
+            box.classList.add("hidden");
+            try {
+              const place = p.toPlace();
+              await place.fetchFields({ fields: ["formattedAddress", "location"] });
+              input.value = place.formattedAddress || input.value;
+              input._place = { placeId: place.id || "", lat: place.location ? place.location.lat() : null, lng: place.location ? place.location.lng() : null };
+            } catch (e) {
+              input._place = null;
+            }
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          };
+          box.appendChild(b);
+        });
+        box.classList.toggle("hidden", !items.length);
+      }, 300);
+    });
+    input.addEventListener("blur", () => setTimeout(() => box.classList.add("hidden"), 200));
+  });
+}
+
 function shell(html) {
   view.innerHTML = html;
 }
@@ -512,6 +647,7 @@ async function boot() {
   if (me.data.ok) {
     state.me = me.data;
     setTag();
+    placesSetup();
     if (location.hash === "" || location.hash === "#/login" || location.hash === "#/start") {
       location.hash = me.data.platformAdmin ? "#/admin" : "#/rides";
     }
@@ -570,6 +706,7 @@ function renderLogin() {
     if (!result.data.ok) return formError(result.data.error || "Could not sign in.");
     state.me = result.data;
     setTag();
+    placesSetup();
     offerA2hsAfterLogin();
     location.hash = result.data.platformAdmin ? "#/admin" : "#/rides";
   };
@@ -591,6 +728,7 @@ function renderLogin() {
     }
     state.me = result.data;
     setTag();
+    placesSetup();
     offerA2hsAfterLogin();
     location.hash = "#/rides";
   };
@@ -770,10 +908,10 @@ function rideCardHtml(ride, pending) {
   const notes = pending && ride.notes ? `<div class="sub">${esc(ride.notes)}</div>` : "";
   const trip = (tripLine(ride) ? `<div class="sub">${esc(tripLine(ride))}</div>` : "") + airportHtml(ride, "div");
   const owner = !(state.me && state.me.role === "driver");
-  const quote = pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : `<div class="sub">${rideStops(ride).length ? "No estimate: this request has stops, so the client saw Price on request." : "No estimate was shown to the client."}</div>`) : "";
+  const quote = pending && owner ? (ride.quote ? quoteBoxHtml(ride.quote) : priceNeededHtml(ride, "div")) : "";
   const actions = pending && owner ? `${trialClosed() ? trialPausedHtml() : approveBlockHtml(ride, `data-fare="${esc(ride.id)}"`, `data-approve="${esc(ride.id)}"`)}<div class="pend-actions"><button class="btn ghost" type="button" data-decline="${esc(ride.id)}">Decline</button></div>` : "";
   return `<div class="list-btn${pending ? " pending-request card" : ""}" data-id="${esc(ride.id)}">
-      <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badge ${esc(ride.status)}">${esc(rideBadgeText(ride))}</span></div>
+      <div class="row"><span class="title">${esc(ride.clientName)}</span><span class="badges">${pending && owner && ride.priceNeeded ? `<span class="badge price-needed">Price needed</span>` : ""}<span class="badge ${esc(ride.status)}">${esc(rideBadgeText(ride))}</span></span></div>
       <div class="sub when">${when}${fare}</div>
       <div class="sub">${esc(ride.pickup)} → ${esc(ride.dropoff)}</div>
       ${stopsSummaryHtml(ride, "div")}
@@ -892,7 +1030,7 @@ async function renderRide(id, gen) {
   box.innerHTML = `<article class="card">
       <div class="row"><h2>${esc(ride.clientName)}</h2><span class="badge ${esc(ride.status)}">${esc(schedule.now || label(ride.status))}</span></div>
       <p class="route">${esc(ride.pickup)}<br>${rideStops(ride).map((stop, i) => `→ <span class="stop-tag">Stop ${i + 1}:</span> ${esc(stop)}<br>`).join("")}→ ${esc(ride.dropoff)}</p>
-      ${rideStops(ride).length && ride.status === "requested" && !driverView && !ride.quote ? `<p class="sub">This request has stops. No estimate was shown; the client saw Price on request.</p>` : ""}
+      ${ride.status === "requested" && !driverView && !ride.quote ? priceNeededHtml(ride, "p") : ""}
       ${tripLine(ride) ? `<p class="sub">${esc(tripLine(ride))}</p>` : ""}
       ${airportHtml(ride, "p")}
       ${ride.quote && !driverView ? quoteBoxHtml(ride.quote) : ""}
@@ -1182,9 +1320,9 @@ async function renderNewRide(gen) {
       <label class="full">Client<select id="client">${options}</select></label>
       <label>Date<input id="date" type="date" required></label>
       <label>Time<input id="time" type="time" required></label>
-      <label class="full">Pickup<input id="pickup" required autocomplete="street-address"></label>
+      <label class="full">Pickup<input id="pickup" required autocomplete="street-address" data-places></label>
       ${stopEditorHtml([], "new-stops")}
-      <label class="full">Drop-off<input id="dropoff" required></label>
+      <label class="full">Drop-off<input id="dropoff" required data-places></label>
       <label>Passengers<input id="passengers" type="number" min="1" max="14" value="1" inputmode="numeric"></label>
       <label>Fare (USD)<input id="fare" inputmode="decimal" placeholder="125.00" required></label>
       <label class="full">Flight (optional)<input id="flight" maxlength="12" autocapitalize="characters"></label>
@@ -2038,7 +2176,7 @@ async function renderSettings(gen) {
     </section>` : ""}
     <section class="card" id="rates-card">
       <h2>Rates &amp; instant quotes</h2>
-      <p class="sub">Set your vehicles, per-mile and hourly rates, airport flat fares, and fees. Clients see an estimate on your booking page; you confirm the final price when you approve.</p>
+      <p class="sub">Set your distance rates (base, per mile, per minute, minimum, airport and stop fees), vehicles, hourly rates, and the airports you serve. Clients see an estimate on your booking page; you confirm the final price when you approve.</p>
       <a class="btn ghost full" href="#/settings/rates" style="display:block;text-align:center;text-decoration:none">Edit rate sheet</a>
     </section>
     <form id="f" class="fields">
@@ -2508,19 +2646,27 @@ async function renderAdmin(gen) {
 }
 
 // ---- Rate sheet editor (More > Rates & instant quotes), draft Nov 10, 2026 ----
-const RS_BLANK_VEHICLE = () => ({ name: "", seats: "", base: "", perMile: "", minimum: "", hourlyRate: "", minHours: "", blockMinutes: "", blockPrice: "" });
-const RS_BLANK_FARE = (n) => ({ place: "", placeKeywords: "", area: "", areaKeywords: "", prices: Array.from({ length: n }, () => ({ oneWay: "", roundTrip: "" })) });
+// Nov 20, 2026: one distance rate set per fleet (base, per mile, per minute, minimum, airport fee,
+// extra-stop fee) prices every one-way and round-trip request by Google road distance. Vehicles stay
+// for seats and hourly. Flat fares and per-vehicle mileage are gone from this form; an older sheet
+// keeps using them until the owner saves here.
+const RS_BLANK_VEHICLE = () => ({ name: "", seats: "", hourlyRate: "", minHours: "", blockMinutes: "", blockPrice: "" });
+const RS_BLANK_DISTANCE = () => ({ base: "", perMile: "", perMinute: "", minimum: "", airportFee: "", extraStopFee: "" });
 
 function rsFromServer(enabled, sheet) {
-  const s = sheet || { vehicles: [{ ...RS_BLANK_VEHICLE(), name: "Sedan", seats: "3" }], flatFares: [], fees: [], gratuityPercent: 0, roundTripFactor: 2, roundTo: 1, maxMiles: 100 };
-  const names = s.vehicles.map((v) => v.name);
+  const s = sheet || { vehicles: [{ ...RS_BLANK_VEHICLE(), name: "Sedan", seats: "3" }], fees: [], gratuityPercent: 0, roundTo: 1, maxMiles: 100 };
+  const legacy = !s.distanceSet && ((s.flatFares || []).length > 0 || (s.vehicles || []).some((v) => v.perMile || v.base));
   return {
     enabled: !!enabled,
-    vehicles: s.vehicles.map((v) => ({ ...RS_BLANK_VEHICLE(), ...v })),
-    flatFares: (s.flatFares || []).map((f) => ({ ...f, prices: names.map((name) => ({ oneWay: "", roundTrip: "", ...((f.prices || {})[name] || {}) })) })),
-    fees: (s.fees || []).map((f) => ({ label: f.label, kind: f.kind, appliesTo: f.appliesTo || "all", amount: f.amount })),
+    legacy,
+    vehicles: s.vehicles.map((v) => {
+      const out = RS_BLANK_VEHICLE();
+      for (const k of ["id", ...Object.keys(out)]) if (v[k] != null) out[k] = v[k];
+      return out;
+    }),
+    distance: { ...RS_BLANK_DISTANCE(), ...(s.distance || {}) },
+    fees: (s.fees || []).map((f) => ({ label: f.label, kind: f.kind, appliesTo: "all", amount: f.amount })),
     gratuityPercent: String(s.gratuityPercent ?? 0),
-    roundTripFactor: String(s.roundTripFactor ?? 2),
     roundTo: String(s.roundTo ?? 1),
     maxMiles: String(s.maxMiles ?? 100),
   };
@@ -2530,16 +2676,13 @@ function rsToServer(rs) {
   return {
     enabled: rs.enabled,
     rateSheet: {
-      vehicles: rs.vehicles,
-      flatFares: rs.flatFares.map((f) => ({
-        place: f.place, placeKeywords: f.placeKeywords, area: f.area, areaKeywords: f.areaKeywords,
-        prices: Object.fromEntries(rs.vehicles.map((v, i) => [v.name, f.prices[i] || { oneWay: "", roundTrip: "" }]).filter(([name]) => name)),
-      })),
+      vehicles: rs.vehicles.map(({ id, ...v }) => v),
+      flatFares: [],
       fees: rs.fees,
       gratuityPercent: rs.gratuityPercent,
-      roundTripFactor: rs.roundTripFactor,
       roundTo: Number(rs.roundTo),
       maxMiles: rs.maxMiles,
+      distance: rs.distance,
     },
   };
 }
@@ -2550,72 +2693,61 @@ function rsField(path, labelText, value, opts = {}) {
 }
 
 function rsEditorHtml(rs, distanceOn) {
-  const vehicleNames = rs.vehicles.map((v, i) => v.name || "Vehicle " + (i + 1));
+  const d = rs.distance;
   const vehicles = rs.vehicles.map((v, i) => `<div class="rate-vehicle">
       <div class="row"><h3 class="title">${esc(v.name || "Vehicle " + (i + 1))}</h3>${rs.vehicles.length > 1 ? `<button type="button" class="linkbtn" data-remove-vehicle="${i}">Remove</button>` : ""}</div>
       <div class="rate-grid">
         ${rsField(`vehicles.${i}.name`, "Name", v.name, { placeholder: "Sedan, SUV, Sprinter" })}
         ${rsField(`vehicles.${i}.seats`, "Seats", v.seats, { mode: "numeric", placeholder: "e.g. 3" })}
-        ${rsField(`vehicles.${i}.base`, "Base fare $", v.base, { mode: "decimal" })}
-        ${rsField(`vehicles.${i}.perMile`, "Per mile $", v.perMile, { mode: "decimal" })}
-        ${rsField(`vehicles.${i}.minimum`, "Trip minimum $", v.minimum, { mode: "decimal" })}
         ${rsField(`vehicles.${i}.hourlyRate`, "Hourly rate $", v.hourlyRate, { mode: "decimal" })}
         ${rsField(`vehicles.${i}.minHours`, "Minimum hours", v.minHours, { mode: "decimal" })}
         <label>After the minimum<select data-path="vehicles.${i}.blockMinutes">${[["", "Hourly rate"], ["15", "Per 15 min"], ["30", "Per 30 min"], ["60", "Per 60 min"]].map(([val, text]) => `<option value="${val}"${String(v.blockMinutes || "") === val ? " selected" : ""}>${text}</option>`).join("")}</select></label>
         ${v.blockMinutes ? rsField(`vehicles.${i}.blockPrice`, `Price per ${v.blockMinutes} min after minimum $`, v.blockPrice, { mode: "decimal", full: true }) : ""}
       </div>
     </div>`).join("");
-  const fares = rs.flatFares.map((f, i) => `<div class="rate-fare">
-      <div class="row"><h3 class="title">${esc(f.place || "Flat fare " + (i + 1))}${f.area ? " \u00b7 " + esc(f.area) : ""}</h3><button type="button" class="linkbtn" data-remove-fare="${i}">Remove</button></div>
-      <div class="rate-grid">
-        ${rsField(`flatFares.${i}.place`, "Place", f.place, { placeholder: "ATL Airport" })}
-        ${rsField(`flatFares.${i}.placeKeywords`, "Matches words", f.placeKeywords, { placeholder: "atl, hartsfield" })}
-        ${rsField(`flatFares.${i}.area`, "Only from/to area (optional)", f.area, { placeholder: "Anywhere" })}
-        ${rsField(`flatFares.${i}.areaKeywords`, "Area matches words", f.areaKeywords, { placeholder: "e.g. buckhead" })}
-        ${rs.vehicles.map((v, vi) => `${rsField(`flatFares.${i}.prices.${vi}.oneWay`, vehicleNames[vi] + " one way $", (f.prices[vi] || {}).oneWay || "", { mode: "decimal" })}${rsField(`flatFares.${i}.prices.${vi}.roundTrip`, vehicleNames[vi] + " round trip $", (f.prices[vi] || {}).roundTrip || "", { mode: "decimal", placeholder: "x" + (rs.roundTripFactor || 2) })}`).join("")}
-      </div>
-    </div>`).join("");
   const fees = rs.fees.map((fee, i) => `<div class="fee-row">
-      ${rsField(`fees.${i}.label`, "Fee name", fee.label, { placeholder: "Airport fee" })}
+      ${rsField(`fees.${i}.label`, "Fee name", fee.label, { placeholder: "Fuel surcharge" })}
       <label>Type<select data-path="fees.${i}.kind"><option value="flat"${fee.kind !== "percent" ? " selected" : ""}>$</option><option value="percent"${fee.kind === "percent" ? " selected" : ""}>% of fare</option></select></label>
       ${rsField(`fees.${i}.amount`, "Amount", fee.amount, { mode: "decimal" })}
-      <label class="full">Applies to<select data-path="fees.${i}.appliesTo"><option value="all"${fee.appliesTo !== "flat" ? " selected" : ""}>Every trip</option><option value="flat"${fee.appliesTo === "flat" ? " selected" : ""}>Flat-fare trips only (e.g. airport)</option></select></label>
       <button type="button" class="linkbtn full" data-remove-fee="${i}">Remove fee</button>
     </div>`).join("");
   return `<form id="rates" novalidate>
     <section class="card">
       <label class="switch"><input type="checkbox" data-path="enabled"${rs.enabled ? " checked" : ""}> Show instant estimates on my booking page</label>
-      <p class="sub">Clients see an estimate with a short breakdown before they send a request. You still set the final price when you approve. Nothing is charged.</p>
-      ${distanceOn ? "" : `<p class="note">Road-distance pricing is off until a maps key is added. Flat fares and hourly rates still give estimates; other trips show \u201cPrice on request\u201d and still come through.</p>`}
+      <p class="sub">Clients see an estimate with a short breakdown before they send a request. When you approve, the price box starts at the quote; change it if needed. Nothing is charged.</p>
+      ${distanceOn ? "" : `<p class="note">Road-distance pricing is off until the maps key is added. Hourly rates still give estimates; other trips show \u201cWe'll confirm your price shortly\u201d and still come through marked Price needed.</p>`}
+      ${rs.legacy ? `<p class="note">Your booking page still uses your old flat fares and per-mile rates. Saving this form switches it to the distance rates below.</p>` : ""}
+    </section>
+    <section class="card" id="distance-rates">
+      <h2>Distance rates (one way and round trip)</h2>
+      <p class="sub">Fare = base + miles x per mile + minutes x per minute, at least the minimum fare. Then add the airport fee (pickup or drop-off at an airport you serve) and the extra-stop fee for each stop. Miles and minutes come from Google driving directions. Round trip = 2 x one way, 20% off. Leave the whole section blank to price these trips yourself.</p>
+      <div class="rate-grid">
+        ${rsField("distance.base", "Base fare $", d.base, { mode: "decimal", placeholder: "0" })}
+        ${rsField("distance.perMile", "Per mile $", d.perMile, { mode: "decimal", placeholder: "e.g. 3.25" })}
+        ${rsField("distance.perMinute", "Per minute $ (optional)", d.perMinute, { mode: "decimal", placeholder: "0" })}
+        ${rsField("distance.minimum", "Minimum fare $", d.minimum, { mode: "decimal", placeholder: "e.g. 65" })}
+        ${rsField("distance.airportFee", "Airport fee $ (optional)", d.airportFee, { mode: "decimal", placeholder: "0" })}
+        ${rsField("distance.extraStopFee", "Extra stop fee $ (optional)", d.extraStopFee, { mode: "decimal", placeholder: "0" })}
+        ${rsField("maxMiles", "Longest trip to estimate (mi)", rs.maxMiles, { mode: "numeric" })}
+      </div>
     </section>
     <section class="card">
-      <h2>Vehicles</h2>
-      <p class="sub">Distance trips: base fare + per mile, at least the trip minimum. Hourly: rate x hours, at least the minimum hours.</p>
+      <h2>Vehicles and hourly</h2>
+      <p class="sub">Seats decide which vehicles a client can pick. Hourly: rate x hours, at least the minimum hours. Distance trips use the rates above for every vehicle.</p>
       ${vehicles}
       ${rs.vehicles.length < 6 ? `<button type="button" class="btn ghost full" id="add-vehicle">Add a vehicle</button>` : ""}
     </section>
     <section class="card">
-      <h2>Flat fares</h2>
-      <p class="sub">A set price to or from a place, such as the airport. Works either direction and needs no distance lookup. Add an area to price, for example, Buckhead to ATL differently from Midtown to ATL. Leave a vehicle blank if you don't offer that fare in it.</p>
-      ${fares || `<p class="muted">No flat fares yet.</p>`}
-      <div class="actions">
-        <button type="button" class="btn ghost" id="add-airport">Add ATL airport fare</button>
-        <button type="button" class="btn ghost" id="add-fare">Add another flat fare</button>
-      </div>
-    </section>
-    <section class="card">
-      <h2>Fees, gratuity, and rounding</h2>
+      <h2>Hourly trips: fees, gratuity, and rounding</h2>
       ${fees || `<p class="muted">No fees.</p>`}
       ${rs.fees.length < 5 ? `<button type="button" class="btn ghost full" id="add-fee">Add a fee</button>` : ""}
       <div class="rate-grid" style="margin-top:12px">
         ${rsField("gratuityPercent", "Gratuity % (0 = not included)", rs.gratuityPercent, { mode: "decimal" })}
-        ${rsField("roundTripFactor", "Round trip = one way x", rs.roundTripFactor, { mode: "decimal" })}
-        <label>Round fares up to<select data-path="roundTo">${[["1", "$1"], ["5", "$5"], ["10", "$10"]].map(([val, text]) => `<option value="${val}"${String(rs.roundTo) === val ? " selected" : ""}>${text}</option>`).join("")}</select></label>
-        ${rsField("maxMiles", "Longest trip to estimate (mi)", rs.maxMiles, { mode: "numeric" })}
+        <label>Round hourly fares up to<select data-path="roundTo">${[["1", "$1"], ["5", "$5"], ["10", "$10"]].map(([val, text]) => `<option value="${val}"${String(rs.roundTo) === val ? " selected" : ""}>${text}</option>`).join("")}</select></label>
       </div>
     </section>
     <p class="err" id="err"></p>
-    <button class="btn full" type="submit">Save rate sheet</button>
+    <button class="btn full" type="submit">Save rates</button>
   </form>
   <section class="card" style="margin-top:12px">
     <h2>Try a quote</h2>
@@ -2623,8 +2755,9 @@ function rsEditorHtml(rs, distanceOn) {
     <form id="tryq" novalidate>
       <label>Trip type<select id="tq-type"><option value="one-way">One way</option><option value="round-trip">Round trip</option><option value="hourly">Hourly</option></select></label>
       <label>Vehicle<select id="tq-vehicle">${rs.vehicles.filter((v) => v.id).map((v) => `<option value="${esc(v.id)}">${esc(v.name)}</option>`).join("")}</select></label>
-      <label>Pickup<input id="tq-pickup" placeholder="Hotel or address"></label>
-      <label>Drop-off<input id="tq-dropoff" placeholder="ATL Airport"></label>
+      <label>Pickup<input id="tq-pickup" placeholder="Hotel or address" data-places></label>
+      <label>Stops (optional, one per line)<textarea id="tq-stops" rows="2"></textarea></label>
+      <label>Drop-off<input id="tq-dropoff" placeholder="Address" data-places></label>
       <label>Hours (hourly)<input id="tq-hours" inputmode="decimal" placeholder="3"></label>
       <button class="btn ghost full" type="submit">Get estimate</button>
       <div id="tq-out" class="sub"></div>
@@ -2708,6 +2841,17 @@ function rideBadgeText(ride) {
 function airportHtml(ride, tag) {
   const bits = [];
   if (ride.airportLine) bits.push(`<${tag} class="sub airport-line">${esc(ride.airportLine)}</${tag}>`);
+  if (ride.landing) {
+    const l = ride.landing;
+    const parts = [];
+    if (l.label) parts.push((l.landed ? "Landed " : "Lands ") + l.label);
+    if (l.gate) parts.push("Gate " + l.gate);
+    if (l.freeWaitEndsLabel) parts.push("free wait until " + l.freeWaitEndsLabel);
+    if (parts.length) bits.push(`<${tag} class="sub landing-line">${esc(parts.join(" \u00b7 "))}</${tag}>`);
+  }
+  if (ride.airport && ride.airport.terminalSource && ride.airport.terminalSource !== "rider" && !(state.me && state.me.role === "driver")) {
+    bits.push(`<${tag} class="sub fine">Terminal from ${ride.airport.terminalSource === "flight_lookup" ? "the flight lookup" : "the airline table"}.</${tag}>`);
+  }
   if (ride.luggage != null) bits.push(`<${tag} class="sub">Luggage: ${esc(ride.luggage)}</${tag}>`);
   if (ride.flightAlert) bits.push(`<${tag} class="sub flight-alert ${esc(ride.flightAlert.kind)}">Flight alert: ${esc(ride.flightAlert.message)}</${tag}>`);
   return bits.join("");
@@ -2724,7 +2868,7 @@ function stopsSummaryHtml(ride, tag) {
   return `<${tag} class="sub stops-line">Stops: ${stops.map((s, i) => esc((i + 1) + ") " + s)).join(" \u00b7 ")}</${tag}>`;
 }
 function stopEditRowHtml(value, i) {
-  return `<div class="stop-edit-row"><input class="stop-edit-input" maxlength="200" autocomplete="off" aria-label="Stop ${i + 1}" placeholder="Stop ${i + 1} address" value="${esc(value)}"><button class="btn ghost" type="button" data-remove-stop aria-label="Remove stop ${i + 1}">Remove</button></div>`;
+  return `<div class="stop-edit-row"><input class="stop-edit-input" maxlength="200" autocomplete="off" data-places aria-label="Stop ${i + 1}" placeholder="Stop ${i + 1} address" value="${esc(value)}"><button class="btn ghost" type="button" data-remove-stop aria-label="Remove stop ${i + 1}">Remove</button></div>`;
 }
 function stopEditorHtml(stops, id) {
   return `<div class="stop-edit full" id="${esc(id)}"><span class="sub">Stops between pickup and drop-off (optional, up to ${MAX_STOPS})</span><div class="stop-edit-rows">${(stops || []).map(stopEditRowHtml).join("")}</div><button class="btn ghost" type="button" data-add-stop>+ Add stop</button></div>`;
@@ -2778,11 +2922,19 @@ function fareOk(value) {
   return FARE_RE.test(String(value || "").trim());
 }
 
-// Approve needs a typed final price. The estimate is shown as a suggestion only.
+// No automatic price on this request (Google down, daily cap, no rates, or old stop rules): the
+// owner types it. The client saw "We'll confirm your price shortly".
+function priceNeededHtml(ride, tag) {
+  const why = rideStops(ride).length && (ride.manualReason === "stops" || ride.quoteStatus !== "manual") ? "This request has stops, so the client saw Price on request." : "No automatic price. The client saw \u201cWe'll confirm your price shortly.\u201d";
+  return `<${tag} class="sub price-needed-note"><span class="pn-label">Price needed.</span> ${esc(why)} Type the price below; it becomes the saved fare and the invoice amount.</${tag}>`;
+}
+
+// Approve saves the final price. With an automatic quote the box starts at the quoted fare; the
+// owner confirms or edits it. Whatever is approved is the saved fare that invoices use.
 function approveBlockHtml(ride, inputAttr, buttonAttr) {
   const suggestion = fareSuggestion(ride);
-  return `<div class="approve-price"><label>Final price $<input inputmode="decimal" ${inputAttr} value="" placeholder="${esc(suggestion ? "Estimate " + suggestion : "e.g. 125")}" autocomplete="off"></label><button class="btn approve" type="button" ${buttonAttr} disabled>Approve</button></div>
-    <p class="sub fare-hint">${suggestion ? `Enter the final price to approve. <button type="button" class="linkbtn use-est" data-use="${esc(suggestion)}">Use estimate $${esc(suggestion)}</button>` : "Enter the final price to approve."}</p>`;
+  return `<div class="approve-price"><label>Final price $<input inputmode="decimal" ${inputAttr} value="${esc(suggestion)}" placeholder="e.g. 125" autocomplete="off"></label><button class="btn approve" type="button" ${buttonAttr} disabled>Approve</button></div>
+    <p class="sub fare-hint">${suggestion ? `Prefilled with the quote ($${esc(suggestion)}). Change it if needed, then approve.` : "Enter the price to approve."}</p>`;
 }
 
 function wireApproveBlock(root) {
@@ -2799,7 +2951,7 @@ function wireApproveBlock(root) {
 
 async function renderRateSheet(gen) {
   setTabs(true);
-  shell(`<p class="muted"><a href="#/settings">More</a></p><h1>Rates &amp; instant quotes</h1><div id="box" class="muted">Loading\u2026</div><div id="airbox"></div>`);
+  shell(`<p class="muted"><a href="#/settings">More</a></p><h1>Rates &amp; instant quotes</h1><div id="box" class="muted">Loading\u2026</div><div id="basebox"></div><div id="airbox"></div>`);
   const result = await api("/api/rate-sheet");
   if (gen !== renderGen) return;
   const box = document.querySelector("#box");
@@ -2810,12 +2962,9 @@ async function renderRateSheet(gen) {
     box.classList.remove("muted");
     box.innerHTML = rsEditorHtml(rs, distanceOn);
     const on = (sel, fn) => { const el = document.querySelector(sel); if (el) el.onclick = () => { rsCollect(rs); fn(); draw(); }; };
-    on("#add-vehicle", () => { rs.vehicles.push(RS_BLANK_VEHICLE()); rs.flatFares.forEach((f) => f.prices.push({ oneWay: "", roundTrip: "" })); });
-    on("#add-fare", () => rs.flatFares.push(RS_BLANK_FARE(rs.vehicles.length)));
-    on("#add-airport", () => rs.flatFares.push({ ...RS_BLANK_FARE(rs.vehicles.length), place: "ATL Airport", placeKeywords: "atl, hartsfield, atlanta airport, atl airport, hartsfield-jackson" }));
+    on("#add-vehicle", () => { rs.vehicles.push(RS_BLANK_VEHICLE()); });
     on("#add-fee", () => rs.fees.push({ label: "", kind: "flat", appliesTo: "all", amount: "" }));
-    document.querySelectorAll("[data-remove-vehicle]").forEach((b) => b.onclick = () => { rsCollect(rs); const i = Number(b.dataset.removeVehicle); rs.vehicles.splice(i, 1); rs.flatFares.forEach((f) => f.prices.splice(i, 1)); draw(); });
-    document.querySelectorAll("[data-remove-fare]").forEach((b) => b.onclick = () => { rsCollect(rs); rs.flatFares.splice(Number(b.dataset.removeFare), 1); draw(); });
+    document.querySelectorAll("[data-remove-vehicle]").forEach((b) => b.onclick = () => { rsCollect(rs); rs.vehicles.splice(Number(b.dataset.removeVehicle), 1); draw(); });
     document.querySelectorAll("[data-remove-fee]").forEach((b) => b.onclick = () => { rsCollect(rs); rs.fees.splice(Number(b.dataset.removeFee), 1); draw(); });
     document.querySelectorAll('#rates select[data-path$=".blockMinutes"]').forEach((sel) => sel.onchange = () => { rsCollect(rs); draw(); });
     const form = document.querySelector("#rates");
@@ -2845,25 +2994,69 @@ async function renderRateSheet(gen) {
         vehicle: document.querySelector("#tq-vehicle").value,
         pickup: document.querySelector("#tq-pickup").value,
         dropoff: document.querySelector("#tq-dropoff").value,
+        stops: document.querySelector("#tq-stops").value.split("\n").map((x) => x.trim()).filter(Boolean),
         hours: Number(document.querySelector("#tq-hours").value) || null,
       } });
       if (!next.data.ok) { out.textContent = next.data.error || "Could not get an estimate."; return; }
       const q = next.data.quote;
       if (!q) { out.textContent = "Choose a vehicle."; return; }
-      if (!q.available) { out.textContent = "Price on request: " + q.message; return; }
-      out.innerHTML = quoteBoxHtml({ total: (q.estimate ? "About " : "") + q.total, label: q.label + (q.miles ? ", " + q.miles + " mi" : ""), lines: q.lines, notes: q.notes });
+      if (!q.available) { out.textContent = "No automatic price: " + q.message; return; }
+      out.innerHTML = quoteBoxHtml({ total: (q.estimate ? "About " : "") + q.total, label: q.label + (q.miles ? ", " + q.miles + " mi" + (q.minutes ? ", " + q.minutes + " min" : "") : ""), lines: q.lines, notes: q.notes });
     };
   };
   draw();
+  renderBaseSettings(gen);
   renderAirportSettings(gen);
+}
+
+// Fleet home base and service radius. Address suggestions on your booking page and in this app lean
+// toward this area (a bias only: riders can still pick any US address, and it is priced normally).
+async function renderBaseSettings(gen, notice) {
+  const result = await api("/api/booking-settings");
+  if (gen !== renderGen) return;
+  const box = document.querySelector("#basebox");
+  if (!box || !result.data.ok) return;
+  const b = result.data.base || null;
+  const radius = b ? b.radiusMiles : result.data.defaultRadiusMiles || 50;
+  box.innerHTML = `<section class="card" id="base-settings">
+      <h2>Home base and service area</h2>
+      <p class="sub">Address suggestions on your booking page and in this app show places near your base first. Clients can still choose any address; trips outside the area are priced the same way.</p>
+      <label class="full">Home base address<input id="base-address" maxlength="200" data-places value="${esc(b ? b.address : "")}" placeholder="Start typing your garage or office address"></label>
+      <label>Service radius (miles)<input id="base-radius" type="number" inputmode="numeric" min="1" max="300" value="${esc(radius)}"></label>
+      ${result.data.mapsOn ? "" : `<p class="note">Address suggestions are off until the maps key is added. You can still save the address.</p>`}
+      ${b && b.lat == null ? `<p class="note">Pick the address from the suggestions so we know where it is.</p>` : ""}
+      <button class="btn full" type="button" id="base-save">Save home base</button>
+      <p class="sub air-msg${notice ? " ok" : ""}" id="base-msg" role="status" aria-live="polite">${notice ? esc(notice) : ""}</p>
+    </section>`;
+  const input = document.querySelector("#base-address");
+  const saved = b ? { address: b.address, lat: b.lat, lng: b.lng } : null;
+  document.querySelector("#base-save").onclick = async () => {
+    const address = input.value.trim();
+    const place = input._place || (saved && saved.address === address ? saved : null);
+    const msg = document.querySelector("#base-msg");
+    msg.classList.remove("ok", "bad");
+    msg.textContent = "Saving\u2026";
+    const body = { base: address ? { address, lat: place ? place.lat : null, lng: place ? place.lng : null, radiusMiles: document.querySelector("#base-radius").value } : null };
+    const r = await api("/api/booking-settings", { method: "PUT", body });
+    if (gen !== renderGen) return;
+    if (!r.data.ok) { msg.textContent = r.data.error || "Could not save."; msg.classList.add("bad"); return; }
+    if (state.me) state.me.maps = undefined; // pick up the new bias for suggestions
+    renderBaseSettings(gen, address ? "Saved. Suggestions now lean toward your service area." : "Saved. No home base set.");
+    placesSetup();
+  };
 }
 
 // Airport pickups on the booking page, passenger limits, and flight alerts (owner only).
 // `notice` is shown after a save re-renders the card, so a tap on Save always gives visible feedback.
 /* air-save-logic-start */
-const AIR_SAVED = { preset: "Saved. ATL terminals are on your booking page.", off: "Saved. Airport options are off.", save: "Saved airport settings." };
-function airSaveBody(kind, s, sedanValue, earlyValue) {
+const AIR_SAVED = { preset: "Saved. ATL terminals are on your booking page.", off: "Saved. Airport options are off.", save: "Saved airport settings.", codes: "Saved. Your airports are on your booking page." };
+function airSaveBody(kind, s, sedanValue, earlyValue, codes) {
   if (kind === "preset") return { body: { preset: ["ATL"] } };
+  // Fleets tick airports from our maintained list; terminals, curb pins and airline tables come with it.
+  if (kind === "codes") {
+    const list = Array.isArray(codes) ? codes.map((c) => String(c).toUpperCase()).filter((c) => /^[A-Z0-9]{3,4}$/.test(c)) : [];
+    return list.length ? { body: { preset: list } } : { body: { airports: { airports: [] } } };
+  }
   if (kind === "off") return { body: { airports: { airports: [] } } };
   const sedan = Number(String(sedanValue == null ? "" : sedanValue).trim());
   if (!Number.isInteger(sedan) || sedan < 1 || sedan > 56) return { error: "Most passengers in a sedan must be a whole number from 1 to 56." };
@@ -2884,10 +3077,13 @@ async function renderAirportSettings(gen, notice) {
   const airports = (s.airports && s.airports.airports) || [];
   const classes = result.data.fleetClasses || [];
   box.innerHTML = `<section class="card" id="airport-settings">
-      <h2>Airport pickups</h2>
+      <h2>Airports you serve</h2>
+      <p class="sub">Tick the airports your fleet serves. Terminals, curb pick-up points and airline terminals come from Nudge's airport list, so there is nothing to set up.</p>
+      <div class="air-codes" id="air-codes">${(result.data.airportList || []).map((a) => `<label class="swrow"><input type="checkbox" value="${esc(a.code)}"${airports.some((x) => x.code === a.code) ? " checked" : ""}> ${esc(a.code)} \u00b7 ${esc(a.name)}</label>`).join("")}</div>
+      <button class="btn ghost full" type="button" id="air-codes-save">Save airports</button>
       <p class="sub">${airports.length ? "On the booking page: " + esc(airports.map((a) => a.code + " (" + a.spots.map((x) => x.label).join(", ") + ")").join("; ")) : "Off. Clients type both addresses."}</p>
       ${airports.length ? airports.map((a) => `<p class="sub">${a.pickupMeet ? "Pickup meeting points: " + esc(a.pickupMeet.options.map((o) => o.label).join(", ")) + ". " : ""}${a.dropoffStyle ? "Drop-off: " + esc(a.dropoffStyle.options.map((o) => o.label).join(" or ")) + "." : ""}</p>`).join("") : ""}
-      <div class="actions"><button class="btn ghost" type="button" id="air-atl">${airports.some((a) => a.code === "ATL") ? "Reset to the ATL terminals" : "Use the ATL terminals"}</button>${airports.length ? `<button class="btn ghost" type="button" id="air-off">Turn off airport options</button>` : ""}</div>
+      ${airports.length ? `<div class="actions"><button class="btn ghost" type="button" id="air-off">Turn off airport options</button></div>` : ""}
       <p class="sub">Your fleet: ${classes.length ? esc(classes.join(", ")) : "no vehicle types on the roster yet, so every vehicle on your rates is offered"}. Vehicles your fleet doesn't run are hidden from clients.</p>
       <label>Most passengers in a sedan<input id="cap-sedan" type="number" inputmode="numeric" min="1" max="56" value="${esc(s.capacities && s.capacities.sedan ? s.capacities.sedan : 3)}"></label>
       <label>Alert drivers when a flight lands early by<select id="early-min">${[15, 20, 25, 30].map((n) => `<option value="${n}"${s.flightRules && s.flightRules.earlyMinutes === n ? " selected" : ""}>${n} minutes or more</option>`).join("")}</select></label>
@@ -2896,10 +3092,11 @@ async function renderAirportSettings(gen, notice) {
       <p class="sub air-msg${notice ? " ok" : ""}" id="air-msg" role="status" aria-live="polite">${notice ? esc(notice) : ""}</p>
     </section>`;
   const msg = document.querySelector("#air-msg");
-  const buttons = () => [...box.querySelectorAll("#air-atl, #air-off, #air-save")];
+  const buttons = () => [...box.querySelectorAll("#air-codes-save, #air-off, #air-save")];
   const showError = (text) => { msg.textContent = text; msg.classList.remove("ok"); msg.classList.add("bad"); };
   const save = async (kind) => {
-    const built = airSaveBody(kind, s, (document.querySelector("#cap-sedan") || {}).value, (document.querySelector("#early-min") || {}).value);
+    const codes = [...box.querySelectorAll("#air-codes input:checked")].map((el) => el.value);
+    const built = airSaveBody(kind, s, (document.querySelector("#cap-sedan") || {}).value, (document.querySelector("#early-min") || {}).value, codes);
     if (built.error) { showError(built.error); return; }
     buttons().forEach((b) => { b.disabled = true; });
     msg.classList.remove("ok", "bad");
@@ -2911,7 +3108,7 @@ async function renderAirportSettings(gen, notice) {
     const again = document.querySelector("#air-msg");
     if (again && again.scrollIntoView) again.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
-  document.querySelector("#air-atl").onclick = () => save("preset");
+  document.querySelector("#air-codes-save").onclick = () => save("codes");
   const off = document.querySelector("#air-off");
   if (off) off.onclick = () => save("off");
   document.querySelector("#air-save").onclick = () => save("save");
@@ -3026,9 +3223,9 @@ function scheduleFormHtml(s, drivers, today) {
     <fieldset class="days full"><legend>And/or every week on</legend><div class="day-grid week">${weeks}</div></fieldset>
     <label>Pickup time<input id="s-time" type="time" required value="${esc(s ? s.time : "")}"></label>
     <label>Passengers<input id="s-passengers" type="number" min="1" max="14" inputmode="numeric" value="${esc(s ? s.passengers : 1)}"></label>
-    <label class="full">Pickup<input id="s-pickup" required maxlength="200" value="${esc(s ? s.pickup : "")}"></label>
+    <label class="full">Pickup<input id="s-pickup" required maxlength="200" data-places value="${esc(s ? s.pickup : "")}"></label>
     ${stopEditorHtml(s ? s.stops : [], "s-stops")}
-    <label class="full">Drop-off<input id="s-dropoff" required maxlength="200" value="${esc(s ? s.dropoff : "")}"></label>
+    <label class="full">Drop-off<input id="s-dropoff" required maxlength="200" data-places value="${esc(s ? s.dropoff : "")}"></label>
     <label>Default fare (optional)<input id="s-fare" inputmode="decimal" placeholder="125.00" value="${esc(s && s.fareCents != null ? (s.fareCents / 100).toFixed(2) : "")}"></label>
     <label>Flight (optional)<input id="s-flight" maxlength="12" autocapitalize="characters" value="${esc(s ? s.flight : "")}"></label>
     ${driverSelect}

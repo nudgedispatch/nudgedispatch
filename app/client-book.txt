@@ -183,6 +183,7 @@
   const MAX_STOPS = 5;
   const STOP_MAX_LENGTH = 200;
   const STOPS_PRICE_MESSAGE = "Trips with stops are priced by the operator. We'll confirm your fare when they approve the request.";
+  const CONFIRM_SHORTLY = "We'll confirm your price shortly.";
 
   // ---- stops between pickup and drop-off ----
   function stopInputs() {
@@ -204,7 +205,7 @@
     add.classList.toggle("hidden", full);
     add.textContent = rows.length ? "+ Add another stop" : "+ Add stop";
     const note = $("#stopsNote");
-    note.textContent = full ? "That is the most stops for one request (" + MAX_STOPS + "). Add more in the notes." : rows.length ? "Up to " + MAX_STOPS + " stops. Trips with stops are priced by the operator." : "";
+    note.textContent = full ? "That is the most stops for one request (" + MAX_STOPS + "). Add more in the notes." : rows.length ? "Up to " + MAX_STOPS + " stops." + (quoteInfo && quoteInfo.distance ? "" : " Trips with stops are priced by the operator.") : "";
     note.classList.toggle("hidden", !rows.length);
   }
   function addStop(value, focus) {
@@ -241,7 +242,7 @@
     list.appendChild(row);
     input.addEventListener("input", () => scheduleQuote());
     input.addEventListener("change", () => scheduleQuote(0));
-    attachPlaces(input, box);
+    attachPlaces(input, box, "stop");
     syncStops();
     if (focus) input.focus();
     return input;
@@ -356,6 +357,7 @@
     $("#timeHint").classList.toggle("hidden", !atPickup);
     $("#flightWrap").classList.toggle("hidden", !!airports.length && st.side === "none");
     $("#flightOpt").textContent = atPickup ? "(to watch for delays and early arrivals)" : "(optional)";
+    syncAirlineSelect();
   }
   function setSide(value) {
     if (![...form.airportSide.options].some((o) => o.value === value)) return;
@@ -486,7 +488,16 @@
   function airportBody() {
     const st = sideState();
     if (st.side === "none" || !st.airport) return null;
-    return { code: st.airport.code, side: st.side, spot: spotValue, meet: st.side === "pickup" ? form.meet.value : "", style: st.side === "dropoff" ? form.style.value : "" };
+    return { code: st.airport.code, side: st.side, spot: spotValue, meet: st.side === "pickup" ? form.meet.value : "", style: st.side === "dropoff" ? form.style.value : "", terminalSource };
+  }
+  // Picked autocomplete places, lined up with the addresses sent (stops: same order as stopValues()).
+  function placesBody() {
+    const st = sideState();
+    return {
+      pickup: st.side === "pickup" ? null : placeOf(form.pickup),
+      dropoff: st.side === "dropoff" ? null : placeOf(form.dropoff),
+      stops: stopInputs().filter((input) => input.value.replace(/\s+/g, " ").trim()).map(placeOf),
+    };
   }
   function sideText(which) {
     const st = sideState();
@@ -509,6 +520,7 @@
       dropoff: form.dropoff.value,
       passengers: passengers(),
       airport: airportBody(),
+      places: placesBody(),
       ...(stopValues().length ? { stops: stopValues() } : {}),
     };
   }
@@ -539,8 +551,16 @@
     }
     if (!q.available) {
       if (q.stops) { $("#quote").dataset.state = "stops"; $("#qKind").textContent = "Trip with stops"; }
+      // No automatic price (Google down, daily cap, no route): no number, just the promise to confirm.
+      if (!q.stops && (!q.message || q.message === CONFIRM_SHORTLY)) {
+        $("#quote").dataset.state = "manual";
+        $("#qKind").textContent = "Your price";
+        price.textContent = CONFIRM_SHORTLY;
+        labelEl.textContent = "Send the request. " + companyName.replace(/\.+$/, "") + " will confirm the fare.";
+        return;
+      }
       price.textContent = "Price on request";
-      labelEl.textContent = q.message || "Send the request and the operator will confirm the price.";
+      labelEl.textContent = q.message || CONFIRM_SHORTLY;
       return;
     }
     $("#qKind").textContent = q.estimate ? "Estimate by road distance" : "Instant estimate";
@@ -572,8 +592,8 @@
   }
   async function requestQuote() {
     if (!quoteInfo) return;
-    if (stopValues().length) {
-      // Stops: never an instant estimate. The operator prices the trip.
+    if (stopValues().length && !quoteInfo.distance) {
+      // Old rate sheets: stops never get an instant estimate. The operator prices the trip.
       quoteSeq++;
       lastQuote = null;
       renderQuote({ available: false, stops: true, message: STOPS_PRICE_MESSAGE });
@@ -596,13 +616,13 @@
       if (my !== quoteSeq) return;
       if (!result.data.ok || !result.data.quote) {
         lastQuote = null;
-        renderQuote({ available: false, message: (result.data && result.data.error) || "Send the request and the operator will confirm the price." });
+        renderQuote({ available: false, message: (result.data && result.data.error) || CONFIRM_SHORTLY });
         return;
       }
       lastQuote = result.data.quote;
       renderQuote(result.data.quote);
     } catch {
-      if (my === quoteSeq) renderQuote({ available: false, message: "Send the request and the operator will confirm the price." });
+      if (my === quoteSeq) renderQuote({ available: false, message: CONFIRM_SHORTLY });
     }
   }
   function scheduleQuote(delay) {
@@ -611,35 +631,228 @@
     quoteTimer = setTimeout(requestQuote, delay == null ? 600 : delay);
   }
 
-  // ---- address suggestions (same-origin proxy; off unless the operator turned it on) ----
+  // ---- address suggestions ----
+  // With a browser key (GOOGLE_MAPS_BROWSER_KEY) the page uses Google Places Autocomplete (Places
+  // API New, AutocompleteSuggestion) straight from the browser. Our own input stays the field, so a
+  // typed address always works, including when Google fails to load. Picking a suggestion keeps its
+  // place ID and location (sent with the quote and the booking for routing). Without a browser key
+  // the older same-origin proxy is used when the operator turned it on.
   const sessionToken = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random())).replace(/-/g, "");
-  function setupPlaces(name) {
-    attachPlaces(form[name], $("#" + name + "Sugg"));
+  let mapsKey = "";
+  let bookingBias = null;
+  let mapsLib = null;
+  let mapsLoading = null;
+  function loadMaps() {
+    if (!mapsKey) return Promise.resolve(null);
+    if (mapsLoading) return mapsLoading;
+    mapsLoading = new Promise((resolve) => {
+      let settled = false;
+      const done = (lib) => { if (settled) return; settled = true; mapsLib = lib; resolve(lib); };
+      const timer = setTimeout(() => done(null), 10000);
+      // Google calls this when the key is refused (wrong referrer, API not enabled): plain fields.
+      window.gm_authFailure = () => { mapsLib = null; };
+      window.__nudgeMapsReady = async () => {
+        try {
+          const lib = await window.google.maps.importLibrary("places");
+          clearTimeout(timer);
+          done(lib && lib.AutocompleteSuggestion ? lib : null);
+        } catch {
+          clearTimeout(timer);
+          done(null);
+        }
+      };
+      const s = document.createElement("script");
+      s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(mapsKey) + "&v=weekly&loading=async&libraries=places&callback=__nudgeMapsReady";
+      s.async = true;
+      s.onerror = () => { clearTimeout(timer); done(null); };
+      document.head.appendChild(s);
+    });
+    return mapsLoading;
   }
-  function attachPlaces(input, box) {
+  function setupPlaces(name) {
+    attachPlaces(form[name], $("#" + name + "Sugg"), name);
+  }
+  function placeOf(input) {
+    return input && input._place ? input._place : null;
+  }
+  function attachPlaces(input, box, which) {
     let timer = 0;
     let seq = 0;
+    let token = null;
     input.addEventListener("input", () => {
-      if (!placesOn) return;
+      input._place = null;
       clearTimeout(timer);
       const q = input.value.trim();
-      if (q.length < 3) { box.classList.add("hidden"); return; }
+      if (q.length < 3 || (!mapsLib && !placesOn)) { box.classList.add("hidden"); return; }
       timer = setTimeout(async () => {
         const my = ++seq;
-        const r = await api("/api/public/book/" + encodeURIComponent(slug) + "/places", { method: "POST", body: { q, session: sessionToken } }).catch(() => null);
-        if (my !== seq || !r || !r.data.ok) return;
+        let items = [];
+        if (mapsLib) {
+          try {
+            if (!token) token = new mapsLib.AutocompleteSessionToken();
+            const req = { input: q, sessionToken: token, includedRegionCodes: ["us"] };
+            // Lean toward the fleet's service area (bias only: any US address can still be picked).
+            if (bookingBias) req.locationBias = { center: { lat: bookingBias.lat, lng: bookingBias.lng }, radius: bookingBias.radiusMeters };
+            const r = await mapsLib.AutocompleteSuggestion.fetchAutocompleteSuggestions(req);
+            items = (r.suggestions || []).map((x) => x.placePrediction).filter(Boolean).slice(0, 5).map((p) => ({ text: p.text.toString(), prediction: p }));
+          } catch {
+            items = [];
+          }
+        } else {
+          const r = await api("/api/public/book/" + encodeURIComponent(slug) + "/places", { method: "POST", body: { q, session: sessionToken } }).catch(() => null);
+          items = r && r.data.ok ? (r.data.suggestions || []).map((t) => ({ text: t })) : [];
+        }
+        if (my !== seq) return;
         box.innerHTML = "";
-        (r.data.suggestions || []).forEach((s) => {
+        items.forEach((item) => {
           const b = document.createElement("button");
           b.type = "button";
-          b.textContent = s;
-          b.onclick = () => { input.value = s; box.classList.add("hidden"); scheduleQuote(0); };
+          b.textContent = item.text;
+          b.onclick = () => { token = null; choosePlace(input, box, which, item); };
           box.appendChild(b);
         });
-        box.classList.toggle("hidden", !(r.data.suggestions || []).length);
+        box.classList.toggle("hidden", !items.length);
       }, 300);
     });
     input.addEventListener("blur", () => setTimeout(() => box.classList.add("hidden"), 200));
+  }
+  async function choosePlace(input, box, which, item) {
+    input.value = item.text;
+    input._place = null;
+    box.classList.add("hidden");
+    if (item.prediction) {
+      try {
+        const place = item.prediction.toPlace();
+        await place.fetchFields({ fields: ["formattedAddress", "location", "types"] });
+        input.value = place.formattedAddress || item.text;
+        input._place = {
+          placeId: place.id || "",
+          lat: place.location ? place.location.lat() : null,
+          lng: place.location ? place.location.lng() : null,
+          types: Array.isArray(place.types) ? place.types : [],
+        };
+      } catch {
+        input._place = null;
+      }
+      if (which === "pickup" || which === "dropoff") airportFromPlace(input, which);
+    }
+    scheduleQuote(0);
+  }
+  // A picked Place of type "airport" that is one of this fleet's airports switches that side to the
+  // airport, so the rider gets the terminal picker (and the airport fee and curb pin apply).
+  function kmBetween(a, b) {
+    const rad = Math.PI / 180;
+    const dLat = (b.lat - a.lat) * rad;
+    const dLng = (b.lng - a.lng) * rad;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+    return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+  function airportFromPlace(input, which) {
+    const p = placeOf(input);
+    if (!p || !p.types.includes("airport") || p.lat == null) return;
+    const hit = airports.find((a) => a.center && kmBetween(a.center, { lat: p.lat, lng: p.lng }) <= (a.radiusKm || 5));
+    if (!hit) return;
+    input.value = "";
+    input._place = null;
+    spotValue = "";
+    terminalSource = "rider";
+    setSide(which + ":" + hit.code);
+    refreshTerminalHelp();
+  }
+
+  // ---- terminal help: flight lookup (airport pickups) and the airline table ----
+  const AIRLINE_NAMES = { DL: "Delta", AA: "American", UA: "United", WN: "Southwest", B6: "JetBlue", NK: "Spirit", F9: "Frontier", AS: "Alaska", "*": "Another airline" };
+  let terminalSource = "rider";
+  let flightSeq = 0;
+  let flightTimer = 0;
+  function normFlight(text) {
+    const t = String(text || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    return /^[A-Z0-9]{2,3}\d{1,4}[A-Z]?$/.test(t) ? t : "";
+  }
+  function airlineTerminals(airport, airline) {
+    const table = (airport && airport.airlines) || {};
+    if (!airline) return [];
+    const list = table[airline] || table["*"] || [];
+    return list.filter((id) => airport.spots.some((s) => s.id === id));
+  }
+  function spotLabels(airport, ids) {
+    return ids.map((id) => (airport.spots.find((s) => s.id === id) || {}).label).filter(Boolean);
+  }
+  function setFlightNote(text) {
+    $("#flightNote").textContent = text || "";
+  }
+  // Pre-select a terminal unless the rider already picked one themselves.
+  function suggestSpot(id, source) {
+    if (!id || (spotValue && terminalSource === "rider" && spotValue !== id)) return false;
+    spotValue = id;
+    terminalSource = source;
+    syncAirportFields();
+    scheduleQuote(0);
+    return true;
+  }
+  function syncAirlineSelect() {
+    const st = sideState();
+    const table = st.airport && st.airport.airlines ? Object.keys(st.airport.airlines) : [];
+    const show = !!st.airport && table.length > 0 && !form.flight.value.trim();
+    $("#airlineWrap").classList.toggle("hidden", !show);
+    if (!show) return;
+    const keep = form.airline.value;
+    const codes = table.filter((c) => c !== "*").concat(table.includes("*") ? ["*"] : []);
+    form.airline.innerHTML = '<option value="">Choose airline</option>' + codes.map((c) => '<option value="' + c + '">' + (AIRLINE_NAMES[c] || c) + "</option>").join("");
+    if (codes.includes(keep)) form.airline.value = keep;
+  }
+  function applyAirlineTable(airline) {
+    const st = sideState();
+    if (!st.airport) return "";
+    const ids = airlineTerminals(st.airport, airline);
+    if (ids.length === 1) {
+      suggestSpot(ids[0], "airline_table");
+      return "";
+    }
+    if (ids.length > 1) return (AIRLINE_NAMES[airline] || airline) + " flights use " + spotLabels(st.airport, ids).join(" or ") + ". Pick the terminal on your ticket.";
+    return "";
+  }
+  function refreshTerminalHelp() {
+    syncAirlineSelect();
+    clearTimeout(flightTimer);
+    flightTimer = setTimeout(lookupFlight, 400);
+  }
+  async function lookupFlight() {
+    const st = sideState();
+    const typed = form.flight.value.trim();
+    const my = ++flightSeq;
+    if (!st.airport) { setFlightNote(""); return; }
+    if (!typed) {
+      setFlightNote(applyAirlineTable(form.airline.value === "*" ? "*" : form.airline.value));
+      return;
+    }
+    const ident = normFlight(typed);
+    if (!ident) { setFlightNote("Check the flight number, for example DL1234."); return; }
+    const iata = /^([A-Z][A-Z0-9]|[0-9][A-Z])\d{1,4}[A-Z]?$/.exec(ident);
+    const airline = iata ? iata[1] : "";
+    // A drop-off's flight departs from the terminal we drop at, so only the airline table helps there.
+    if (st.side !== "pickup") { setFlightNote(applyAirlineTable(airline)); return; }
+    setFlightNote("Looking up your flight…");
+    const r = await api("/api/public/book/" + encodeURIComponent(slug) + "/flight-status", { method: "POST", body: { code: st.airport.code, flight: ident, date: form.date.value, time: form.time.value } }).catch(() => null);
+    if (my !== flightSeq) return;
+    const d = r && r.data && r.data.ok ? r.data : null;
+    if (d && d.found) {
+      const bits = [];
+      if (d.landingLabel) bits.push((d.landed ? "Landed " : "Lands ") + d.landingLabel);
+      if (d.gate) bits.push("Gate " + d.gate);
+      if (d.terminal && d.terminalSource === "flight_lookup") {
+        suggestSpot(d.terminal, "flight_lookup");
+        const label = spotLabels(st.airport, [d.terminal])[0];
+        if (label) bits.push(label);
+        setFlightNote(bits.join(" · "));
+        return;
+      }
+      const table = applyAirlineTable(airline);
+      setFlightNote(bits.join(" · ") + (bits.length && table ? ". " : "") + table);
+      return;
+    }
+    const table = applyAirlineTable(airline);
+    setFlightNote(table || (spotValue ? "" : "Pick your terminal above."));
   }
 
   // ---- quote / website prefill: ?airport=pickup&code=ATL&spot=domestic-south&dropoff=... ----
@@ -695,6 +908,9 @@
     $("#heading").classList.remove("hidden");
     form.classList.remove("hidden");
     placesOn = !!result.data.places;
+    mapsKey = typeof result.data.mapsKey === "string" ? result.data.mapsKey : "";
+    bookingBias = result.data.bias && Number.isFinite(result.data.bias.lat) ? result.data.bias : null;
+    loadMaps();
     setupAirports(result.data.airports);
     setupQuotes(result.data.quotes);
     syncTripFields();
@@ -748,6 +964,7 @@
     if (st.side === "dropoff" && !spotValue) return "Choose the " + st.airport.code + " terminal for drop-off.";
     if (st.side !== "dropoff" && form.tripType.value !== "hourly" && sideText("dropoff").length < 3) return "Enter the drop-off address.";
     if (!$("#meetWrap").classList.contains("hidden") && !form.meet.value) return "Choose where to meet your driver.";
+    if (form.flight.value.trim() && !normFlight(form.flight.value)) return "Check the flight number: airline code and number, such as DL1234. Or leave it blank.";
     if (stopValues().length > MAX_STOPS) return "Add up to " + MAX_STOPS + " stops.";
     if (stopValues().some((v) => v.length > STOP_MAX_LENGTH)) return "Each stop can be up to " + STOP_MAX_LENGTH + " characters.";
     const v = selectedVehicle();
@@ -765,14 +982,16 @@
     rows.push([st.side === "pickup" ? "Arrival date" : "Pickup date", form.date.value]);
     rows.push(["Pickup time", form.time.options[form.time.selectedIndex] ? form.time.options[form.time.selectedIndex].textContent : ""]);
     if (form.flight.value.trim()) rows.push(["Flight", form.flight.value.trim().toUpperCase()]);
+    if (st.side !== "none" && $("#flightNote").textContent) rows.push(["Flight info", $("#flightNote").textContent]);
     rows.push(["Passengers", String(passengers())]);
     if (form.luggage.value) rows.push(["Luggage", form.luggage.value]);
     const stops = stopValues();
     stops.forEach((stop, i) => rows.push(["Stop " + (i + 1), stop]));
     rows.push(["Drop-off", sideText("dropoff") || (form.tripType.value === "hourly" ? "As directed" : "")]);
     if (st.side === "dropoff" && !$("#styleWrap").classList.contains("hidden")) rows.push(["Drop-off at terminal", form.style.options[form.style.selectedIndex] ? form.style.options[form.style.selectedIndex].textContent : ""]);
-    if (lastQuote && lastQuote.available && !stops.length) rows.push(["Estimate", (lastQuote.estimate ? "About " : "") + lastQuote.total]);
-    if (stops.length && quoteInfo) rows.push(["Price", "Price on request. We'll confirm your fare."]);
+    const priced = lastQuote && lastQuote.available && (!stops.length || (quoteInfo && quoteInfo.distance));
+    if (priced) rows.push(["Estimate", (lastQuote.estimate ? "About " : "") + lastQuote.total]);
+    else if (quoteInfo && form.tripType.value !== "hourly") rows.push(["Price", stops.length && !quoteInfo.distance ? "Price on request. We'll confirm your fare." : CONFIRM_SHORTLY]);
     const v = selectedVehicle();
     if (v) rows.push(["Vehicle", v.name]);
     rows.push(["Name", form.name.value.trim()]);
@@ -813,6 +1032,8 @@
     setDateDefaults();
     form.passengers.value = "1";
     spotValue = "";
+    terminalSource = "rider";
+    setFlightNote("");
     vehicleChosen = false;
     form.meet.dataset.chosen = "";
     form.style.dataset.chosen = "";
@@ -843,10 +1064,16 @@
     if (st.side === "dropoff" && airportOf(form.dropoff.value)) form.dropoff.value = "";
     if (st.side !== "none" && st.airport && !st.airport.spots.some((s) => s.id === spotValue)) spotValue = "";
     syncAirportFields();
+    refreshTerminalHelp();
     scheduleQuote(0);
   });
+  form.flight.addEventListener("input", () => { syncAirlineSelect(); clearTimeout(flightTimer); flightTimer = setTimeout(lookupFlight, 900); });
+  form.flight.addEventListener("change", refreshTerminalHelp);
+  form.airline.addEventListener("change", () => { setFlightNote(applyAirlineTable(form.airline.value)); });
+  form.date.addEventListener("change", () => { if (form.flight.value.trim()) refreshTerminalHelp(); });
   [form.pickupSpot, form.dropoffSpot].forEach((sel) => sel.addEventListener("change", () => {
     spotValue = sel.value;
+    terminalSource = "rider";
     syncAirportFields();
     scheduleQuote(0);
   }));
@@ -897,6 +1124,7 @@
         flight: form.flight.value,
         notes: form.notes.value,
         airport: airportBody(),
+        places: placesBody(),
         ...(stopValues().length ? { stops: stopValues() } : {}),
         hp_extra: form.hp_extra ? form.hp_extra.value : "",
       };
@@ -909,7 +1137,7 @@
       const sentTo = String(result.data.companyName || companyName).replace(/\.+$/, "");
       const est = result.data.estimate;
       $("#doneTxt").textContent = "Request sent to " + sentTo + ". They will confirm with you." +
-        (est ? " " + (est.estimate ? "Estimated price: about " : "Estimated price: ") + est.total + ". " + est.confirm : "");
+        (est ? " " + (est.estimate ? "Estimated price: about " : "Estimated price: ") + est.total + ". " + est.confirm : result.data.priceMessage ? " " + result.data.priceMessage : "");
       $("#doneMeet").textContent = (result.data.trip && result.data.trip.meeting) || "";
       form.classList.add("hidden");
       $("#heading").classList.add("hidden");
