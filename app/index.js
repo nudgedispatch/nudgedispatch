@@ -2129,12 +2129,18 @@ function readTrip(body, sheet) {
 __name(readTrip, "readTrip");
 // Road distance: Google Routes API computeRoutes (Compute Routes Essentials: TRAFFIC_UNAWARE, field
 // mask routes.distanceMeters,routes.duration, up to 10 intermediates). Server-only key in the
-// GOOGLE_ROUTES_KEY Worker secret; it is never sent to the page or returned in a response. Without
-// the key there is no distance, and one-way / round-trip requests come through with "We'll confirm
-// your price shortly" (quote_status manual). QUOTE_DEV_FAKE_ROUTE=1 (local .dev.vars only, and only
-// on localhost) returns a made-up distance so the distance path can be tested without a key.
+// GOOGLE_ROUTES_KEY Worker secret, falling back to GOOGLE_MAPS_SERVER_KEY so a live fleet that
+// already has the older name keeps road-distance quotes if the new secret is not set yet. The key
+// is never sent to the page or returned in a response. Without either key there is no distance, and
+// one-way / round-trip requests come through with "We'll confirm your price shortly" (quote_status
+// manual). QUOTE_DEV_FAKE_ROUTE=1 (local .dev.vars only, and only on localhost) returns a made-up
+// distance so the distance path can be tested without a key.
+function routesServerKey(env) {
+  return String((env && (env.GOOGLE_ROUTES_KEY || env.GOOGLE_MAPS_SERVER_KEY)) || "").trim();
+}
+__name(routesServerKey, "routesServerKey");
 function routingProvider(env, request) {
-  if (env.GOOGLE_ROUTES_KEY) return "google";
+  if (routesServerKey(env)) return "google";
   if (env.QUOTE_DEV_FAKE_ROUTE === "1") {
     const host = new URL(request.url).hostname;
     if (host === "127.0.0.1" || host === "localhost") return "fake";
@@ -2262,7 +2268,7 @@ async function routeTrip(env, request, companyId, waypoints) {
     if (waypoints.intermediates.length) body.intermediates = waypoints.intermediates;
     const r = await fetch("https://routes.googleapis.com/directions/v2:computeRoutes", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": env.GOOGLE_ROUTES_KEY, "x-goog-fieldmask": "routes.distanceMeters,routes.duration" },
+      headers: { "content-type": "application/json", "x-goog-api-key": routesServerKey(env), "x-goog-fieldmask": "routes.distanceMeters,routes.duration" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(8e3)
     });

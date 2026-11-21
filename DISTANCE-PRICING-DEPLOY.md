@@ -51,15 +51,15 @@ npx wrangler secret put FLIGHT_API_KEY         # flight provider key
 
 | Name | Kind | Value |
 | --- | --- | --- |
-| `GOOGLE_ROUTES_KEY` | secret | Server key. Without it, one-way and round-trip requests arrive as **manual** ("We'll confirm your price shortly"). |
+| `GOOGLE_ROUTES_KEY` | secret | Server key (falls back to `GOOGLE_MAPS_SERVER_KEY` if unset). Without either key, one-way and round-trip requests arrive as **manual** ("We'll confirm your price shortly"). |
 | `GOOGLE_MAPS_BROWSER_KEY` | var | Browser key. Empty means plain address fields everywhere. |
 | `ROUTES_DAILY_CAP` | var | Default `500` (all fleets together, per Eastern day). There is also a 500/day/fleet limit. |
 | `FLIGHT_PROVIDER` | var | `aeroapi` (the only adapter built), or `off`. |
 | `FLIGHT_API_KEY` | secret | AeroAPI key. |
 | `FLIGHT_DAILY_CAP` | var | Default `200`. Counts booking-page lookups only. The 5-minute flight-alert cron is not counted. |
 
-- [ ] **Routing key rename:** `GOOGLE_MAPS_SERVER_KEY` is **no longer used for routing**. Fleets still on old rate sheets lose
-  road-distance quotes until `GOOGLE_ROUTES_KEY` is set, so set it in the same deploy.
+- [ ] **Routing key:** prefer `GOOGLE_ROUTES_KEY`. If it is unset, routing falls back to `GOOGLE_MAPS_SERVER_KEY`, so a live
+  fleet that already has the older secret keeps road-distance quotes. Still set `GOOGLE_ROUTES_KEY` when you can (restrict it to the Routes API).
 - [ ] **Old flight names:** `FLIGHT_DATA_PROVIDER` / `FLIGHT_DATA_API_KEY` are still read when the new names are unset. Remove them once the
   new ones are in.
 - [ ] **Keep everything else:** `ADMIN_TOKEN` and every other secret and binding stay as they are. No Cloudflare rules change.
@@ -125,7 +125,7 @@ Setup:
 9. **Out-of-area address:** pick a Nashville address. It can still be selected, routes and prices normally.
 10. **Round trip:** exactly 1.6 x the one-way price for the same trip.
 11. **Hourly:** 4 h comes to $225 + 4 x $18.75 = $300. No Google call.
-12. **Google down:** remove `GOOGLE_ROUTES_KEY` or use a wrong key.
+12. **Google down:** remove `GOOGLE_ROUTES_KEY` and `GOOGLE_MAPS_SERVER_KEY`, or use a wrong key.
     - The booking page shows "We'll confirm your price shortly", with no number.
     - The request goes through. The owner sees **Price needed**, types a price, and that price becomes the fare and the invoice amount.
 13. **Caps reached:** set `ROUTES_DAILY_CAP=0`. You get the same result as step 12, and the logs show `daily-cap`.
