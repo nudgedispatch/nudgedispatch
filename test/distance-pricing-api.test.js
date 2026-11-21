@@ -44,7 +44,7 @@ async function applyMigrations(persistTo) {
   await new Promise((resolve, reject) => {
     const child = spawn(
       "npx",
-      ["wrangler", "d1", "migrations", "apply", "nudge-app-local", "--local", "--persist-to", persistTo],
+      ["wrangler", "d1", "migrations", "apply", "nudge-app-local", "--local", "-c", "wrangler.toml", "--persist-to", persistTo],
       { cwd: new URL("..", import.meta.url).pathname, env: { ...process.env, CI: "1" }, stdio: "ignore" },
     );
     child.on("error", reject);
