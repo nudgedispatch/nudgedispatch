@@ -8,10 +8,10 @@ Nudge Dispatch is a multi-fleet dispatch and booking app for small car-service f
 - **Server-only keys reaching the browser.** `GOOGLE_MAPS_SERVER_KEY`, `GOOGLE_ROUTES_KEY`, Stripe, Bland, AeroAPI, VAPID private key and similar must never appear in HTML, client JS, `/api/me` or any response body.
 - **Cross-tenant data.** Every owner or driver query must be scoped to the caller's `company_id`. Drivers must get 403 on owner-only actions.
 - **Migrations.** Migrations in `migrations/` are additive only: new numbered files, never edits to an existing one. Flag destructive SQL (DROP, DELETE without a tight WHERE, column removal).
-- **Live side effects.** Code or config that sets `SMS_MODE` to `live`/`test`, sets `STRIPE_MODE=live`, points `wrangler.toml` at a production D1 id, or runs `wrangler deploy` / remote D1 commands outside `scripts/deploy-prod.sh`.
+- **Live side effects.** Code or config that sets `SMS_MODE` to `live`/`test`, sets `STRIPE_MODE=live`, points `wrangler.toml` at a production D1 id, adds or edits a production config (`wrangler.prod.toml`, or any file used through `NUDGE_PROD_CONFIG`), or runs `wrangler deploy` / remote D1 commands outside `scripts/deploy-prod.sh`.
 - **Money.** Fare, quote, trial and billing math in `app/quote-engine.js`, `app/billing.js`, `app/trial.js`, `app/stripe_webhook.js`, `app/paypal.js`: rounding to cents, minimums, airport and extra-stop fees, round-trip factors, and the "Price needed" path when no automatic price exists. A client must never be shown or charged a wrong price silently.
 - **Security headers.** The strict CSP and `no-referrer` on `/` and `/index.html` must not be loosened. Looser booking CSP belongs only on `/book/<slug>/`.
-- **CSRF and auth.** New signed-in POST endpoints need the existing session and CSRF checks. Public endpoints need rate limits or daily caps (see `ROUTES_*_CAP`, `FLIGHT_*_CAP`).
+- **CSRF and auth.** New signed-in POST endpoints need the existing session and CSRF checks. Public endpoints (booking, signup, quote, address and flight lookups) must be bounded: a per-IP limit through `rateLimitAllow` in `app/index.js`, and a daily cap on any call that costs money (Google Routes/Places, flight data).
 
 ## Also check
 
