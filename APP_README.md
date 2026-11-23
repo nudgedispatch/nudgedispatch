@@ -143,6 +143,8 @@ The company code / booking slug is chosen during signup, reserved on the pending
 
 Signup includes an optional Branding step: a logo (client-resized to a 384px PNG data URL under 180000 characters, the same limit as `invoice_settings.logo_data_url`) and a theme color (presets or a custom hex). Both can be skipped and edited later in Settings. The theme is stored on `invoice_settings.theme_color`. An empty value keeps the current teal-on-dark booking header; a custom hex becomes the booking and QR page header background, with text color chosen for WCAG 4.5:1 contrast. The public booking page loads `/book/<slug>/theme.css` so the color works under the page CSP.
 
+If `invoice_settings.website` (Settings, Website) is a valid http(s) address, the public booking page shows it as a header link (bare domains are treated as `https://`). Other invoice settings stay off the public API.
+
 Turnstile: set `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY`. If the secret is empty (local tests), verification is skipped.
 
 ## Driver ride alerts (Web Push, Nov 19, 2026)

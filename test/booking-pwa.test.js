@@ -110,7 +110,7 @@ test("booking HTML is rendered per slug with escaped titles and no-store", { tim
     const sw = await call(worker, `/book/${slug}/sw.js`);
     assert.equal(sw.status, 200);
     assert.match(sw.headers.get("cache-control") || "", /no-store/i);
-    assert.match(sw.text, /nudge-book-shell-v5/);
+    assert.match(sw.text, /nudge-book-shell-v6/);
   } finally {
     if (worker) await worker.stop();
     await rm(persistTo, { recursive: true, force: true });
