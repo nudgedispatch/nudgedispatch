@@ -10,6 +10,17 @@
 //   * distance fares: base + per mile x road miles, at least the trip minimum, x round-trip factor.
 //   * extras: fees (flat $ or % of fare), optional gratuity %, rounding of the fare to $1/$5/$10.
 // All money is integer cents.
+//
+// Nov 20, 2026: distance pricing. A sheet with `distance` (one fleet-wide rate set, see fare.js)
+// prices every one-way and round-trip trip by Google road miles and minutes, including trips with
+// stops; flat fares and per-vehicle mileage rates are then ignored. A sheet saved before this has
+// no `distance` and keeps its old behaviour until the owner saves the new rate form. Hourly is
+// unchanged either way.
+
+import { validateDistanceRates, ratesForEditor, computeFare, rateSnapshot } from "./fare.js";
+
+// Shown to riders whenever there is no automatic price (Google down, daily cap, no route).
+export const CONFIRM_SHORTLY = "We'll confirm your price shortly.";
 
 export const TRIP_TYPES = ["one-way", "round-trip", "hourly"];
 export const TRIP_LABELS = { "one-way": "One way", "round-trip": "Round trip", hourly: "Hourly" };
@@ -170,7 +181,9 @@ export function validateRateSheet(input) {
   const maxMiles = numberIn(input.maxMiles, 5, 500, 100);
   if (Number.isNaN(maxMiles)) return { error: "Longest trip to estimate must be from 5 to 500 miles." };
 
-  const priced = vehicles.some((v) => v.distance || v.hourlyRate !== null) || flatFares.length > 0;
+  const dist = validateDistanceRates(input.distance);
+  if (dist.error) return { error: dist.error };
+  const priced = vehicles.some((v) => v.distance || v.hourlyRate !== null) || flatFares.length > 0 || !!dist.rates;
   if (!priced) return { error: "Add a per-mile, hourly, or flat price so riders can see an estimate." };
   return {
     sheet: {
@@ -183,6 +196,7 @@ export function validateRateSheet(input) {
       roundTripFactor: Math.round(roundTripFactor * 100) / 100,
       roundTo: roundTo || 1,
       maxMiles: Math.round(maxMiles),
+      distance: dist.rates,
     },
   };
 }
@@ -206,6 +220,8 @@ export function sheetForEditor(sheet) {
     roundTripFactor: sheet.roundTripFactor || 2,
     roundTo: sheet.roundTo || 1,
     maxMiles: sheet.maxMiles || 100,
+    distance: ratesForEditor(sheet.distance),
+    distanceSet: !!sheet.distance,
   };
 }
 
@@ -213,8 +229,10 @@ export function sheetForEditor(sheet) {
 export function publicSheetInfo(sheet) {
   return {
     vehicles: (sheet.vehicles || []).map((v) => ({ id: v.id, name: v.name, seats: v.seats, hourly: v.hourlyRate !== null, minHours: v.minHours || 0 })),
-    places: [...new Set((sheet.flatFares || []).map((f) => f.place))].slice(0, 8),
+    places: sheet.distance ? [] : [...new Set((sheet.flatFares || []).map((f) => f.place))].slice(0, 8),
     gratuityPercent: sheet.gratuityPercent || 0,
+    // Distance rates set: trips with stops are priced too (the page asks for a quote with stops).
+    distance: !!sheet.distance,
   };
 }
 
@@ -267,13 +285,14 @@ function hoursText(h) {
 // Does this trip need a road-distance lookup? (Only one-way/round-trip, no flat fare, vehicle priced by distance.)
 export function needsDistance(sheet, req) {
   if (!req || req.tripType === "hourly") return false;
+  if (sheet && sheet.distance) return !!(req.pickup && req.dropoff);
   const v = (sheet.vehicles || []).find((x) => x.id === req.vehicle);
   if (!v || !v.distance) return false;
   if (!req.pickup || !req.dropoff) return false;
   return !findFlatFare(sheet, v.id, req.pickup, req.dropoff);
 }
 
-// req: { tripType, vehicle (id), pickup, dropoff, hours, passengers }
+// req: { tripType, vehicle (id), pickup, dropoff, hours, passengers, stops (count), airport (bool) }
 // route: { miles, minutes } | null  (from the Worker's routing lookup; null = unavailable)
 // Returns { available: true, totalCents, basis, label, lines:[{label,cents}], notes:[], miles?, minutes? }
 //      or { available: false, reason, message }
@@ -307,6 +326,7 @@ export function computeQuote(sheet, req, route) {
     const sameStreet = normStreet(req.pickup) === normStreet(req.dropoff) && !!normStreet(req.pickup);
     if (sameStreet) return { available: false, reason: "same-address", message: "Pickup and drop-off are the same address. Enter a different drop-off, or choose a drop-off at the airport." };
     const legs = tripType === "round-trip";
+    if (sheet.distance) return distanceQuote(sheet, v, req, route, tripType, notes);
     const flat = findFlatFare(sheet, v.id, req.pickup, req.dropoff);
     if (flat) {
       const p = flat.price;
@@ -317,7 +337,7 @@ export function computeQuote(sheet, req, route) {
       label = where + (legs ? ", round trip" : ", one way");
     } else {
       if (!v.distance) return { available: false, reason: "no-rate", message: "This trip isn't on the rate sheet. Send the request and the operator will quote it." };
-      if (!route || !(route.miles > 0)) return { available: false, reason: "no-distance", message: "We couldn't estimate this trip. Send the request and the operator will confirm the price." };
+      if (!route || !(route.miles > 0)) return { available: false, reason: "no-distance", message: CONFIRM_SHORTLY };
       if (route.miles > (sheet.maxMiles || 100)) return { available: false, reason: "too-far", message: "This trip is longer than we estimate online. Send the request and the operator will quote it." };
       const miles = Math.round(route.miles * 10) / 10;
       const oneWay = Math.max((v.base || 0) + Math.round((v.perMile || 0) * miles), v.minimum || 0);
@@ -347,6 +367,35 @@ export function computeQuote(sheet, req, route) {
     notes.push("Gratuity not included.");
   }
   return { available: true, totalCents: total, basis, tripType, vehicle: v.name, label, lines, notes, ...extra, ...(tripType === "hourly" ? { hours: Number(req.hours) } : {}) };
+}
+
+// One-way / round trip priced from the fleet's distance rates (fare.js). No flat fares, no
+// per-vehicle mileage, no gratuity or rounding (those stay with hourly).
+function distanceQuote(sheet, v, req, route, tripType, notes) {
+  if (!route || !(route.miles > 0)) return { available: false, reason: "no-distance", message: CONFIRM_SHORTLY };
+  if (route.miles > (sheet.maxMiles || 100)) return { available: false, reason: "too-far", message: "This trip is longer than we estimate online. Send the request and the operator will quote it." };
+  const miles = Math.round(route.miles * 10) / 10;
+  const minutes = route.minutes != null ? Math.max(0, Math.ceil(route.minutes - 1e-9)) : 0;
+  const stops = Math.max(0, Math.floor(Number(req.stops) || 0));
+  const roundTrip = tripType === "round-trip";
+  const factor = Number(sheet.roundTripFactor) >= 1 ? Number(sheet.roundTripFactor) : 2;
+  const fare = computeFare(sheet.distance, { miles, minutes, airport: !!req.airport, stops, roundTrip, roundTripFactor: factor });
+  if (fare.totalCents > MAX_CENTS) return { available: false, reason: "too-large", message: "Send the request and the operator will quote it." };
+  if (fare.minimumApplied) notes.push(`${fmt(sheet.distance.minimum)} minimum fare.`);
+  return {
+    available: true,
+    totalCents: fare.totalCents,
+    basis: "distance",
+    tripType,
+    vehicle: v.name,
+    label: (roundTrip ? "Round trip" : "One way") + " by road distance" + (stops ? `, ${stops} stop${stops === 1 ? "" : "s"}` : ""),
+    lines: fare.lines.map((l) => ({ label: (l === fare.lines[0] ? v.name + ", " : "") + l.label, cents: l.cents })),
+    notes,
+    miles,
+    minutes,
+    stops,
+    rates: rateSnapshot(sheet.distance, factor),
+  };
 }
 
 export const formatCents = fmt;

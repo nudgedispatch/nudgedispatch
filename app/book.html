@@ -69,7 +69,8 @@
       <div id="places" class="chips hidden" aria-label="Flat-rate places"></div>
       <div class="two" data-field="when"><label><span id="dateLabel">Pickup date</span><input name="date" type="date" required></label><label><span id="timeLabel">Pickup time</span><select name="time" required><option value="">Select time</option></select></label></div>
       <p class="fine hidden" id="timeHint">Choose the time you want to be picked up. Your flight number is used only to watch for delays and early arrivals.</p>
-      <label id="flightWrap" data-field="flight">Flight number <span id="flightOpt">(optional)</span><input name="flight" id="flight" placeholder="e.g. DL1234" autocapitalize="characters"></label>
+      <label id="flightWrap" data-field="flight">Flight number <span id="flightOpt">(optional)</span><input name="flight" id="flight" placeholder="e.g. DL1234" autocapitalize="characters"><span class="fine" id="flightNote" role="status" aria-live="polite"></span></label>
+      <label id="airlineWrap" class="hidden" data-field="airline">Airline (optional, helps pick the terminal)<select name="airline" id="airline"><option value="">Choose airline</option></select></label>
       <div class="two" data-field="party"><label>Passengers<input name="passengers" type="number" min="1" max="14" inputmode="numeric" value="1"></label><label>Luggage<input name="luggage" type="number" min="0" max="30" inputmode="numeric" placeholder="0"></label></div>
       <div class="card quote hidden" id="quote" aria-live="polite" data-field="quote">
         <div class="sub" id="qKind">Instant estimate</div>

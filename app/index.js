@@ -1291,10 +1291,28 @@ function rideQuoteJson(row) {
     label: q.label || "",
     lines: Array.isArray(q.lines) ? q.lines.map((line) => ({ label: String(line.label || ""), amount: money(Number(line.cents) || 0) })) : [],
     notes: Array.isArray(q.notes) ? q.notes.map(String) : [],
-    miles: q.miles ?? null
+    miles: q.miles ?? row.quoted_miles ?? null,
+    minutes: q.minutes ?? row.quoted_minutes ?? null,
+    status: row.quote_status || "",
+    quotedAt: row.quoted_at ?? q.at ?? null
   };
 }
 __name(rideQuoteJson, "rideQuoteJson");
+// Landing time for the owner/driver ride view: the flight cron's latest snapshot (actual, else latest
+// estimate), else the lookup saved at booking. The existing free wait after landing starts here.
+function rideLanding(row) {
+  const airport = parseStoredAirport(row.airport_json);
+  if (!airport || airport.side !== "pickup") return null;
+  let snap = null;
+  try { snap = row.flight_status_json ? JSON.parse(row.flight_status_json) : null; } catch { snap = null; }
+  const landed = !!(snap && snap.landed);
+  const at = snap ? (snap.actualArrival ?? snap.estimatedArrival ?? null) : airport.landingAt ?? null;
+  const gate = (snap && snap.gate) || airport.gate || "";
+  if (!at && !gate) return null;
+  const waitEnds = freeWaitEnds(at);
+  return { at: at || null, label: clockEastern(at), landed, gate, freeWaitEndsAt: waitEnds, freeWaitEndsLabel: clockEastern(waitEnds), terminalSource: airport.terminalSource || "" };
+}
+__name(rideLanding, "rideLanding");
 function rideJson(row, role = "owner") {
   const owner = role === "owner";
   const status = displayRideStatus(row);
@@ -1319,9 +1337,10 @@ function rideJson(row, role = "owner") {
     airport: parseStoredAirport(row.airport_json),
     airportLine: airportSummary(parseStoredAirport(row.airport_json)),
     luggage: row.luggage ?? null,
+    landing: rideLanding(row),
     flightAlert: row.flight_alert ? { kind: row.flight_alert_kind, message: row.flight_alert, at: row.flight_alert_at } : null,
     updatedAt: row.updated_at,
-    ...owner ? { clientId: row.client_id, clientPhone: row.client_phone || "", clientEmail: row.client_email || "", fareCents: row.fare_cents, fare: money(row.fare_cents), notes: row.notes, payment: row.payment, source: row.source || "", quote: rideQuoteJson(row) } : {},
+    ...owner ? { clientId: row.client_id, clientPhone: row.client_phone || "", clientEmail: row.client_email || "", fareCents: row.fare_cents, fare: money(row.fare_cents), notes: row.notes, payment: row.payment, source: row.source || "", quote: rideQuoteJson(row), quoteStatus: row.quote_status || "", manualReason: row.quote_cents == null ? (parseQuoteJson(row.quote_json) || {}).manualReason || "" : "", priceNeeded: row.approval === "requested" && (row.quote_status === "manual" || row.quote_cents === null || row.quote_cents === void 0) } : {},
     schedule: rideSchedule({
       pickupDate: row.pickup_date,
       pickupTime: row.pickup_time,
@@ -1448,25 +1467,9 @@ function clientIp(request) {
 __name(clientIp, "clientIp");
 async function bookingAllowed(env, request, slug) {
   const ipHash = await sha256Hex("book-ip:" + clientIp(request));
-  const now = Date.now();
   const windowMs = 15 * 60 * 1e3;
-  const maxHits = 30;
-  async function hit(bucket) {
-    const row = await env.DB.prepare("SELECT hits, window_started FROM booking_limits WHERE bucket = ?").bind(bucket).first();
-    if (!row || now - row.window_started > windowMs) {
-      await env.DB.prepare(
-        `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?, 1, ?)
-         ON CONFLICT(bucket) DO UPDATE SET hits = 1, window_started = excluded.window_started`
-      ).bind(bucket, now).run();
-      return true;
-    }
-    if (row.hits >= maxHits) return false;
-    await env.DB.prepare("UPDATE booking_limits SET hits = hits + 1 WHERE bucket = ?").bind(bucket).run();
-    return true;
-  }
-  __name(hit, "hit");
-  if (!await hit("ip:" + ipHash)) return false;
-  if (!await hit("slug:" + slug)) return false;
+  if (!await limitHit(env, "bip:" + ipHash, 30, windowMs)) return false;
+  if (!await limitHit(env, "bslug:" + slug, 30, windowMs)) return false;
   return true;
 }
 __name(bookingAllowed, "bookingAllowed");
@@ -1757,10 +1760,121 @@ async function publicQuoteInfo(env, companyId, settings) {
   return info;
 }
 __name(publicQuoteInfo, "publicQuoteInfo");
+// Browser key for Google Places Autocomplete on the booking page (GOOGLE_MAPS_BROWSER_KEY). It is a
+// public, referrer-restricted key (nudgedispatch.com and subdomains), separate from the server-only
+// GOOGLE_ROUTES_KEY. Unset: plain address fields.
+function mapsBrowserKey(env) {
+  const k = String(env.GOOGLE_MAPS_BROWSER_KEY || "").trim();
+  return /^[A-Za-z0-9_-]{20,80}$/.test(k) ? k : "";
+}
+__name(mapsBrowserKey, "mapsBrowserKey");
+// Fleet home base and service radius (companies.base_*). Bias for Places Autocomplete only, never a
+// restriction. Places caps a bias circle at 50 km, so a larger service radius is clamped for the bias.
+const DEFAULT_SERVICE_RADIUS_MILES = 50;
+async function loadFleetBase(env, companyId) {
+  if (!companyId) return null;
+  let row = null;
+  try {
+    row = await env.DB.prepare("SELECT base_address, base_lat, base_lng, service_radius_miles FROM companies WHERE id = ?").bind(companyId).first();
+  } catch {
+    row = null;
+  }
+  if (!row || !row.base_address) return null;
+  return { address: row.base_address, lat: row.base_lat ?? null, lng: row.base_lng ?? null, radiusMiles: row.service_radius_miles || DEFAULT_SERVICE_RADIUS_MILES };
+}
+__name(loadFleetBase, "loadFleetBase");
+function readFleetBase(input) {
+  if (input === null) return { base: null };
+  if (!input || typeof input !== "object" || Array.isArray(input)) return { error: "Expected a home base." };
+  const address = str(input.address, 200);
+  if (!address) return { base: null };
+  const lat = input.lat === null || input.lat === "" || input.lat === void 0 ? null : Number(input.lat);
+  const lng = input.lng === null || input.lng === "" || input.lng === void 0 ? null : Number(input.lng);
+  if ((lat === null) !== (lng === null)) return { error: "Pick the home base from the address suggestions." };
+  if (lat !== null && !(Number.isFinite(lat) && Math.abs(lat) <= 90 && Number.isFinite(lng) && Math.abs(lng) <= 180)) return { error: "That home base location is not valid." };
+  const r = input.radiusMiles === "" || input.radiusMiles === void 0 || input.radiusMiles === null ? DEFAULT_SERVICE_RADIUS_MILES : Number(input.radiusMiles);
+  if (!Number.isFinite(r) || r < 1 || r > 300) return { error: "Service radius must be from 1 to 300 miles." };
+  return { base: { address, lat, lng, radiusMiles: Math.round(r) } };
+}
+__name(readFleetBase, "readFleetBase");
+// What a page may know: the base rounded to about 1 km (it may be an owner's home), and the radius.
+function biasFor(base) {
+  if (!base || base.lat == null || base.lng == null) return null;
+  return { lat: Math.round(base.lat * 100) / 100, lng: Math.round(base.lng * 100) / 100, radiusMeters: Math.min(5e4, Math.round(base.radiusMiles * 1609.344)) };
+}
+__name(biasFor, "biasFor");
 function placesEnabled(env) {
   return String(env.PLACES_AUTOCOMPLETE || "off").toLowerCase() === "on" && !!env.GOOGLE_MAPS_SERVER_KEY;
 }
 __name(placesEnabled, "placesEnabled");
+// Owner/driver app suggestions: server key, and either the booking proxy switch or (as before) a browser
+// key that used to turn them on. The page itself never gets a key.
+function appPlacesEnabled(env) {
+  return !!env.GOOGLE_MAPS_SERVER_KEY && (placesEnabled(env) || !!mapsBrowserKey(env));
+}
+__name(appPlacesEnabled, "appPlacesEnabled");
+const APP_PLACE_ID_RE = /^[A-Za-z0-9_-]{10,300}$/;
+// POST /api/places/suggest { q, session, near?: { lat, lng } } -> { suggestions: [{ text, placeId }] }
+// Bias: a driver's own position when the app sends it (used for this request only, never stored),
+// else the fleet's home base. US only; a bias, never a restriction.
+async function postAppPlacesSuggest(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const q = str(body.q, 120);
+  if (!appPlacesEnabled(env) || q.length < 3) return json({ ok: true, suggestions: [] });
+  if (!await limitHit(env, "apu:" + user.userId, 300, 15 * 60 * 1e3) || !await limitHit(env, "apc:" + user.companyId, 3e3, 24 * 60 * 60 * 1e3)) return json({ ok: true, suggestions: [] });
+  const near = body.near && Number.isFinite(Number(body.near.lat)) && Number.isFinite(Number(body.near.lng)) && Math.abs(Number(body.near.lat)) <= 90 && Math.abs(Number(body.near.lng)) <= 180 ? { lat: Number(body.near.lat), lng: Number(body.near.lng), radiusMeters: 25e3 } : null;
+  const bias = near || biasFor(await loadFleetBase(env, user.companyId));
+  const req = { input: q, includedRegionCodes: ["us"], sessionToken: str(body.session, 64) || void 0 };
+  if (bias) req.locationBias = { circle: { center: { latitude: bias.lat, longitude: bias.lng }, radius: bias.radiusMeters } };
+  try {
+    const r = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "suggestions.placePrediction.text,suggestions.placePrediction.placeId" },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!r.ok) {
+      console.log(JSON.stringify({ level: "warn", msg: "app-places", status: r.status }));
+      return json({ ok: true, suggestions: [] });
+    }
+    const data = await r.json();
+    const suggestions = (data.suggestions || []).map((x) => x.placePrediction).filter((p) => p && p.text && p.text.text).slice(0, 5)
+      .map((p) => ({ text: p.text.text, placeId: typeof p.placeId === "string" && APP_PLACE_ID_RE.test(p.placeId) ? p.placeId : "" }));
+    return json({ ok: true, suggestions });
+  } catch (error) {
+    console.log(JSON.stringify({ level: "warn", msg: "app-places", name: error instanceof Error ? error.name : "Error" }));
+    return json({ ok: true, suggestions: [] });
+  }
+}
+__name(postAppPlacesSuggest, "postAppPlacesSuggest");
+// POST /api/places/details { placeId, session } -> { text, placeId, lat, lng } (Place Details Essentials).
+async function postAppPlacesDetails(request, env) {
+  const user = await authed(request, env, true);
+  if (isResponse(user)) return user;
+  const body = await readJson(request);
+  if (isResponse(body)) return body;
+  const placeId = str(body.placeId, 300);
+  if (!appPlacesEnabled(env) || !APP_PLACE_ID_RE.test(placeId)) return json({ ok: false });
+  if (!await limitHit(env, "apd:" + user.userId, 200, 15 * 60 * 1e3)) return json({ ok: false });
+  try {
+    const session = str(body.session, 64);
+    const r = await fetch("https://places.googleapis.com/v1/places/" + encodeURIComponent(placeId) + (session ? "?sessionToken=" + encodeURIComponent(session) : ""), {
+      headers: { "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "id,formattedAddress,location" },
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!r.ok) return json({ ok: false });
+    const p = await r.json();
+    const lat = p.location && Number(p.location.latitude), lng = p.location && Number(p.location.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return json({ ok: false });
+    return json({ ok: true, text: str(p.formattedAddress, 200), placeId, lat, lng });
+  } catch {
+    return json({ ok: false });
+  }
+}
+__name(postAppPlacesDetails, "postAppPlacesDetails");
 // Airport side of a public booking or quote. Replaces the typed pickup or drop-off with the terminal.
 function applyAirportChoice(body, settings, vehicleName) {
   const choice = readAirportChoice(body, settings.airports, vehicleClassOf(vehicleName));
@@ -1799,7 +1913,9 @@ async function getPublicBook(request, env, slug) {
     quotes: await publicQuoteInfo(env, company.id, settings),
     airports: publicAirportInfo(settings.airports),
     capacities: settings.capacities,
-    places: placesEnabled(env)
+    places: placesEnabled(env),
+    mapsKey: mapsBrowserKey(env),
+    bias: biasFor(await loadFleetBase(env, company.id))
   });
 }
 __name(getPublicBook, "getPublicBook");
@@ -1819,6 +1935,14 @@ async function readPublicJson(request) {
   }
 }
 __name(readPublicJson, "readPublicJson");
+// Why a request has no automatic price (owner view only): stops on an old rate sheet, no rates,
+// or the quote engine's reason (no-distance = Google down / cap / no route, too-far, ...).
+function manualReason(sheet, stops, q) {
+  if (!sheet) return "no-rates";
+  if (stops.length && !sheet.distance) return "stops";
+  return q && q.reason ? String(q.reason).slice(0, 24) : "no-quote";
+}
+__name(manualReason, "manualReason");
 async function postPublicBook(request, env, slug) {
   const company = await publicBookingCompany(env, slug);
   if (!company) return fail(404, "Booking page not found.");
@@ -1882,10 +2006,22 @@ async function postPublicBook(request, env, slug) {
   const trip = readTrip({ ...body, pickup, dropoff, vehicle: vehicleRow ? vehicleRow.id : "" }, sheet);
   if (tripTypeIn === "hourly" && trip.hours === null) return fail(400, "Choose how many hours.");
   // Server-side estimate only. Any price fields in the request body are ignored.
-  // A trip with stops gets no automatic estimate: the operator prices it on approval.
-  const q = sheet && !stops.length ? await quoteTrip(env, request, company.id, sheet, trip) : null;
+  // Old rate sheets: a trip with stops gets no automatic estimate. With distance rates, stops are
+  // routed and priced. No price for any reason (Google down, cap reached): quote_status manual,
+  // the owner sees "Price needed" and types it; the booking always goes through.
+  const places = readPlaces(body);
+  const q = sheet && (!stops.length || sheet.distance) ? await quoteTrip(env, request, company.id, sheet, trip, { places, airport: placed.airport, stops, settings, isPublic: true }) : null;
   const quoted = q && q.available ? q : null;
   const now = Date.now();
+  if (placed.airport) {
+    // Flight lookup the page already made (same Worker cache, no new provider call).
+    const looked = flight ? await cachedFlightLookup(placed.airport.code, normalizeFlight(flight), date) : null;
+    if (looked) {
+      if (looked.gate) placed.airport.gate = looked.gate;
+      if (looked.landingAt) placed.airport.landingAt = looked.landingAt;
+    }
+    placed.airport.flight = flight ? normalizeFlight(flight) || flight : "";
+  }
   const existingClients = await env.DB.prepare("SELECT id, name, phone, email, notes FROM clients WHERE company_id = ? LIMIT 500").bind(company.id).all();
   let clientId;
   const match = (existingClients.results || []).find((row) => phonesMatch(row.phone, phone));
@@ -1899,24 +2035,41 @@ async function postPublicBook(request, env, slug) {
     await env.DB.prepare("INSERT INTO clients (id, company_id, name, phone, email, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(clientId, company.id, name, phone, email, "", now, now).run();
   }
   const rideId = crypto.randomUUID();
-  await env.DB.prepare(
-    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage, stops_json)
-     VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
+  const baseValues = [
     rideId, company.id, clientId, date, time, pickup, dropoff, passengers, flight, notes, now, now,
     trip.tripType, trip.vehicleName, trip.tripType === "hourly" ? trip.hours : null,
     quoted ? quoted.totalCents : null,
-    quoted ? JSON.stringify({ v: 1, basis: quoted.basis, label: quoted.label, vehicle: quoted.vehicle, lines: quoted.lines, notes: quoted.notes, miles: quoted.miles ?? null, minutes: quoted.minutes ?? null, at: now }) : null,
+    quoted ? JSON.stringify({ v: 1, basis: quoted.basis, label: quoted.label, vehicle: quoted.vehicle, lines: quoted.lines, notes: quoted.notes, miles: quoted.miles ?? null, minutes: quoted.minutes ?? null, at: now }) : JSON.stringify({ v: 1, manualReason: manualReason(sheet, stops, q) }),
     placed.airport ? JSON.stringify(placed.airport) : null,
     luggageRaw,
     stopsToStored(stops)
-  ).run();
+  ];
+  const BASE_COLS = "id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage, stops_json";
+  const BASE_VALS = "?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?, ?, ?, ?";
+  try {
+    await env.DB.prepare(`INSERT INTO rides (${BASE_COLS}, quoted_miles, quoted_minutes, quote_status, quote_rates_json, quoted_at) VALUES (${BASE_VALS}, ?, ?, ?, ?, ?)`).bind(
+      ...baseValues,
+      quoted && quoted.miles != null ? quoted.miles : null,
+      quoted && quoted.minutes != null ? quoted.minutes : null,
+      quoted ? "auto" : "manual",
+      quoted && quoted.rates ? JSON.stringify(quoted.rates) : null,
+      quoted ? now : null
+    ).run();
+  } catch (error) {
+    // Worker deployed before migration 0019: save the booking without the quote snapshot columns
+    // (the quote itself is still in quote_cents / quote_json). Never lose a rider's booking.
+    if (!isMissingColumn(error)) throw error;
+    console.log(JSON.stringify({ level: "error", msg: "rides insert", reason: "pre-0019 schema" }));
+    await env.DB.prepare(`INSERT INTO rides (${BASE_COLS}) VALUES (${BASE_VALS})`).bind(...baseValues).run();
+  }
+  if (!quoted) console.log(JSON.stringify({ level: "info", msg: "manual quote", reason: q ? q.reason || "unavailable" : sheet ? "no-quote" : "no-rates" }));
   await autoRestoreClient(env, company.id, clientId, rideId, "", "booking-page");
   const view = quoted ? quoteView(quoted, publicCompanyName(company)) : null;
   return json({
     ok: true,
     companyName: publicCompanyName(company),
     estimate: view ? { total: view.total, estimate: view.estimate, label: view.label, confirm: view.confirm } : null,
+    priceMessage: view ? "" : CONFIRM_SHORTLY,
     trip: { pickup, dropoff, stops, vehicle: trip.vehicleName || "", airport: placed.airport ? airportSummary(placed.airport) : "", meeting: riderMeetingNote(placed.airport) }
   }, 201);
 }
@@ -1959,19 +2112,19 @@ __name(decideBooking, "decideBooking");
 // ---- Rate sheet + instant quotes (draft, Nov 10, 2026) ----
 // Prices are always computed here from the company's saved rate sheet. The booking page only
 // displays what this returns; any price a browser sends is ignored.
+// One atomic statement: start a new window, or count one more hit only while under maxHits. A refused
+// request changes nothing (no RETURNING row), so concurrent requests cannot pass the limit together.
 async function limitHit(env, bucket, maxHits, windowMs) {
-  const now = Date.now();
-  const row = await env.DB.prepare("SELECT hits, window_started FROM booking_limits WHERE bucket = ?").bind(bucket).first();
-  if (!row || now - row.window_started > windowMs) {
-    await env.DB.prepare(
-      `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?, 1, ?)
-       ON CONFLICT(bucket) DO UPDATE SET hits = 1, window_started = excluded.window_started`
-    ).bind(bucket, now).run();
-    return true;
-  }
-  if (row.hits >= maxHits) return false;
-  await env.DB.prepare("UPDATE booking_limits SET hits = hits + 1 WHERE bucket = ?").bind(bucket).run();
-  return true;
+  if (!(maxHits > 0)) return false;
+  const row = await env.DB.prepare(
+    `INSERT INTO booking_limits (bucket, hits, window_started) VALUES (?1, 1, ?2)
+     ON CONFLICT(bucket) DO UPDATE SET
+       hits = CASE WHEN ?2 - booking_limits.window_started > ?3 THEN 1 ELSE booking_limits.hits + 1 END,
+       window_started = CASE WHEN ?2 - booking_limits.window_started > ?3 THEN ?2 ELSE booking_limits.window_started END
+     WHERE ?2 - booking_limits.window_started > ?3 OR booking_limits.hits < ?4
+     RETURNING hits`
+  ).bind(bucket, Date.now(), windowMs, maxHits).first();
+  return !!row;
 }
 __name(limitHit, "limitHit");
 async function loadRateSheet(env, companyId) {
@@ -2038,12 +2191,20 @@ function readTrip(body, sheet) {
   };
 }
 __name(readTrip, "readTrip");
-// Road distance. Google Routes API (Compute Routes Essentials) when the GOOGLE_MAPS_SERVER_KEY
-// secret is set; otherwise no distance, and the quote falls back to flat fares / hourly / "operator
-// will confirm". QUOTE_DEV_FAKE_ROUTE=1 (local .dev.vars only, and only on localhost) returns a
-// made-up distance so the distance path can be tested without a key.
+// Road distance: Google Routes API computeRoutes (Compute Routes Essentials: TRAFFIC_UNAWARE, field
+// mask routes.distanceMeters,routes.duration, up to 10 intermediates). Server-only key in the
+// GOOGLE_ROUTES_KEY Worker secret, falling back to GOOGLE_MAPS_SERVER_KEY so a live fleet that
+// already has the older name keeps road-distance quotes if the new secret is not set yet. The key
+// is never sent to the page or returned in a response. Without either key there is no distance, and
+// one-way / round-trip requests come through with "We'll confirm your price shortly" (quote_status
+// manual). QUOTE_DEV_FAKE_ROUTE=1 (local .dev.vars only, and only on localhost) returns a made-up
+// distance so the distance path can be tested without a key.
+function routesServerKey(env) {
+  return String((env && (env.GOOGLE_ROUTES_KEY || env.GOOGLE_MAPS_SERVER_KEY)) || "").trim();
+}
+__name(routesServerKey, "routesServerKey");
 function routingProvider(env, request) {
-  if (env.GOOGLE_MAPS_SERVER_KEY) return "google";
+  if (routesServerKey(env)) return "google";
   if (env.QUOTE_DEV_FAKE_ROUTE === "1") {
     const host = new URL(request.url).hostname;
     if (host === "127.0.0.1" || host === "localhost") return "fake";
@@ -2051,19 +2212,192 @@ function routingProvider(env, request) {
   return "none";
 }
 __name(routingProvider, "routingProvider");
-async function routeMiles(env, request, companyId, pickup, dropoff) {
-  const provider = routingProvider(env, request);
-  if (provider === "none") return null;
-  const a = pickup.toLowerCase().replace(/\s+/g, " ").trim();
-  const b = dropoff.toLowerCase().replace(/\s+/g, " ").trim();
-  if (a.length < 4 || b.length < 4 || a === b) return null;
-  if (provider === "fake") {
-    if (/far away/.test(a + " " + b)) return { miles: 640, minutes: 560 };
-    const h = parseInt((await sha256Hex(a + "|" + b)).slice(0, 6), 16);
-    const miles = 5 + (h % 350) / 10;
-    return { miles, minutes: Math.round(miles * 1.6) };
+function routesDailyCap(env) {
+  const n = Number(env.ROUTES_DAILY_CAP);
+  return Number.isInteger(n) && n >= 0 ? n : 500;
+}
+function capVar(value, fallback) {
+  const n = Number(value);
+  return value !== void 0 && value !== null && value !== "" && Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+__name(capVar, "capVar");
+// Uncached Routes calls, per Eastern day (same todayIso as the global cap), all counted atomically:
+//   ROUTES_FLEET_DAILY_CAP   per fleet, everything (owner previews, bookings, public quotes). Default 500.
+//   ROUTES_PUBLIC_DAILY_CAP  per fleet, from unauthenticated public quotes and public bookings. Default 150, so
+//                            unique-waypoint requests cannot spend the fleet's whole cap.
+//   ROUTES_DAILY_CAP         all fleets together (shared budget). Default 500.
+//   ROUTES_FLEET_RESERVE     each fleet's first N calls of the day are not refused by the shared cap
+//                            (still counted), so one fleet cannot push every other fleet to zero. Default 50.
+// Any cap reached: no Google call; the quote is manual and the booking still saves (Price needed).
+async function takeRouteCall(env, companyId, isPublic) {
+  const publicKind = "routes-public:" + companyId;
+  const fleetKind = "routes-fleet:" + companyId;
+  if (isPublic && !await takeDaily(env, publicKind, capVar(env.ROUTES_PUBLIC_DAILY_CAP, 150))) return "public-cap";
+  const fleetCount = await takeDaily(env, fleetKind, capVar(env.ROUTES_FLEET_DAILY_CAP, 500));
+  if (!fleetCount) {
+    if (isPublic) await giveBackDaily(env, publicKind);
+    return "fleet-cap";
   }
-  const cacheKey = new Request("https://route-cache.nudgedispatch.invalid/v1/" + await sha256Hex(provider + "|" + a + "|" + b));
+  if (await takeDaily(env, "routes", routesDailyCap(env))) return "";
+  // Shared budget used up today. The fleet's reserve still goes through (counted separately);
+  // ROUTES_DAILY_CAP=0 turns routing off for everyone, reserve or not.
+  if (routesDailyCap(env) > 0 && fleetCount <= capVar(env.ROUTES_FLEET_RESERVE, 50) && await takeDaily(env, "routes-reserve", 1e6)) return "";
+  await giveBackDaily(env, fleetKind);
+  if (isPublic) await giveBackDaily(env, publicKind);
+  return "daily-cap";
+}
+__name(takeRouteCall, "takeRouteCall");
+__name(routesDailyCap, "routesDailyCap");
+function flightDailyCap(env) {
+  const n = Number(env.FLIGHT_DAILY_CAP);
+  return Number.isInteger(n) && n >= 0 ? n : 200;
+}
+__name(flightDailyCap, "flightDailyCap");
+// Counts one call for (Eastern day, kind) only while under cap, atomically. Returns the new count, or 0
+// when the cap is reached (nothing counted, so raising the cap later the same day takes effect).
+// Missing usage table (migration 0019 not applied) or any error: 0, so Google is never called uncounted.
+async function takeDaily(env, kind, cap) {
+  if (!(cap > 0)) return 0;
+  try {
+    const row = await env.DB.prepare(
+      `INSERT INTO api_daily_usage (day, kind, calls) VALUES (?1, ?2, 1)
+       ON CONFLICT(day, kind) DO UPDATE SET calls = api_daily_usage.calls + 1 WHERE api_daily_usage.calls < ?3
+       RETURNING calls`
+    ).bind(todayIso(), kind, cap).first();
+    return row ? row.calls : 0;
+  } catch (error) {
+    console.log(JSON.stringify({ level: "error", msg: "daily cap", kind: kind.split(":")[0], name: error instanceof Error ? error.name : "Error" }));
+    return 0;
+  }
+}
+__name(takeDaily, "takeDaily");
+// Give back a count taken for a call that then did not happen (a later cap refused it).
+async function giveBackDaily(env, kind) {
+  try {
+    await env.DB.prepare("UPDATE api_daily_usage SET calls = calls - 1 WHERE day = ? AND kind = ? AND calls > 0").bind(todayIso(), kind).run();
+  } catch {
+  }
+}
+__name(giveBackDaily, "giveBackDaily");
+async function underDailyCap(env, kind, cap) {
+  return await takeDaily(env, kind, cap) > 0;
+}
+__name(underDailyCap, "underDailyCap");
+// Place picked in the booking page's autocomplete: { placeId, lat, lng, types }. Validated loosely;
+// anything odd is dropped and the typed address is used.
+function readPlace(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const placeId = typeof v.placeId === "string" && /^[A-Za-z0-9_-]{10,300}$/.test(v.placeId) ? v.placeId : "";
+  const lat = Number(v.lat), lng = Number(v.lng);
+  const hasLoc = Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && !(lat === 0 && lng === 0);
+  const types = Array.isArray(v.types) ? v.types.filter((t) => typeof t === "string" && /^[a-z_]{2,40}$/.test(t)).slice(0, 12) : [];
+  if (!placeId && !hasLoc) return null;
+  return { placeId, lat: hasLoc ? lat : null, lng: hasLoc ? lng : null, types };
+}
+__name(readPlace, "readPlace");
+function readPlaces(body) {
+  const p = body && body.places && typeof body.places === "object" ? body.places : {};
+  const stops = Array.isArray(p.stops) ? p.stops.slice(0, 5).map(readPlace) : [];
+  return { pickup: readPlace(p.pickup), dropoff: readPlace(p.dropoff), stops };
+}
+__name(readPlaces, "readPlaces");
+function placeWaypoint(text, place) {
+  if (place && place.placeId) return { placeId: place.placeId };
+  if (place && place.lat != null) return { location: { latLng: { latitude: place.lat, longitude: place.lng } } };
+  const t = String(text || "").trim();
+  return t.length >= 4 ? { address: t } : null;
+}
+__name(placeWaypoint, "placeWaypoint");
+// Waypoints for the Routes call. The airport side uses that terminal's curb pin (or, until Devo sets
+// the pin, the terminal's address), so International vs Domestic mileage differs.
+function tripWaypoints(trip, places, airport, stops) {
+  const side = (which) => {
+    if (airport && airport.side === which) return terminalWaypoint(airport.code, airport.spot);
+    return placeWaypoint(trip[which], places[which]);
+  };
+  const origin = side("pickup");
+  const destination = side("dropoff");
+  if (!origin || !destination) return null;
+  const intermediates = [];
+  for (const [i, s] of (stops || []).entries()) {
+    const w = placeWaypoint(s, places.stops[i]);
+    if (!w) return null;
+    intermediates.push(w);
+  }
+  return { origin, destination, intermediates };
+}
+__name(tripWaypoints, "tripWaypoints");
+// Airport fee and airport detection: the rider chose an airport connection (always one of our
+// airports), or an autocomplete Place of type "airport" that is one of this fleet's airports.
+// Airport fee: a chosen airport connection, or a pickup/drop-off Place at one of the fleet's ticked
+// airports. Client-sent types are not the only signal (see detectAirport): with no types the location
+// decides, and a Place with a placeId whose types say "not an airport" (or that has no location) is
+// re-checked server-side (Place Details Essentials: types and location, server key, cached a day).
+async function tripAirportCode(env, airport, places, settings) {
+  if (airport && airport.code) return airport.code;
+  const codes = ((settings && settings.airports && settings.airports.airports) || []).map((a) => a.code);
+  if (!codes.length) return "";
+  for (const place of [places.pickup, places.dropoff]) {
+    if (!place) continue;
+    const claimsOther = Array.isArray(place.types) && place.types.length && !place.types.includes("airport");
+    const needsCheck = place.placeId && (place.lat == null || (claimsOther && airportAt(place, codes)));
+    const checked = needsCheck ? await placeFacts(env, place.placeId) : null;
+    const code = detectAirport(checked ? { ...place, ...checked } : place, codes);
+    if (code) return code;
+  }
+  return "";
+}
+__name(tripAirportCode, "tripAirportCode");
+// { types, lat, lng } for a placeId from the server (never the page), or null (no key, error, timeout).
+async function placeFacts(env, placeId) {
+  if (!env.GOOGLE_MAPS_SERVER_KEY || !/^[A-Za-z0-9_-]{10,300}$/.test(placeId)) return null;
+  const cacheKey = new Request("https://place-facts.nudgedispatch.invalid/v1/" + encodeURIComponent(placeId));
+  const cache = typeof caches !== "undefined" ? caches.default : null;
+  try {
+    const hit = cache ? await cache.match(cacheKey) : null;
+    if (hit) return await hit.json();
+  } catch {
+  }
+  try {
+    const r = await fetch("https://places.googleapis.com/v1/places/" + encodeURIComponent(placeId), {
+      headers: { "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "types,location" },
+      signal: AbortSignal.timeout(4e3)
+    });
+    if (!r.ok) {
+      console.log(JSON.stringify({ level: "warn", msg: "place facts", status: r.status }));
+      return null;
+    }
+    const p = await r.json();
+    const lat = p.location ? Number(p.location.latitude) : NaN, lng = p.location ? Number(p.location.longitude) : NaN;
+    const facts = { types: Array.isArray(p.types) ? p.types.filter((t) => typeof t === "string").slice(0, 20) : [], lat: Number.isFinite(lat) ? lat : null, lng: Number.isFinite(lng) ? lng : null };
+    if (cache) {
+      try {
+        await cache.put(cacheKey, new Response(JSON.stringify(facts), { headers: { "content-type": "application/json", "cache-control": "max-age=86400" } }));
+      } catch {
+      }
+    }
+    return facts;
+  } catch (error) {
+    console.log(JSON.stringify({ level: "warn", msg: "place facts", name: error instanceof Error ? error.name : "Error" }));
+    return null;
+  }
+}
+__name(placeFacts, "placeFacts");
+// Returns { miles, minutes } or null (no key, cap reached, Google error or timeout). Never throws.
+async function routeTrip(env, request, companyId, waypoints, isPublic = false) {
+  const provider = routingProvider(env, request);
+  if (provider === "none" || !waypoints) return null;
+  const keyText = JSON.stringify(waypoints).toLowerCase();
+  if (provider === "fake") {
+    // Local only. The caps still count here so the cap paths can be tested without Google.
+    const refused = await takeRouteCall(env, companyId, isPublic);
+    if (refused) return null;
+    if (/far away/.test(keyText)) return { miles: 640, minutes: 560 };
+    const h = parseInt((await sha256Hex(keyText)).slice(0, 6), 16);
+    const miles = 5 + (h % 350) / 10 + waypoints.intermediates.length * 3;
+    return { miles: Math.round(miles * 10) / 10, minutes: Math.ceil(miles * 1.6) };
+  }
+  const cacheKey = new Request("https://route-cache.nudgedispatch.invalid/v2/" + await sha256Hex(provider + "|" + keyText));
   const cache = typeof caches !== "undefined" ? caches.default : null;
   if (cache) {
     try {
@@ -2075,24 +2409,27 @@ async function routeMiles(env, request, companyId, pickup, dropoff) {
     } catch {
     }
   }
-  // Cost guard: at most 500 uncached lookups per company per day (well inside Google's 10,000 free/month for one busy company).
-  if (!await limitHit(env, "route:" + companyId, 500, 24 * 60 * 60 * 1e3)) return null;
+  // Cost guards (see takeRouteCall). Any cap reached: no Google call, the request goes to manual.
+  const refused = await takeRouteCall(env, companyId, isPublic);
+  if (refused) {
+    console.log(JSON.stringify({ level: "warn", msg: "routes", reason: refused }));
+    return null;
+  }
   let result = null;
   try {
+    const body = { origin: waypoints.origin, destination: waypoints.destination, travelMode: "DRIVE", routingPreference: "TRAFFIC_UNAWARE", regionCode: "us", units: "IMPERIAL" };
+    if (waypoints.intermediates.length) body.intermediates = waypoints.intermediates;
     const r = await fetch("https://routes.googleapis.com/directions/v2:computeRoutes", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": env.GOOGLE_MAPS_SERVER_KEY, "x-goog-fieldmask": "routes.distanceMeters,routes.duration" },
-      // TRAFFIC_UNAWARE + only distance/duration keeps this on the Compute Routes Essentials SKU.
-      body: JSON.stringify({ origin: { address: pickup }, destination: { address: dropoff }, travelMode: "DRIVE", routingPreference: "TRAFFIC_UNAWARE", regionCode: "us", units: "IMPERIAL" }),
-      signal: AbortSignal.timeout(4e3)
+      headers: { "content-type": "application/json", "x-goog-api-key": routesServerKey(env), "x-goog-fieldmask": "routes.distanceMeters,routes.duration" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(8e3)
     });
     if (r.ok) {
       const j = await r.json();
       const route = j && j.routes && j.routes[0];
-      if (route && route.distanceMeters > 0) {
-        const secs = parseInt(String(route.duration || "0").replace("s", ""), 10) || 0;
-        result = { miles: Math.round(route.distanceMeters / 160.9344) / 10, minutes: Math.round(secs / 60) };
-      }
+      if (route && route.distanceMeters > 0) result = { miles: metersToMiles(route.distanceMeters), minutes: durationToMinutes(route.duration) };
+      else console.log(JSON.stringify({ level: "warn", msg: "routes", reason: "no-route" }));
     } else {
       console.log(JSON.stringify({ level: "warn", msg: "routes", status: r.status }));
     }
@@ -2108,12 +2445,19 @@ async function routeMiles(env, request, companyId, pickup, dropoff) {
   }
   return result;
 }
-__name(routeMiles, "routeMiles");
-async function quoteTrip(env, request, companyId, sheet, trip) {
+__name(routeTrip, "routeTrip");
+// extras: { places, airport (stored airport choice or null), stops (array of addresses), settings,
+//           isPublic (unauthenticated public quote or booking: also counts against ROUTES_PUBLIC_DAILY_CAP) }
+async function quoteTrip(env, request, companyId, sheet, trip, extras = {}) {
   if (!sheet || !trip.vehicle) return null;
-  const req = { tripType: trip.tripType || "one-way", vehicle: trip.vehicle, pickup: trip.pickup, dropoff: trip.dropoff, hours: trip.hours, passengers: trip.passengers };
-  const route = needsDistance(sheet, req) ? await routeMiles(env, request, companyId, trip.pickup, trip.dropoff) : null;
-  return computeQuote(sheet, req, route);
+  const stops = extras.stops || [];
+  const places = extras.places || { pickup: null, dropoff: null, stops: [] };
+  const airportCode = await tripAirportCode(env, extras.airport || null, places, extras.settings);
+  const req = { tripType: trip.tripType || "one-way", vehicle: trip.vehicle, pickup: trip.pickup, dropoff: trip.dropoff, hours: trip.hours, passengers: trip.passengers, stops: stops.length, airport: !!airportCode };
+  const route = needsDistance(sheet, req) ? await routeTrip(env, request, companyId, tripWaypoints(trip, places, extras.airport || null, stops), !!extras.isPublic) : null;
+  const q = computeQuote(sheet, req, route);
+  if (q) q.airportCode = airportCode;
+  return q;
 }
 __name(quoteTrip, "quoteTrip");
 function quoteView(q, companyName) {
@@ -2149,10 +2493,11 @@ async function postPublicQuote(request, env, slug) {
   if (!await limitHit(env, "qip:" + ipHash, 120, 15 * 60 * 1e3) || !await limitHit(env, "qslug:" + slug, 600, 15 * 60 * 1e3)) {
     return fail(429, "Please wait a few minutes and try again.");
   }
-  // A trip with stops is never auto-priced: the operator confirms the fare.
+  // Old rate sheets (no distance rates yet): a trip with stops is never auto-priced. With distance
+  // rates, stops go to Google as intermediates and the extra-stop fee applies.
   const stopsIn = readStops(body.stops);
   if (stopsIn.error) return fail(400, stopsIn.error);
-  if (stopsIn.stops.length) return json({ ok: true, quote: { available: false, stops: stopsIn.stops.length, message: STOPS_PRICE_MESSAGE } });
+  if (stopsIn.stops.length && !saved.sheet.distance) return json({ ok: true, quote: { available: false, stops: stopsIn.stops.length, message: STOPS_PRICE_MESSAGE } });
   const settings = await loadBookingSettings(env, company.id);
   const classes = await fleetClassSet(env, company.id);
   const offered = offeredVehicles(saved.sheet, classes, settings.capacities);
@@ -2160,7 +2505,7 @@ async function postPublicQuote(request, env, slug) {
   const placed = applyAirportChoice(body, settings, vehicleRow ? vehicleRow.name : "");
   if (placed.error) return json({ ok: true, quote: null });
   const trip = readTrip({ ...body, pickup: placed.pickup, dropoff: placed.dropoff, vehicle: vehicleRow ? vehicleRow.id : "" }, saved.sheet);
-  const q = await quoteTrip(env, request, company.id, saved.sheet, trip);
+  const q = await quoteTrip(env, request, company.id, saved.sheet, trip, { places: readPlaces(body), airport: placed.airport, stops: stopsIn.stops, settings, isPublic: true });
   return json({ ok: true, quote: quoteView(q, publicCompanyName(company)), pickup: placed.pickup, dropoff: placed.dropoff });
 }
 __name(postPublicQuote, "postPublicQuote");
@@ -2171,7 +2516,7 @@ async function getBookingSettings(request, env) {
   if (denied) return denied;
   const s = await loadBookingSettings(env, user.companyId);
   const classes = await fleetClassSet(env, user.companyId);
-  return json({ ok: true, settings: { airports: s.airports, capacities: s.capacities, flightRules: s.flightRules }, fleetClasses: [...classes], flightTracking: flightProvider(env).ready, presets: ["ATL"] });
+  return json({ ok: true, settings: { airports: s.airports, capacities: s.capacities, flightRules: s.flightRules }, fleetClasses: [...classes], flightTracking: flightProvider(env).ready, base: await loadFleetBase(env, user.companyId), defaultRadiusMiles: DEFAULT_SERVICE_RADIUS_MILES, mapsOn: !!mapsBrowserKey(env), presets: ["ATL"], airportList: AIRPORT_CODES.map((code) => ({ code, name: AIRPORTS[code].fullName })) });
 }
 __name(getBookingSettings, "getBookingSettings");
 async function putBookingSettings(request, env) {
@@ -2195,6 +2540,17 @@ async function putBookingSettings(request, env) {
     const v = validateCapacities(body.capacities);
     if (v.error) return fail(400, v.error);
     capacities = v.capacities;
+  }
+  if (body.base !== void 0) {
+    const b = readFleetBase(body.base);
+    if (b.error) return fail(400, b.error);
+    try {
+      await env.DB.prepare("UPDATE companies SET base_address = ?, base_lat = ?, base_lng = ?, service_radius_miles = ? WHERE id = ?").bind(b.base ? b.base.address : null, b.base ? b.base.lat : null, b.base ? b.base.lng : null, b.base ? b.base.radiusMiles : null, user.companyId).run();
+    } catch (error) {
+      if (!isMissingColumn(error)) throw error;
+      return fail(503, "Database update needed (migration 0019) before the home base can be saved.");
+    }
+    if (body.airports === void 0 && body.preset === void 0 && body.capacities === void 0 && body.flightRules === void 0) return json({ ok: true, base: b.base });
   }
   let rules = current.flightRules;
   if (body.flightRules !== void 0) {
@@ -2236,6 +2592,103 @@ async function postPublicPlaces(request, env, slug) {
   }
 }
 __name(postPublicPlaces, "postPublicPlaces");
+// ---- Flight lookup for airport trips on the booking page (Nov 20, 2026) ----
+// POST /api/public/book/<slug>/flight-status  { code, flight, date, time }
+// Returns the terminal (one of our terminal ids), gate, and scheduled / estimated / actual landing.
+// Provider behind flight-provider.js; key in the FLIGHT_API_KEY secret; our own FLIGHT_DAILY_CAP.
+// Lookup down, over the cap, or nothing found: the airline table (airports-data.js) suggests the
+// terminal, or the rider picks it. Never blocks a booking; provider errors are logged, not shown.
+function flightCacheKey(code, ident, date) {
+  return new Request("https://flight-cache.nudgedispatch.invalid/v1/" + encodeURIComponent(code + "|" + ident + "|" + date));
+}
+__name(flightCacheKey, "flightCacheKey");
+async function cachedFlightLookup(code, ident, date) {
+  if (!ident || typeof caches === "undefined") return null;
+  try {
+    const hit = await caches.default.match(flightCacheKey(code, ident, date));
+    return hit ? await hit.json() : null;
+  } catch {
+    return null;
+  }
+}
+__name(cachedFlightLookup, "cachedFlightLookup");
+function clockEastern(msValue) {
+  return msValue ? new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }).format(new Date(msValue)) : "";
+}
+__name(clockEastern, "clockEastern");
+async function postPublicFlightStatus(request, env, slug) {
+  const company = await publicBookingCompany(env, slug);
+  if (!company) return fail(404, "Booking page not found.");
+  const body = await readPublicJson(request);
+  if (isResponse(body)) return body;
+  const settings = await loadBookingSettings(env, company.id);
+  const code = str(body.code, 4).toUpperCase();
+  const airport = (settings.airports.airports || []).find((a) => a.code === code);
+  const known = airportByCode(code);
+  if (!airport || !known) return json({ ok: true, found: false, reason: "airport" });
+  const ident = normalizeFlight(body.flight);
+  const date = validDate(str(body.date, 10)) ? str(body.date, 10) : todayIso();
+  const time = validTime(str(body.time, 5)) ? str(body.time, 5) : "12:00";
+  // Airline table first, so there is always an answer even when the lookup is off or fails.
+  const airline = ident ? airlineOf(ident) : str(body.airline, 3).toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const tableTerminals = terminalsForAirline(code, airline);
+  const out = { ok: true, found: false, code, flight: ident, airline, terminal: "", terminalSource: "", airlineTerminals: tableTerminals, gate: "", landingAt: null, landingLabel: "", status: "" };
+  if (tableTerminals.length === 1) { out.terminal = tableTerminals[0]; out.terminalSource = "airline_table"; }
+  if (!ident) return json(out);
+  const ipHash = await sha256Hex("book-ip:" + clientIp(request));
+  if (!await limitHit(env, "fip:" + ipHash, 30, 15 * 60 * 1e3)) return json(out);
+  let looked = await cachedFlightLookup(code, ident, date);
+  if (!looked) {
+    const provider = flightProvider(env);
+    if (!provider.ready) {
+      console.log(JSON.stringify({ level: "info", msg: "flight lookup", reason: "provider-off" }));
+      return json(out);
+    }
+    // Per fleet first (FLIGHT_FLEET_DAILY_CAP, default 100 per Eastern day), then the shared
+    // FLIGHT_DAILY_CAP. Either reached: the airline table answers; the booking is never blocked.
+    const flightFleetKind = "flight-fleet:" + company.id;
+    if (!await takeDaily(env, flightFleetKind, capVar(env.FLIGHT_FLEET_DAILY_CAP, 100))) {
+      console.log(JSON.stringify({ level: "warn", msg: "flight lookup", reason: "fleet-cap" }));
+      return json(out);
+    }
+    if (!await underDailyCap(env, "flight", flightDailyCap(env))) {
+      await giveBackDaily(env, flightFleetKind);
+      console.log(JSON.stringify({ level: "warn", msg: "flight lookup", reason: "daily-cap" }));
+      return json(out);
+    }
+    const around = easternMs(date, time) || Date.now();
+    const r = await fetchFlightSnapshot(env, ident, around);
+    if (!r.ok) {
+      console.log(JSON.stringify({ level: "warn", msg: "flight lookup", reason: "provider", problem: String(r.problem || "").slice(0, 80) }));
+      return json(out);
+    }
+    const s = r.snapshot;
+    looked = {
+      terminal: terminalFromProvider(code, s.terminal),
+      gate: String(s.gate || "").slice(0, 12),
+      scheduledAt: s.scheduledArrival ?? null,
+      estimatedAt: s.estimatedArrival ?? null,
+      actualAt: s.actualArrival ?? null,
+      landingAt: s.actualArrival ?? s.estimatedArrival ?? s.scheduledArrival ?? null,
+      status: String(s.status || "").slice(0, 40),
+      at: Date.now()
+    };
+    try {
+      await caches.default.put(flightCacheKey(code, ident, date), new Response(JSON.stringify(looked), { headers: { "content-type": "application/json", "cache-control": "max-age=3600" } }));
+    } catch {
+    }
+  }
+  out.found = true;
+  if (looked.terminal) { out.terminal = looked.terminal; out.terminalSource = "flight_lookup"; }
+  out.gate = looked.gate || "";
+  out.landingAt = looked.landingAt;
+  out.landingLabel = clockEastern(looked.landingAt);
+  out.scheduledLabel = clockEastern(looked.scheduledAt);
+  out.landed = !!looked.actualAt;
+  out.status = looked.status || "";
+  return json(out);
+}
+__name(postPublicFlightStatus, "postPublicFlightStatus");
 // Cron: watch flights for airport pickups and alert the assigned driver on any change.
 async function runFlightChecks(env, nowMs, fetchImpl) {
   const provider = flightProvider(env);
@@ -2304,7 +2757,9 @@ async function previewRateSheet(request, env) {
   if (!saved || !saved.sheet) return fail(404, "Save your rate sheet first.");
   const trip = readTrip(body, saved.sheet);
   const settings = await loadSettings(env, user.companyId);
-  const q = await quoteTrip(env, request, user.companyId, saved.sheet, trip);
+  const stopsIn = readStops(body.stops);
+  if (stopsIn.error) return fail(400, stopsIn.error);
+  const q = await quoteTrip(env, request, user.companyId, saved.sheet, trip, { stops: saved.sheet.distance ? stopsIn.stops : [] });
   return json({ ok: true, quote: quoteView(q, settings && settings.business_name || user.companyName) });
 }
 __name(previewRateSheet, "previewRateSheet");
@@ -2638,6 +3093,8 @@ async function handleApi(request, env) {
     if (path === "/api/login" && method === "POST") return login(request, env);
     if (path === "/api/logout" && method === "POST") return logout(request, env);
     if (path === "/api/me" && method === "GET") return me(request, env);
+    if (path === "/api/places/suggest" && method === "POST") return postAppPlacesSuggest(request, env);
+    if (path === "/api/places/details" && method === "POST") return postAppPlacesDetails(request, env);
     if (path === "/api/trial" && method === "GET") return getTrial(request, env);
     if (path === "/api/trial/cancel" && method === "POST") return cancelTrial(request, env);
     if (path === "/api/account/cancel" && method === "POST") return cancelTrial(request, env);
@@ -2717,6 +3174,8 @@ async function handleApi(request, env) {
     if (path === "/api/booking-settings" && method === "PUT") return putBookingSettings(request, env);
     const publicPlaces = /^\/api\/public\/book\/([^/]+)\/places$/.exec(path);
     if (publicPlaces && method === "POST") return postPublicPlaces(request, env, decodeURIComponent(publicPlaces[1]));
+    const publicFlight = /^\/api\/public\/book\/([^/]+)\/flight-status$/.exec(path);
+    if (publicFlight && method === "POST") return postPublicFlightStatus(request, env, decodeURIComponent(publicFlight[1]));
     const publicQuote = /^\/api\/public\/book\/([^/]+)\/quote$/.exec(path);
     if (publicQuote && method === "POST") return postPublicQuote(request, env, decodeURIComponent(publicQuote[1]));
     const publicBook = /^\/api\/public\/book\/([^/]+)$/.exec(path);
@@ -2922,7 +3381,7 @@ async function exportRides(request, env) {
   if (isResponse(user)) return user;
   const denied = ownerOnly(user);
   if (denied) return denied;
-  const rows = await env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? ORDER BY r.pickup_date, r.pickup_time`).bind(user.companyId).all();
+  const rows = await rideSelect(env, "WHERE r.company_id = ? ORDER BY r.pickup_date, r.pickup_time", [user.companyId], "all");
   return csvResponse("rides-" + todayIso() + ".csv",
     ["Date", "Time", "Client", "Client phone", "Client email", "Pickup", "Drop-off", "Passengers", "Flight", "Status", "Fare", "Estimate", "Payment", "Trip type", "Vehicle", "Hours", "Notes", "Source", "Stops"],
     (rows.results || []).map((r) => [r.pickup_date, r.pickup_time, r.client_name, r.client_phone, r.client_email, r.pickup, r.dropoff, r.passengers, r.flight,
@@ -3925,7 +4384,10 @@ __name(logout, "logout");
 async function me(request, env) {
   const user = await requireUser(request, env);
   if (isResponse(user)) return user;
-  return json({ ok: true, ...publicUser(user) });
+  // Address suggestions in the owner/driver app: on/off only (never a key). Suggestions come from the
+  // signed-in /api/places/* proxy, which uses the server key and the fleet's base as bias.
+  const maps = !user.platformAdmin && user.companyId && appPlacesEnabled(env) ? { on: true } : null;
+  return json({ ok: true, ...publicUser(user), maps });
 }
 __name(me, "me");
 async function authed(request, env, mutate) {
@@ -4099,10 +4561,28 @@ async function restoreClient(request, env, id) {
   return json({ ok: true, restored: true, client: clientJson({ ...existing, archived_at: null, updated_at: now }) });
 }
 __name(restoreClient, "restoreClient");
+// Before migration 0019 the quote snapshot columns don't exist: rideSelect falls back to NULLs.
+function isMissingColumn(error) {
+  return /no such column|has no column named/i.test(String(error && error.message || error));
+}
+__name(isMissingColumn, "isMissingColumn");
+var RIDE_SELECT_PRE_0019 = null;
+async function rideSelect(env, tail, binds, method) {
+  const run = (sql) => env.DB.prepare(`${sql} ${tail}`).bind(...binds)[method]();
+  try {
+    return await run(RIDE_SELECT);
+  } catch (error) {
+    if (!isMissingColumn(error)) throw error;
+    console.log(JSON.stringify({ level: "error", msg: "rides select", reason: "pre-0019 schema" }));
+    RIDE_SELECT_PRE_0019 = RIDE_SELECT_PRE_0019 || RIDE_SELECT.replace("r.quoted_miles, r.quoted_minutes, r.quote_status, r.quoted_at,", "NULL AS quoted_miles, NULL AS quoted_minutes, NULL AS quote_status, NULL AS quoted_at,");
+    return run(RIDE_SELECT_PRE_0019);
+  }
+}
+__name(rideSelect, "rideSelect");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
   r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.arrived_at, r.picked_up_at, r.completed_at,
   r.driver_user_id, drv.name AS assigned_driver_name, drv.vehicle AS assigned_driver_vehicle, drv.plate AS assigned_driver_plate, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
-  r.airport_json, r.luggage, r.stops_json,
+  r.airport_json, r.luggage, r.stops_json, r.quoted_miles, r.quoted_minutes, r.quote_status, r.quoted_at, r.flight_status_json,
   (SELECT fa.message FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert,
   (SELECT fa.kind FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_kind,
   (SELECT fa.created_at FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_at
@@ -4111,15 +4591,15 @@ var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS c
 async function listRides(request, env) {
   const user = await authed(request, env, false);
   if (isResponse(user)) return user;
-  const rows = user.role === "driver" ? await env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? AND r.driver_user_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200`).bind(user.companyId, user.userId).all() : await env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200`).bind(user.companyId).all();
+  const rows = user.role === "driver" ? await rideSelect(env, "WHERE r.company_id = ? AND r.driver_user_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200", [user.companyId, user.userId], "all") : await rideSelect(env, "WHERE r.company_id = ? ORDER BY r.pickup_date DESC, r.pickup_time DESC LIMIT 200", [user.companyId], "all");
   return json({ ok: true, rides: (rows.results || []).map((row) => rideJson(row, user.role)) });
 }
 __name(listRides, "listRides");
 async function ownedRide(env, user, id) {
   if (user.role === "driver") {
-    return env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? AND r.id = ? AND r.driver_user_id = ?`).bind(user.companyId, id, user.userId).first();
+    return rideSelect(env, "WHERE r.company_id = ? AND r.id = ? AND r.driver_user_id = ?", [user.companyId, id, user.userId], "first");
   }
-  return env.DB.prepare(`${RIDE_SELECT} WHERE r.company_id = ? AND r.id = ?`).bind(user.companyId, id).first();
+  return rideSelect(env, "WHERE r.company_id = ? AND r.id = ?", [user.companyId, id], "first");
 }
 __name(ownedRide, "ownedRide");
 function rideFields(body) {
@@ -5885,7 +6365,7 @@ import bookQrJs from "./client-book-qr.txt";
 import bookQrSwJs from "./client-book-qr-sw.txt";
 import bookQrCss from "./book-qr.css";
 import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml } from "./booking-qr.js";
-import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
+import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS, CONFIRM_SHORTLY } from "./quote-engine.js";
 import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, TRIAL_RIDE_LIMIT, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, TRIAL_STRIPE_HORIZON_DAYS, CANCEL_REASONS, canCancelTrial, canCancelPaid, trialCancelColumns, cancelFeedback, stripeTrialEnd, isAutoTrial, moveBackToTrial } from "./trial.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
 import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, smsSetupPromoCode, isCardPaymentMethod, cardOnlyPaymentConfig, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
@@ -5910,7 +6390,13 @@ import { validateAirportConfig, validateCapacities, publicAirportInfo, readAirpo
 import { validatePaymentMethods, parseStoredPaymentMethods, payOptions, payLines } from "./payment-methods.js";
 import { readStops, stopsToStored, parseStoredStops, stopLines, stopsCell, STOPS_PRICE_MESSAGE } from "./stops.js";
 import { flightProvider, fetchFlightSnapshot, flightAlerts, flightRules, normalizeFlight, shouldWatch } from "./flight-alerts.js";
+import { metersToMiles, durationToMinutes } from "./fare.js";
+import { AIRPORTS, AIRPORT_CODES, airportByCode, terminalWaypoint, detectAirport, airportAt, airlineOf, terminalsForAirline, terminalFromProvider, freeWaitEnds } from "./airports-data.js";
 var CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+// Public booking page (/book/<slug>/) only, and only when GOOGLE_MAPS_BROWSER_KEY is set: Google's
+// documented allowlist for the Maps JavaScript API (Places Autocomplete). The signed-in owner/driver app
+// and every other response keep CSP above (the app gets suggestions through /api/places/*).
+var CSP_BOOK_MAPS = "default-src 'self'; img-src 'self' data: https://*.googleapis.com https://*.gstatic.com *.google.com *.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' https://*.googleapis.com https://*.gstatic.com *.google.com https://*.ggpht.com *.googleusercontent.com 'unsafe-eval' blob:; connect-src 'self' https://*.googleapis.com *.google.com https://*.gstatic.com data: blob:; frame-src *.google.com; worker-src blob:; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 var CSP_SIGNUP = "default-src 'self'; img-src 'self' data: https://challenges.cloudflare.com; style-src 'self' https://challenges.cloudflare.com; script-src 'self' https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://checkout.stripe.com";
 var FILES = {
   "/": { body: indexHtml, type: "text/html; charset=utf-8", cache: "no-cache" },
@@ -5943,8 +6429,10 @@ function assetTag(s) {
 }
 __name(assetTag, "assetTag");
 var BOOK_JS_SRC = "/book.js?v=" + assetTag(bookJs);
-function bookPageHtml(companyName, themeColor) {
-  return applyBookingPageHtml(bookHtml, { jsSrc: BOOK_JS_SRC, companyName, themeColor });
+function bookPageHtml(companyName, themeColor, mapsOn) {
+  const html = applyBookingPageHtml(bookHtml, { jsSrc: BOOK_JS_SRC, companyName, themeColor });
+  // With maps on, the header CSP (CSP_BOOK_MAPS) is the policy; the stricter meta copy would block Google.
+  return mapsOn ? html.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\n?/, "") : html;
 }
 __name(bookPageHtml, "bookPageHtml");
 function bookServiceWorker() {
@@ -6050,7 +6538,10 @@ async function serveBookingAsset(request, env, slug, rest, url) {
     const company = await publicBookingCompany(env, slug);
     const companyName = company ? publicCompanyName(company) : "";
     const brand = await renderedBrand(env, company);
-    return new Response(bookPageHtml(companyName, brand ? brandChrome(brand).header : company && company.theme_color), { status: 200, headers: securityHeaders("text/html; charset=utf-8", "no-store") });
+    const mapsOn = !!(company && mapsBrowserKey(env));
+    // The browser key is referrer-restricted, so with maps on the page sends its origin (only) to Google.
+    const headers = mapsOn ? securityHeaders("text/html; charset=utf-8", "no-store", { "referrer-policy": "strict-origin-when-cross-origin" }, CSP_BOOK_MAPS) : securityHeaders("text/html; charset=utf-8", "no-store");
+    return new Response(bookPageHtml(companyName, brand ? brandChrome(brand).header : company && company.theme_color, mapsOn), { status: 200, headers });
   }
   if (rest === "/theme.css") {
     const company = await publicBookingCompany(env, slug);
@@ -6090,6 +6581,8 @@ async function serveShell(request, env) {
   }
   const file = FILES[path] || (!path.includes(".") ? FILES["/index.html"] : void 0);
   if (!file) return new Response("Not found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8", "no-store") });
+  // The owner/driver app shell always keeps the strict CSP and no-referrer, browser key or not: it never
+  // loads maps.googleapis.com (address suggestions go through the signed-in /api/places/* proxy).
   return new Response(file.body, { status: 200, headers: securityHeaders(file.type, file.cache) });
 }
 __name(serveShell, "serveShell");
