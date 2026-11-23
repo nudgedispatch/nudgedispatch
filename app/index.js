@@ -1474,7 +1474,7 @@ async function publicBookingCompany(env, slug) {
   if (typeof slug !== "string" || !BOOKING_SLUG_RE.test(slug)) return null;
   const row = await env.DB.prepare(
     `SELECT c.id, c.status, c.name, c.booking_slug, c.created_at, c.trial_status, c.trial_started_at, c.trial_ride_limit,
-            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.theme_color, s.brand_json, s.phone AS contact_phone, s.email AS contact_email
+            c.trial_days, c.trial_ended_at, c.trial_end_reason, c.stripe_customer_id, c.stripe_subscription_id, c.billing_status, c.billing_past_due_at, c.billing_paid_through, c.billing_last_paid_at, c.billing_event_at, c.billing_updated_at, s.business_name, s.logo_data_url, s.theme_color, s.brand_json, s.website, s.phone AS contact_phone, s.email AS contact_email
      FROM companies c
      LEFT JOIN invoice_settings s ON s.company_id = c.id
      WHERE c.booking_slug = ?`
@@ -1775,7 +1775,7 @@ async function getPublicBook(request, env, slug) {
   const company = await publicBookingCompany(env, slug);
   if (!company) return fail(404, "Booking page not found.");
   if (publicBillingLocked(company)) {
-    return json({ ok: true, open: false, companyName: publicCompanyName(company), logoDataUrl: company.logo_data_url || "", themeColor: (company.theme_color || ""), theme: themeVars(company.theme_color || ""), quotes: null, closed: publicPausedView(company) });
+    return json({ ok: true, open: false, companyName: publicCompanyName(company), logoDataUrl: company.logo_data_url || "", themeColor: (company.theme_color || ""), theme: themeVars(company.theme_color || ""), website: publicWebsiteUrl(company.website), quotes: null, closed: publicPausedView(company) });
   }
   const trial = await companyTrial(env, company.id, company);
   const settings = await loadBookingSettings(env, company.id);
@@ -1785,6 +1785,7 @@ async function getPublicBook(request, env, slug) {
       open: false,
       companyName: publicCompanyName(company),
       logoDataUrl: company.logo_data_url || "", themeColor: (company.theme_color || ""), theme: themeVars(company.theme_color || ""),
+      website: publicWebsiteUrl(company.website),
       quotes: null,
       closed: publicClosedView(company)
     });
@@ -1794,6 +1795,7 @@ async function getPublicBook(request, env, slug) {
     open: true,
     companyName: publicCompanyName(company),
     logoDataUrl: company.logo_data_url || "", themeColor: (company.theme_color || ""), theme: themeVars(company.theme_color || ""),
+    website: publicWebsiteUrl(company.website),
     quotes: await publicQuoteInfo(env, company.id, settings),
     airports: publicAirportInfo(settings.airports),
     capacities: settings.capacities,
@@ -5892,6 +5894,7 @@ import { usCanadaE164, onMyWayMessage, arrivedMessage, sendBlandSms, textingProb
 import { meetingPointForArrived } from "./progress-nav.js";
 import { readSchedule, parseDayList, matchDate, pendingOccurrences, describeSchedule, monthEndNote, todayInZone, addDays, shortDate, MAX_LOOKAHEAD_DAYS } from "./schedules.js";
 import { bookingShortName, applyBookingPageHtml } from "./booking-shell.js";
+import { publicWebsiteUrl } from "./public-website.js";
 import { isListedPlatformAdmin } from "./platform-admin.js";
 import { BOOKING_SLUG_RE, BOOKING_RESERVED, slugBase as slugBaseFromName, slugProblem, normalizeSlug } from "./slug.js";
 import { normalizeThemeHex, themeVars, themeCss } from "./theme.js";

@@ -130,6 +130,7 @@ body.bookpage .logo { width: 34px; height: 34px; border-radius: 8px; object-fit:
 body.bookpage .brand { flex: 1; min-width: 0; color: var(--teal); font-weight: 700; font-size: 19px; letter-spacing: .3px; }
 body.bookpage .brand .coname { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 body.bookpage .brand small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; letter-spacing: 0; }
+body.bookpage .brand .cosite { display: block; margin-top: 1px; color: var(--book-theme-muted, var(--muted)); font-weight: 400; font-size: 12px; letter-spacing: 0; text-decoration: underline; text-underline-offset: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 .bookpage main { padding: 16px 16px 40px; max-width: 720px; margin: 0 auto; }
 .bookpage h1 { font-size: 22px; margin: 4px 0 12px; color: var(--teal-2); }
 .bookpage .two { display: flex; gap: 10px; }

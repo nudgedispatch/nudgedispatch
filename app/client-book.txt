@@ -25,6 +25,29 @@
     if (first.length >= 3 && first.length <= 12) return first;
     return text.slice(0, 12).trim();
   }
+  function setCompanyWebsite(raw) {
+    const a = $("#coSite");
+    if (!a) return;
+    let href = "";
+    try {
+      const url = new URL(String(raw || "").trim());
+      if ((url.protocol === "http:" || url.protocol === "https:") && url.hostname) href = url.href;
+    } catch {}
+    if (!href) {
+      a.classList.add("hidden");
+      a.removeAttribute("href");
+      a.textContent = "";
+      return;
+    }
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = urlHostname(href) || "Visit website";
+    a.classList.remove("hidden");
+  }
+  function urlHostname(href) {
+    try { return new URL(href).hostname.replace(/\.$/, "") || ""; } catch { return ""; }
+  }
   function isStandalone() {
     return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
   }
@@ -688,6 +711,7 @@
     $("#coName").textContent = companyName;
     document.title = companyName;
     if (result.data.logoDataUrl) $("#coLogo").src = result.data.logoDataUrl;
+    setCompanyWebsite(result.data.website);
     const titleEl = document.querySelector('meta[name="apple-mobile-web-app-title"]');
     if (titleEl) titleEl.setAttribute("content", bookingShortName(companyName));
     if (result.data.open === false) { showClosed(result.data.closed); setupInstallPrompt(); return; }

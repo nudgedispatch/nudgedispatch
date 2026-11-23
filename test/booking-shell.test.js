@@ -52,7 +52,7 @@ test("applyBookingPageHtml keeps the default titles when no company name is give
   assert.match(html, /src="\/book\.js\?v=test"/);
 });
 
-test("the booking page includes a CSP-safe install prompt and v5 service worker cache", () => {
+test("the booking page includes a CSP-safe install prompt and v6 service worker cache", () => {
   assert.match(bookHtml, /id="installBar"/);
   assert.match(bookHtml, /id="installApp"/);
   assert.match(bookHtml, />Install app</);
@@ -64,5 +64,15 @@ test("the booking page includes a CSP-safe install prompt and v5 service worker 
   assert.match(bookJs, /nudge-book-install-dismissed/);
   assert.match(bookJs, /setupInstallPrompt/);
   assert.match(bookJs, /document\.title = companyName/);
-  assert.match(bookSw, /nudge-book-shell-v5/);
+  assert.match(bookSw, /nudge-book-shell-v6/);
+});
+
+test("the booking page header has a hidden website link with a safe target", () => {
+  assert.match(bookHtml, /id="coSite"/);
+  assert.match(bookHtml, /id="coSite"[^>]*target="_blank"/);
+  assert.match(bookHtml, /id="coSite"[^>]*rel="noopener noreferrer"/);
+  assert.match(bookJs, /function setCompanyWebsite/);
+  assert.match(bookJs, /setCompanyWebsite\(result\.data\.website\)/);
+  assert.match(bookJs, /rel = "noopener noreferrer"/);
+  assert.match(bookJs, /target = "_blank"/);
 });
