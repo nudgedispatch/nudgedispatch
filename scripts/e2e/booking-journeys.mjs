@@ -25,7 +25,7 @@ function check(name, cond, detail = "") {
 
 async function migrate(persistTo) {
   await new Promise((resolve, reject) => {
-    const child = spawn("npx", ["wrangler", "d1", "migrations", "apply", "nudge-app-local", "--local", "--persist-to", persistTo], { cwd: root, env: { ...process.env, CI: "1" }, stdio: "ignore" });
+    const child = spawn("npx", ["wrangler", "d1", "migrations", "apply", "nudge-app-local", "--local", "--persist-to", persistTo, "--config", "wrangler.toml"], { cwd: root, env: { ...process.env, CI: "1" }, stdio: "ignore" });
     child.on("error", reject);
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("migrations exited " + code))));
   });
@@ -211,6 +211,41 @@ try {
     const review2 = await page.locator("#reviewTable").textContent();
     check(`${tag} drop-off review shows Curbside`, /Drop-off at terminalCurbside/.test(review2), review2);
     await shot("review-airport-dropoff");
+
+    // 8a. Same-day and different-date round trips, through review only (no submit).
+    await open(suvOnly, "?airport=pickup&code=ATL&spot=domestic-south&dropoff=" + encodeURIComponent("100 Main St, Alpharetta"));
+    check(`${tag} return fields hidden on one-way`, !(await vis("#returnWhen")));
+    await page.selectOption("[name=tripType]", "round-trip");
+    check(`${tag} return fields shown on round trip`, await vis("#returnWhen"));
+    await page.selectOption("[name=time]", "09:00");
+    const sameDayDate = await val("[name=date]");
+    await page.fill("[name=returnDate]", sameDayDate);
+    await page.selectOption("[name=returnTime]", "17:00");
+    const sameDayQuote = await quoteText();
+    check(`${tag} same-day round trip still shows one estimate`, /\$\d/.test(sameDayQuote), sameDayQuote);
+    await page.click("#toContact");
+    await page.fill("[name=name]", "Pat Rider");
+    await page.fill("[name=phone]", "404-555-0123");
+    await page.click("#toReview");
+    const sameReview = await page.locator("#reviewTable").textContent();
+    check(`${tag} same-day review lists Round trip, return date, and return time`, /Round trip/.test(sameReview) && /Return date/.test(sameReview) && /Return time/.test(sameReview) && sameReview.includes(sameDayDate), sameReview);
+    await shot("review-round-trip-same-day");
+
+    await open(suvOnly, "?airport=pickup&code=ATL&spot=domestic-south&dropoff=" + encodeURIComponent("100 Main St, Alpharetta"));
+    await page.selectOption("[name=tripType]", "round-trip");
+    await page.selectOption("[name=time]", "09:00");
+    const splitOut = await val("[name=date]");
+    const [sy, sm, sd] = splitOut.split("-").map(Number);
+    const splitBack = new Date(Date.UTC(sy, sm - 1, sd + 1)).toISOString().slice(0, 10);
+    await page.fill("[name=returnDate]", splitBack);
+    await page.selectOption("[name=returnTime]", "17:00");
+    await page.click("#toContact");
+    await page.fill("[name=name]", "Pat Rider");
+    await page.fill("[name=phone]", "404-555-0123");
+    await page.click("#toReview");
+    const splitReview = await page.locator("#reviewTable").textContent();
+    check(`${tag} different-date review lists both days`, /Round trip/.test(splitReview) && splitReview.includes(splitOut) && splitReview.includes(splitBack) && /Return date/.test(splitReview) && /Return time/.test(splitReview), splitReview);
+    await shot("review-round-trip-different-date");
 
     // 8. Desktop-style autofill: both address boxes get the same saved street (Jesse's live page).
     await open(suvOnly);

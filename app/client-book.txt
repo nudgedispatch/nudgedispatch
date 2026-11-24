@@ -128,19 +128,23 @@
     return ((h % 12) || 12) + ":" + String(m).padStart(2, "0") + " " + (h < 12 ? "AM" : "PM");
   }
   function fillTimes() {
-    const sel = form.time;
-    for (let minutes = 0; minutes < 1440; minutes += 15) {
-      const h = Math.floor(minutes / 60);
-      const m = minutes % 60;
-      const option = document.createElement("option");
-      option.value = String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
-      option.textContent = timeLabel(h, m);
-      sel.appendChild(option);
-    }
+    [form.time, form.returnTime].forEach((sel) => {
+      if (!sel || sel.options.length > 1) return;
+      for (let minutes = 0; minutes < 1440; minutes += 15) {
+        const h = Math.floor(minutes / 60);
+        const m = minutes % 60;
+        const option = document.createElement("option");
+        option.value = String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+        option.textContent = timeLabel(h, m);
+        sel.appendChild(option);
+      }
+    });
   }
   function setDateDefaults() {
     form.date.value = tomorrowIso();
     form.date.min = todayIso();
+    form.returnDate.min = form.date.value || todayIso();
+    if (!form.returnDate.value) form.returnDate.value = form.date.value;
   }
   function showErr(message) {
     const err = $("#err");
@@ -450,8 +454,14 @@
   }
   function syncTripFields() {
     const hourly = form.tripType.value === "hourly";
+    const round = form.tripType.value === "round-trip";
     $("#hoursWrap").classList.toggle("hidden", !hourly);
+    $("#returnWhen").classList.toggle("hidden", !round);
     $("#dropLabel").textContent = hourly ? "Drop-off address (optional for hourly)" : "Drop-off address";
+    if (round) {
+      form.returnDate.min = form.date.value || todayIso();
+      if (!form.returnDate.value) form.returnDate.value = form.date.value;
+    }
     fillHours();
     syncAirportFields();
   }
@@ -767,6 +777,11 @@
     if (st.side !== "pickup" && sideText("pickup").length < 3) return "Enter the pickup address.";
     if (!form.date.value) return "Enter the pickup date.";
     if (!form.time.value) return "Choose the pickup time.";
+    if (form.tripType.value === "round-trip") {
+      if (form.returnDate.value && !form.returnTime.value) return "Choose the return time.";
+      if (form.returnTime.value && !form.returnDate.value) return "Enter the return date.";
+      if (form.returnDate.value && form.returnDate.value < form.date.value) return "Choose a return date on or after the pickup date.";
+    }
     const n = Number(form.passengers.value || 1);
     if (!Number.isInteger(n) || n < 1 || n > 14) return "Enter passengers from 1 to 14.";
     if (st.side === "dropoff" && !spotValue) return "Choose the " + st.airport.code + " terminal for drop-off.";
@@ -788,6 +803,8 @@
     if (st.side === "pickup" && !$("#meetWrap").classList.contains("hidden")) rows.push(["Meeting point", form.meet.options[form.meet.selectedIndex] ? form.meet.options[form.meet.selectedIndex].textContent : ""]);
     rows.push([st.side === "pickup" ? "Arrival date" : "Pickup date", form.date.value]);
     rows.push(["Pickup time", form.time.options[form.time.selectedIndex] ? form.time.options[form.time.selectedIndex].textContent : ""]);
+    if (form.tripType.value === "round-trip" && form.returnDate.value) rows.push(["Return date", form.returnDate.value]);
+    if (form.tripType.value === "round-trip" && form.returnTime.value) rows.push(["Return time", form.returnTime.options[form.returnTime.selectedIndex] ? form.returnTime.options[form.returnTime.selectedIndex].textContent : form.returnTime.value]);
     if (form.flight.value.trim()) rows.push(["Flight", form.flight.value.trim().toUpperCase()]);
     rows.push(["Passengers", String(passengers())]);
     if (form.luggage.value) rows.push(["Luggage", form.luggage.value]);
@@ -877,6 +894,10 @@
   form.meet.addEventListener("change", () => { form.meet.dataset.chosen = form.meet.value; syncAirportFields(); });
   form.style.addEventListener("change", () => { form.style.dataset.chosen = form.style.value; syncAirportFields(); });
   form.tripType.addEventListener("change", () => { syncTripFields(); scheduleQuote(0); });
+  form.date.addEventListener("change", () => {
+    form.returnDate.min = form.date.value || todayIso();
+    if (form.tripType.value === "round-trip" && form.returnDate.value && form.returnDate.value < form.date.value) form.returnDate.value = form.date.value;
+  });
   form.vehicle.addEventListener("change", () => { vehicleChosen = true; fillHours(); syncAirportFields(); scheduleQuote(0); });
   form.hours.addEventListener("change", () => scheduleQuote(0));
   form.passengers.addEventListener("input", () => { syncVehicles(); syncAirportFields(); scheduleQuote(); });
@@ -911,6 +932,8 @@
         email: form.email.value,
         date: form.date.value,
         time: form.time.value,
+        returnDate: form.tripType.value === "round-trip" ? form.returnDate.value : "",
+        returnTime: form.tripType.value === "round-trip" ? form.returnTime.value : "",
         pickup: form.pickup.value,
         dropoff: form.dropoff.value,
         passengers: passengers(),

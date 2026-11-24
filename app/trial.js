@@ -9,9 +9,14 @@
 //  - Cancel stays available but not prominent: a small link in More > Your plan, with an exit survey.
 //    Cancelling before the 15th ride means no charge, ever.
 // A "ride" is a ride with status 'completed' for the company. Requests, drafts, declined and cancelled
-// rides never count. Pure functions only, so they can be tested without a database.
+// rides never count. A split different-date round trip counts once (see TRIAL_SPLIT_ROUND_TRIP_COUNTS_AS).
+// Pure functions only, so they can be tested without a database.
 
 export const TRIAL_RIDE_LIMIT = 15;
+// A split different-date round trip is one customer booking, so it counts as 1
+// completed trip toward this limit (same as a same-day round trip, which stays one row).
+// Set to 2 to count each leg separately. completedRides() in index.js honors this.
+export const TRIAL_SPLIT_ROUND_TRIP_COUNTS_AS = 1;
 // Time expiry: 0 = none (Jesse, Nov 17, 2026). Set a number of days here to bring a time limit back.
 export const TRIAL_TIME_LIMIT_DAYS = 0;
 export const TRIAL_DAYS = TRIAL_TIME_LIMIT_DAYS; // legacy name, kept for the admin API
@@ -354,3 +359,25 @@ export function moveBackToTrial(company, completed, now = Date.now()) {
   };
   return { next, fresh: !paidBefore, detachedSubscription: subCanceled && !!sub };
 }
+
+// SQL for completedRides(). One `?` placeholder: company_id.
+export function trialCompletedRideSql() {
+  if (TRIAL_SPLIT_ROUND_TRIP_COUNTS_AS === 2) {
+    return "SELECT COUNT(*) AS n FROM rides WHERE company_id = ? AND status = 'completed'";
+  }
+  return `SELECT COUNT(*) AS n FROM (
+    SELECT COALESCE(NULLIF(group_id, ''), id) AS trip_key
+    FROM rides
+    WHERE company_id = ? AND status = 'completed'
+    GROUP BY trip_key
+  ) AS trip_counts`;
+}
+
+// rows: { id, group_id, status } (leg is ignored; a group counts once if any leg is completed).
+export function countCompletedForTrial(rows) {
+  const completed = (rows || []).filter((r) => r && r.status === "completed");
+  if (TRIAL_SPLIT_ROUND_TRIP_COUNTS_AS === 2) return completed.length;
+  const keys = new Set(completed.map((r) => (r.group_id ? r.group_id : r.id)));
+  return keys.size;
+}
+

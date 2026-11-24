@@ -1314,6 +1314,11 @@ function rideJson(row, role = "owner") {
     approval: row.approval || "none",
     tripType: row.trip_type || "",
     tripTypeLabel: TRIP_LABELS[row.trip_type] || "",
+    returnDate: row.return_date || "",
+    returnTime: row.return_time || "",
+    groupId: row.group_id || "",
+    leg: row.leg ?? null,
+    isSplitLeg: isSplitLeg(row),
     vehicleName: row.vehicle_name || "",
     hours: row.hours ?? null,
     airport: parseStoredAirport(row.airport_json),
@@ -1494,7 +1499,8 @@ var TRIAL_COLS = "c.id, c.created_at, c.trial_status, c.trial_started_at, c.tria
 var TRIAL_CONVERT_RETRY_MS = 5 * 60 * 1000;
 async function completedRides(env, companyId) {
   // A "ride" = status 'completed'. Requests, drafts, declined and cancelled rides never count.
-  return count(env, "SELECT COUNT(*) AS n FROM rides WHERE company_id = ? AND status = 'completed'", companyId);
+  // Split different-date round trips count once unless TRIAL_SPLIT_ROUND_TRIP_COUNTS_AS is 2.
+  return count(env, trialCompletedRideSql(), companyId);
 }
 __name(completedRides, "completedRides");
 async function companyTrial(env, companyId, row) {
@@ -1819,6 +1825,47 @@ async function readPublicJson(request) {
   }
 }
 __name(readPublicJson, "readPublicJson");
+
+function bookingQuoteJson(quoted, now) {
+  return quoted ? JSON.stringify({
+    v: 1, basis: quoted.basis, label: quoted.label, vehicle: quoted.vehicle,
+    lines: quoted.lines, notes: quoted.notes, miles: quoted.miles ?? null, minutes: quoted.minutes ?? null, at: now,
+    oneWayCents: quoted.oneWayCents ?? null, roundTripFactor: quoted.roundTripFactor ?? null
+  }) : null;
+}
+__name(bookingQuoteJson, "bookingQuoteJson");
+function quoteSplitOpts(row) {
+  try {
+    const q = row && row.quote_json ? JSON.parse(row.quote_json) : {};
+    return { oneWayCents: q.oneWayCents, factor: q.roundTripFactor };
+  } catch {
+    return {};
+  }
+}
+__name(quoteSplitOpts, "quoteSplitOpts");
+function readReturnWhen(tripType, date, body) {
+  const returnDate = str(body.returnDate, 10);
+  const returnTime = str(body.returnTime, 5);
+  if (tripType !== "round-trip") return { returnDate: "", returnTime: "" };
+  if (returnDate && !validDate(returnDate)) return { error: "Enter a valid return date." };
+  if (returnTime && !validTime(returnTime)) return { error: "Enter a valid return time." };
+  if (returnDate && !returnTime) return { error: "Enter the return time." };
+  if (returnTime && !returnDate) return { error: "Enter the return date." };
+  if (returnDate && date && returnDate < date) return { error: "Choose a return date on or after the pickup date." };
+  return { returnDate, returnTime };
+}
+__name(readReturnWhen, "readReturnWhen");
+function insertRequestedRide(env, row) {
+  return env.DB.prepare(
+    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage, stops_json, return_date, return_time, group_id, leg)
+     VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    row.id, row.companyId, row.clientId, row.date, row.time, row.pickup, row.dropoff, row.passengers, row.flight, row.notes, row.now, row.now,
+    row.tripType, row.vehicleName, row.hours, row.quoteCents, row.quoteJson, row.airportJson, row.luggage, row.stopsJson,
+    row.returnDate || "", row.returnTime || "", row.groupId || "", row.leg ?? null
+  );
+}
+__name(insertRequestedRide, "insertRequestedRide");
 async function postPublicBook(request, env, slug) {
   const company = await publicBookingCompany(env, slug);
   if (!company) return fail(404, "Booking page not found.");
@@ -1881,6 +1928,8 @@ async function postPublicBook(request, env, slug) {
   if (!Number.isInteger(passengers) || passengers < 1 || passengers > 14) return fail(400, "Enter passengers from 1 to 14.");
   const trip = readTrip({ ...body, pickup, dropoff, vehicle: vehicleRow ? vehicleRow.id : "" }, sheet);
   if (tripTypeIn === "hourly" && trip.hours === null) return fail(400, "Choose how many hours.");
+  const ret = readReturnWhen(trip.tripType, date, body);
+  if (ret.error) return fail(400, ret.error);
   // Server-side estimate only. Any price fields in the request body are ignored.
   // A trip with stops gets no automatic estimate: the operator prices it on approval.
   const q = sheet && !stops.length ? await quoteTrip(env, request, company.id, sheet, trip) : null;
@@ -1898,19 +1947,40 @@ async function postPublicBook(request, env, slug) {
     clientId = crypto.randomUUID();
     await env.DB.prepare("INSERT INTO clients (id, company_id, name, phone, email, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(clientId, company.id, name, phone, email, "", now, now).run();
   }
+  const split = shouldSplitRoundTrip(trip.tripType, date, ret.returnDate, ret.returnTime);
+  const sameDayReturn = !!(trip.tripType === "round-trip" && ret.returnDate && ret.returnTime && !split);
+  const fares = quoted ? splitRoundTripFareCents(quoted.totalCents, { oneWayCents: quoted.oneWayCents, factor: quoted.roundTripFactor }) : { outboundCents: 0, returnCents: 0 };
   const rideId = crypto.randomUUID();
-  await env.DB.prepare(
-    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage, stops_json)
-     VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, 'scheduled', 'unpaid', ?, ?, 'requested', 'booking-page', ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    rideId, company.id, clientId, date, time, pickup, dropoff, passengers, flight, notes, now, now,
-    trip.tripType, trip.vehicleName, trip.tripType === "hourly" ? trip.hours : null,
-    quoted ? quoted.totalCents : null,
-    quoted ? JSON.stringify({ v: 1, basis: quoted.basis, label: quoted.label, vehicle: quoted.vehicle, lines: quoted.lines, notes: quoted.notes, miles: quoted.miles ?? null, minutes: quoted.minutes ?? null, at: now }) : null,
-    placed.airport ? JSON.stringify(placed.airport) : null,
-    luggageRaw,
-    stopsToStored(stops)
-  ).run();
+  const returnId = split ? crypto.randomUUID() : "";
+  const groupId = split ? roundTripGroupId(rideId) : "";
+  const qJson = bookingQuoteJson(quoted, now);
+  const base = {
+    companyId: company.id, clientId, passengers, flight, notes, now,
+    tripType: trip.tripType, vehicleName: trip.vehicleName, hours: trip.tripType === "hourly" ? trip.hours : null,
+    quoteJson: qJson, luggage: luggageRaw
+  };
+  const statements = [
+    insertRequestedRide(env, {
+      ...base, id: rideId, date, time, pickup, dropoff,
+      quoteCents: quoted ? (split ? fares.outboundCents : quoted.totalCents) : null,
+      airportJson: placed.airport ? JSON.stringify(placed.airport) : null,
+      stopsJson: stopsToStored(stops),
+      returnDate: sameDayReturn ? ret.returnDate : "",
+      returnTime: sameDayReturn ? ret.returnTime : "",
+      groupId, leg: split ? 1 : null
+    })
+  ];
+  if (split) {
+    const backAirport = flipAirport(placed.airport);
+    statements.push(insertRequestedRide(env, {
+      ...base, id: returnId, date: ret.returnDate, time: ret.returnTime, pickup: dropoff, dropoff: pickup,
+      quoteCents: quoted ? fares.returnCents : null,
+      airportJson: backAirport ? JSON.stringify(backAirport) : null,
+      stopsJson: stopsToStored([]),
+      returnDate: "", returnTime: "", groupId, leg: 2
+    }));
+  }
+  await env.DB.batch(statements);
   await autoRestoreClient(env, company.id, clientId, rideId, "", "booking-page");
   const view = quoted ? quoteView(quoted, publicCompanyName(company)) : null;
   return json({
@@ -1945,8 +2015,40 @@ async function decideBooking(request, env, id, decision) {
     finalCents = parseFare(fareRaw);
     if (finalCents === null) return fail(400, "Enter the final price in dollars, such as 125 or 125.50.");
     const driverId = user.accountKind === "individual" ? user.userId : existing.driver_user_id;
+    const splitOnApprove = !isSplitLeg(existing) && shouldSplitRoundTrip(existing.trip_type, existing.pickup_date, existing.return_date, existing.return_time);
+    if (splitOnApprove) {
+      const fares = splitRoundTripFareCents(finalCents, quoteSplitOpts(existing));
+      const returnId = crypto.randomUUID();
+      const groupId = roundTripGroupId(existing.id);
+      const backAirport = flipAirport(parseStoredAirport(existing.airport_json));
+      try {
+        await env.DB.batch([
+          env.DB.prepare("UPDATE rides SET approval = 'approved', status = 'scheduled', driver_user_id = ?, fare_cents = ?, return_date = '', return_time = '', group_id = ?, leg = 1, updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'").bind(driverId, fares.outboundCents, groupId, now, user.companyId, id),
+          env.DB.prepare(
+            `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, approval, source, trip_type, vehicle_name, hours, quote_cents, quote_json, airport_json, luggage, stops_json, return_date, return_time, group_id, leg)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'unpaid', ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, 2)`
+          ).bind(
+            returnId, user.companyId, existing.client_id, driverId, existing.return_date, existing.return_time, existing.dropoff, existing.pickup,
+            existing.passengers, existing.flight, fares.returnCents, existing.notes, now, now, existing.source || "booking-page",
+            existing.trip_type, existing.vehicle_name, existing.hours, existing.quote_cents, existing.quote_json,
+            backAirport ? JSON.stringify(backAirport) : null, existing.luggage, stopsToStored([]), groupId
+          )
+        ]);
+      } catch (error) {
+        if (isConstraintError(error)) return fail(409, "This request has already been decided.");
+        throw error;
+      }
+      result = { meta: { changes: 1 } };
+      queueRideAlert(request, env, user, id, driverId, "assigned");
+      queueRideAlert(request, env, user, returnId, driverId, "assigned");
+      const row = await ownedRide(env, user, id);
+      const back = await ownedRide(env, user, returnId);
+      return json({ ok: true, ride: row ? rideJson(row, user.role) : null, returnRide: back ? rideJson(back, user.role) : null, groupId, ids: [id, returnId] });
+    }
     result = await env.DB.prepare("UPDATE rides SET approval = 'approved', status = 'scheduled', driver_user_id = ?, fare_cents = ?, updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'").bind(driverId, finalCents, now, user.companyId, id).run();
     if (result.meta.changes) queueRideAlert(request, env, user, id, driverId, "assigned");
+  } else if (existing.group_id) {
+    result = await env.DB.prepare("UPDATE rides SET approval = 'declined', status = 'cancelled', updated_at = ? WHERE company_id = ? AND group_id = ? AND approval = 'requested'").bind(now, user.companyId, existing.group_id).run();
   } else {
     result = await env.DB.prepare("UPDATE rides SET approval = 'declined', status = 'cancelled', updated_at = ? WHERE company_id = ? AND id = ? AND approval = 'requested'").bind(now, user.companyId, id).run();
   }
@@ -4102,7 +4204,7 @@ __name(restoreClient, "restoreClient");
 var RIDE_SELECT = `SELECT r.id, r.client_id, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, r.pickup_date, r.pickup_time, r.pickup, r.dropoff,
   r.passengers, r.flight, r.fare_cents, r.notes, r.status, r.payment, r.progress, r.en_route_at, r.arrived_at, r.picked_up_at, r.completed_at,
   r.driver_user_id, drv.name AS assigned_driver_name, drv.vehicle AS assigned_driver_vehicle, drv.plate AS assigned_driver_plate, r.created_at, r.updated_at, r.approval, r.source, r.trip_type, r.vehicle_name, r.hours, r.quote_cents, r.quote_json,
-  r.airport_json, r.luggage, r.stops_json,
+  r.airport_json, r.luggage, r.stops_json, r.return_date, r.return_time, r.group_id, r.leg,
   (SELECT fa.message FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert,
   (SELECT fa.kind FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_kind,
   (SELECT fa.created_at FROM flight_alerts fa WHERE fa.company_id = r.company_id AND fa.ride_id = r.id ORDER BY fa.created_at DESC LIMIT 1) AS flight_alert_at
@@ -4141,7 +4243,10 @@ function rideFields(body) {
   if (fare === null) return { error: "Enter the fare in dollars, such as 125 or 125.50." };
   const stopsIn = readStops(body.stops);
   if (stopsIn.error) return { error: stopsIn.error };
-  return { error: "", fields: { client_id: clientId, pickup_date: date, pickup_time: time, pickup, dropoff, passengers, flight, fare_cents: fare, notes, stops_json: stopsToStored(stopsIn.stops) } };
+  const tripType = TRIP_TYPES.includes(body.tripType) ? body.tripType : "";
+  const ret = readReturnWhen(tripType, date, body);
+  if (ret.error) return { error: ret.error };
+  return { error: "", fields: { client_id: clientId, pickup_date: date, pickup_time: time, pickup, dropoff, passengers, flight, fare_cents: fare, notes, stops_json: stopsToStored(stopsIn.stops), trip_type: tripType, return_date: ret.returnDate, return_time: ret.returnTime } };
 }
 __name(rideFields, "rideFields");
 async function createRide(request, env) {
@@ -4160,10 +4265,26 @@ async function createRide(request, env) {
   const now = Date.now();
   const id = crypto.randomUUID();
   const f = parsed.fields;
+  const driverId = user.accountKind === "individual" ? user.userId : null;
+  const split = shouldSplitRoundTrip(f.trip_type, f.pickup_date, f.return_date, f.return_time);
+  const sameDayReturn = !!(f.trip_type === "round-trip" && f.return_date && f.return_time && !split);
+  const cols = "id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, source, trip_type, stops_json, return_date, return_time, group_id, leg";
+  if (split) {
+    const fares = splitRoundTripFareCents(f.fare_cents);
+    const returnId = crypto.randomUUID();
+    const groupId = roundTripGroupId(id);
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO rides (${cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'unpaid', ?, ?, 'owner', ?, ?, '', '', ?, 1)`).bind(id, user.companyId, f.client_id, driverId, f.pickup_date, f.pickup_time, f.pickup, f.dropoff, f.passengers, f.flight, fares.outboundCents, f.notes, now, now, f.trip_type, f.stops_json, groupId),
+      env.DB.prepare(`INSERT INTO rides (${cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'unpaid', ?, ?, 'owner', ?, ?, '', '', ?, 2)`).bind(returnId, user.companyId, f.client_id, driverId, f.return_date, f.return_time, f.dropoff, f.pickup, f.passengers, f.flight, fares.returnCents, f.notes, now, now, f.trip_type, stopsToStored([]), groupId)
+    ]);
+    await autoRestoreClient(env, user.companyId, f.client_id, id, user.userId, "owner");
+    const row = await ownedRide(env, user, id);
+    const back = await ownedRide(env, user, returnId);
+    return json({ ok: true, ride: row ? rideJson(row, user.role) : null, returnRide: back ? rideJson(back, user.role) : null, groupId, ids: [id, returnId] }, 201);
+  }
   await env.DB.prepare(
-    `INSERT INTO rides (id, company_id, client_id, driver_user_id, pickup_date, pickup_time, pickup, dropoff, passengers, flight, fare_cents, notes, status, payment, created_at, updated_at, stops_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'unpaid', ?, ?, ?)`
-  ).bind(id, user.companyId, f.client_id, user.accountKind === "individual" ? user.userId : null, f.pickup_date, f.pickup_time, f.pickup, f.dropoff, f.passengers, f.flight, f.fare_cents, f.notes, now, now, f.stops_json).run();
+    `INSERT INTO rides (${cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'unpaid', ?, ?, 'owner', ?, ?, ?, ?, '', NULL)`
+  ).bind(id, user.companyId, f.client_id, driverId, f.pickup_date, f.pickup_time, f.pickup, f.dropoff, f.passengers, f.flight, f.fare_cents, f.notes, now, now, f.trip_type, f.stops_json, sameDayReturn ? f.return_date : "", sameDayReturn ? f.return_time : "").run();
   await autoRestoreClient(env, user.companyId, f.client_id, id, user.userId, "owner");
   const row = await ownedRide(env, user, id);
   return json({ ok: true, ride: row ? rideJson(row, user.role) : null }, 201);
@@ -4712,8 +4833,11 @@ function invoiceText(settings, ride, number, issuedOn) {
     ...stopLines(parseStoredStops(ride.stops_json)),
     `Drop-off: ${ride.dropoff}`
   ];
+  if (ride.trip_type === "round-trip" && ride.leg) trip.unshift(`Round trip leg ${ride.leg} of 2`);
+  else if (ride.trip_type === "round-trip") trip.unshift("Round trip");
   if (ride.flight) trip.push(`Flight: ${ride.flight}`);
   trip.push(`Passengers: ${ride.passengers}`);
+  if (ride.return_date) trip.push(`Return: ${longDate(ride.return_date)}${ride.return_time ? ", " + time12(ride.return_time) : ""}`);
   const clock = rideSchedule({
     pickupDate: ride.pickup_date,
     pickupTime: ride.pickup_time,
@@ -4982,7 +5106,10 @@ async function createInvoice(request, env, rideId) {
     ...ride.stops_json ? { stops: parseStoredStops(ride.stops_json) } : {},
     passengers: ride.passengers,
     flight: ride.flight,
-    fareCents: ride.fare_cents
+    fareCents: ride.fare_cents,
+    tripType: ride.trip_type || "",
+    ...ride.return_date ? { returnDate: ride.return_date, returnTime: ride.return_time || "" } : {},
+    ...ride.leg ? { groupId: ride.group_id || "", leg: ride.leg } : {}
   };
   const id = crypto.randomUUID();
   const now = Date.now();
@@ -5886,7 +6013,8 @@ import bookQrSwJs from "./client-book-qr-sw.txt";
 import bookQrCss from "./book-qr.css";
 import { bookingUrlFor, qrSvg, qrPng, qrManifest, qrPageHtml, qrUnavailableHtml } from "./booking-qr.js";
 import { validateRateSheet, sheetForEditor, publicSheetInfo, computeQuote, needsDistance, formatCents, TRIP_TYPES, TRIP_LABELS } from "./quote-engine.js";
-import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, TRIAL_RIDE_LIMIT, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, TRIAL_STRIPE_HORIZON_DAYS, CANCEL_REASONS, canCancelTrial, canCancelPaid, trialCancelColumns, cancelFeedback, stripeTrialEnd, isAutoTrial, moveBackToTrial } from "./trial.js";
+import { trialState, trialBanner, trialBlockedMessage, applyTrialChange, trialJson, TRIAL_RIDE_LIMIT, TRIAL_TIME_LIMIT_DAYS, TRIAL_CANCEL_MODE, TRIAL_STRIPE_HORIZON_DAYS, CANCEL_REASONS, canCancelTrial, canCancelPaid, trialCancelColumns, cancelFeedback, stripeTrialEnd, isAutoTrial, moveBackToTrial, trialCompletedRideSql } from "./trial.js";
+import { shouldSplitRoundTrip, splitRoundTripFareCents, roundTripGroupId, flipAirport, isSplitLeg } from "./round-trip-legs.js";
 import { billingAccess, billingBanner, lockedView, lockedMessage } from "./access.js";
 import { normPlan, planOf, kindForPlan, smsAllowed, smsOn, billingJson, payingNow, smsEnableProblem, SMS_NOT_PAYING_NOTE, stripe, stripeKeyProblem, stripeKeyClass, stripeKeyMode, stripeWebhookMode, billingConnection, StripeError, pricesByLookup, pricesWithProducts, smsSetupPromoCode, isCardPaymentMethod, cardOnlyPaymentConfig, findPromotion, couponCoversProduct, smsSetupInvoiceItem, normSetupFee, setupFeeOf, setupFeeFromBody, setupPromoCode, cardSummary, paymentMethodJson, subscriptionPlanItems, smsLookupKeys, reportSmsUsage, LOOKUP, BETA_PROMO_CODE, SMS_METER_EVENT, SMS_PRICE_TEXT, SMS_COMING_SOON, PLAN_LABELS } from "./billing.js";
 import { verifyStripeSignature, HANDLED_EVENTS, subStatusToBilling, refsOf, paidThroughMs, webhookLivemodeDecision } from "./stripe_webhook.js";
