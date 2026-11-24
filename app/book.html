@@ -68,6 +68,7 @@
       <div id="stopsCtl" class="stopsctl"><button class="btn ghost addstop" type="button" id="addStop">+ Add stop</button><span class="fine hidden" id="stopsNote"></span></div>
       <div id="places" class="chips hidden" aria-label="Flat-rate places"></div>
       <div class="two" data-field="when"><label><span id="dateLabel">Pickup date</span><input name="date" type="date" required></label><label><span id="timeLabel">Pickup time</span><select name="time" required><option value="">Select time</option></select></label></div>
+      <div class="two hidden" id="returnWhen" data-field="return"><label><span id="returnDateLabel">Return date</span><input name="returnDate" type="date"></label><label><span id="returnTimeLabel">Return time</span><select name="returnTime"><option value="">Select time</option></select></label></div>
       <p class="fine hidden" id="timeHint">Choose the time you want to be picked up. Your flight number is used only to watch for delays and early arrivals.</p>
       <label id="flightWrap" data-field="flight">Flight number <span id="flightOpt">(optional)</span><input name="flight" id="flight" placeholder="e.g. DL1234" autocapitalize="characters"></label>
       <div class="two" data-field="party"><label>Passengers<input name="passengers" type="number" min="1" max="14" inputmode="numeric" value="1"></label><label>Luggage<input name="luggage" type="number" min="0" max="30" inputmode="numeric" placeholder="0"></label></div>

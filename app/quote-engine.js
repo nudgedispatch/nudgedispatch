@@ -285,6 +285,7 @@ export function computeQuote(sheet, req, route) {
   if (v.seats && Number(req.passengers) > v.seats) notes.push(`${v.name} seats up to ${v.seats}. The operator may suggest a larger vehicle.`);
   let fareCents, basis, label, fareLine;
   let extra = {};
+  let oneWayCents = null;
   if (tripType === "hourly") {
     if (v.hourlyRate === null) return { available: false, reason: "no-hourly", message: `${v.name} isn't offered by the hour. Send the request and the operator will quote it.` };
     const h = Number(req.hours);
@@ -310,6 +311,7 @@ export function computeQuote(sheet, req, route) {
     const flat = findFlatFare(sheet, v.id, req.pickup, req.dropoff);
     if (flat) {
       const p = flat.price;
+      oneWayCents = p.oneWay;
       fareCents = legs ? (p.roundTrip !== null && p.roundTrip !== undefined ? p.roundTrip : Math.round(p.oneWay * sheet.roundTripFactor)) : p.oneWay;
       const where = flat.fare.area ? (flat.dir === "to" ? `${flat.fare.area} to ${flat.fare.place}` : `${flat.fare.place} to ${flat.fare.area}`) : (flat.dir === "to" ? `To ${flat.fare.place}` : `From ${flat.fare.place}`);
       fareLine = `${v.name}, ${flat.fare.area ? where : where.charAt(0).toLowerCase() + where.slice(1)} flat fare (${legs ? "round trip" : "one way"})`;
@@ -321,6 +323,7 @@ export function computeQuote(sheet, req, route) {
       if (route.miles > (sheet.maxMiles || 100)) return { available: false, reason: "too-far", message: "This trip is longer than we estimate online. Send the request and the operator will quote it." };
       const miles = Math.round(route.miles * 10) / 10;
       const oneWay = Math.max((v.base || 0) + Math.round((v.perMile || 0) * miles), v.minimum || 0);
+      oneWayCents = oneWay;
       fareCents = legs ? Math.round(oneWay * sheet.roundTripFactor) : oneWay;
       fareLine = `${v.name}, ${miles} mi` + (v.base ? ` (${fmt(v.base)} + ${fmt(v.perMile || 0)}/mi)` : ` at ${fmt(v.perMile || 0)}/mi`) + (legs ? `, round trip x${sheet.roundTripFactor}` : "");
       if (v.minimum && (v.base || 0) + Math.round((v.perMile || 0) * miles) < v.minimum) notes.push(`${fmt(v.minimum)} trip minimum.`);
@@ -346,7 +349,7 @@ export function computeQuote(sheet, req, route) {
   } else {
     notes.push("Gratuity not included.");
   }
-  return { available: true, totalCents: total, basis, tripType, vehicle: v.name, label, lines, notes, ...extra, ...(tripType === "hourly" ? { hours: Number(req.hours) } : {}) };
+  return { available: true, totalCents: total, basis, tripType, vehicle: v.name, label, lines, notes, ...extra, ...(tripType === "hourly" ? { hours: Number(req.hours) } : {}), ...(tripType === "round-trip" && oneWayCents != null ? { oneWayCents, roundTripFactor: sheet.roundTripFactor } : {}) };
 }
 
 export const formatCents = fmt;

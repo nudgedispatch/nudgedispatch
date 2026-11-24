@@ -859,6 +859,8 @@ async function renderRide(id, gen) {
   const invoice = result.data.invoice;
   const rows = [
     ["Planned pickup", ride.date + " at " + time12(ride.time) + " ET"],
+    ...(ride.isSplitLeg && ride.leg ? [["Round trip", "Leg " + ride.leg + " of 2"]] : []),
+    ...(ride.returnDate ? [["Return", ride.returnDate + (ride.returnTime ? " at " + time12(ride.returnTime) : "") + " ET"]] : []),
     ["Planned drop-off", "Not stored"],
     ["On my way", schedule.enRouteLabel ? schedule.enRouteLabel + " ET" : "Not recorded"],
     ["Driver arrived", schedule.arrivedLabel ? schedule.arrivedLabel + " ET" : "Not recorded"],
@@ -1182,6 +1184,9 @@ async function renderNewRide(gen) {
       <label class="full">Client<select id="client">${options}</select></label>
       <label>Date<input id="date" type="date" required></label>
       <label>Time<input id="time" type="time" required></label>
+      <label>Trip type<select id="tripType"><option value="">One way</option><option value="round-trip">Round trip</option></select></label>
+      <label id="returnDateWrap" class="hidden">Return date<input id="returnDate" type="date"></label>
+      <label id="returnTimeWrap" class="hidden">Return time<input id="returnTime" type="time"></label>
       <label class="full">Pickup<input id="pickup" required autocomplete="street-address"></label>
       ${stopEditorHtml([], "new-stops")}
       <label class="full">Drop-off<input id="dropoff" required></label>
@@ -1193,9 +1198,16 @@ async function renderNewRide(gen) {
       <button class="btn full" type="submit">Save ride</button>
     </form>`);
   wireStopEditor(document.querySelector("#new-stops"));
+  const syncNewReturn = () => {
+    const show = document.querySelector("#tripType").value === "round-trip";
+    document.querySelector("#returnDateWrap").classList.toggle("hidden", !show);
+    document.querySelector("#returnTimeWrap").classList.toggle("hidden", !show);
+  };
+  document.querySelector("#tripType").onchange = syncNewReturn;
   document.querySelector("#f").onsubmit = async (event) => {
     event.preventDefault();
     const stops = readStopEditor(document.querySelector("#new-stops"));
+    const tripType = document.querySelector("#tripType").value;
     const result = await api("/api/rides", {
       method: "POST",
       body: {
@@ -1208,6 +1220,8 @@ async function renderNewRide(gen) {
         fare: document.querySelector("#fare").value,
         flight: document.querySelector("#flight").value,
         notes: document.querySelector("#notes").value,
+        ...(tripType ? { tripType } : {}),
+        ...(tripType === "round-trip" ? { returnDate: document.querySelector("#returnDate").value, returnTime: document.querySelector("#returnTime").value } : {}),
         ...(stops.length ? { stops } : {}),
       },
     });
@@ -1249,10 +1263,12 @@ async function renderInvoice(id, gen) {
       <p class="total">${esc(invoice.fare)}</p>
       <p><strong>Bill to</strong><br>${esc(invoice.billTo.name)}<br>${esc(invoice.billTo.phone)} ${esc(invoice.billTo.email)}</p>
       <table>
+        ${trip.leg ? `<tr><td>Trip</td><td>Round trip leg ${esc(String(trip.leg))} of 2</td></tr>` : (trip.tripType === "round-trip" ? `<tr><td>Trip</td><td>Round trip</td></tr>` : "")}
         <tr><td>When</td><td>${esc(longIssued(trip.date))} ${esc(time12(trip.time))}</td></tr>
         <tr><td>Pickup</td><td>${esc(trip.pickup)}</td></tr>
         ${rideStops(trip).map((stop, i) => `<tr class="stop-row"><td>Stop ${i + 1}</td><td>${esc(stop)}</td></tr>`).join("")}
         <tr><td>Drop-off</td><td>${esc(trip.dropoff)}</td></tr>
+        ${trip.returnDate ? `<tr><td>Return</td><td>${esc(longIssued(trip.returnDate))}${trip.returnTime ? " " + esc(time12(trip.returnTime)) : ""}</td></tr>` : ""}
         <tr><td>Passengers</td><td>${esc(trip.passengers)}</td></tr>
         ${trip.flight ? `<tr><td>Flight</td><td>${esc(trip.flight)}</td></tr>` : ""}
       </table>
@@ -2763,7 +2779,9 @@ function readStopEditor(root) {
 
 function tripLine(ride) {
   const bits = [];
-  if (ride.tripTypeLabel) bits.push(ride.tripTypeLabel + (ride.tripType === "hourly" && ride.hours ? " " + ride.hours + " h" : ""));
+  if (ride.tripTypeLabel) bits.push(ride.tripTypeLabel + (ride.tripType === "hourly" && ride.hours ? " " + ride.hours + " h" : "") + (ride.isSplitLeg && ride.leg ? " \u00b7 leg " + ride.leg + " of 2" : ""));
+  else if (ride.isSplitLeg && ride.leg) bits.push("Round trip \u00b7 leg " + ride.leg + " of 2");
+  if (!ride.isSplitLeg && ride.returnDate) bits.push("return " + ride.returnDate + (ride.returnTime ? " at " + time12(ride.returnTime) : ""));
   if (ride.vehicleName) bits.push(ride.vehicleName);
   return bits.join(" \u00b7 ");
 }
