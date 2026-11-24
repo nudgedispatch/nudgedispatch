@@ -1,4 +1,4 @@
--- 0019 (Nov 24, 2026): different-date round trips become two linked rides.
+-- 0020 (Nov 24, 2026): different-date round trips become two linked rides.
 -- Additive only. Same-day (or missing return time) stays one rides row and keeps
 -- return_date / return_time. Split legs share group_id, use leg 1 then 2, and leave
 -- return_date / return_time empty — the return's pickup_date / pickup_time is the
